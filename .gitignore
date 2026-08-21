@@ -1,0 +1,22 @@
+# Editor / AI tooling
+.claude/
+.continue/
+.vscode/
+
+# Internal dev notes (not for the public repo)
+CLAUDE.md
+
+# Backups, logs, personal helper scripts
+*.bak
+*.log
+dmp.py
+
+# Build intermediates (should never be inside the tree, but just in case)
+*.obj
+*.pdb
+*.ilk
+*.exp
+
+# OS cruft
+Thumbs.db
+Desktop.ini

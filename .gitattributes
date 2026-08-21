@@ -1,0 +1,11 @@
+# Preserve exact bytes of shipped artifacts.
+# riding.cfg is GBK-encoded (species names must match the game's getName() bytes) — never convert EOLs.
+release/RidingPlugin/riding.cfg -text
+*.dll binary
+*.mod binary
+
+# Normalize line endings for source/text
+*.cpp   text
+*.h     text
+*.md    text
+*.cmd   text
