@@ -1,8 +1,6 @@
 ﻿#include <Debug.h>
 
 #include <kenshi/Character.h>
-#include <kenshi/CharacterHuman.h>
-#include <kenshi/CharacterAnimal.h>
 #include <kenshi/CharMovement.h>
 #include <kenshi/GameWorld.h>
 #include <kenshi/Globals.h>
@@ -19,17 +17,14 @@
 #include <core/Functions.h>
 
 #include <ogre/OgreVector3.h>
+// OgreSceneNode.h is load-bearing: AnimationClass::node is an Ogre::SceneNode* and
+// no other included header pulls the complete type in transitively.
 #include <ogre/OgreSceneNode.h>
-#include <ogre/OgreOldBone.h>
 
-#include <mygui/MyGUI_Gui.h>
 #include <mygui/MyGUI_Window.h>
-#include <mygui/MyGUI_Button.h>
-#include <mygui/MyGUI_Delegate.h>
 
 #include <boost/unordered_map.hpp>
 #include <string>
-#include <functional>
 
 #include <windows.h>
 #include <stdio.h>
@@ -99,18 +94,6 @@ enum SeatMode
     SEAT_EXACT    = 0,
     SEAT_MIDPOINT = 1,
     SEAT_NECK     = 2
-};
-
-// Mount methods: how the rider is held on the mount.
-//   0 = CARRY  - use the native carry system (pickupObject).  Holds the rider with
-//                no physics fighting, but some animals (pack_beast family) lose
-//                their walk animation while in carry mode.
-//   1 = SLAVE  - no carry system, pure slave attach + per-frame position sync so
-//                the mount keeps its normal locomotion animations.
-enum MountMethod
-{
-    MOUNT_CARRY = 0,
-    MOUNT_SLAVE = 1
 };
 
 // Rider upper-body posture while mounted.
@@ -210,19 +193,19 @@ static const int kMountApproachRefresh = 15;
 // backup for animals whose body keeps the rider farther from centre than this.
 static const float kMountArriveDist = 10.0f;
 
-// Per-species tuning: seat mode + (x = forward, y = up) world-space delta + mount method.
+// Per-species tuning: seat mode + (x = forward, y = up) world-space delta.
 // Orientation is NOT tunable - the rider always faces the mount's travel direction.
+// (cfg column 4 "mount" is a dead legacy field: every ride uses native carry since
+//  2026-08-20; the column position survives read-and-ignore / write-0 for file compat.)
 struct SpeciesTuning
 {
     int           seatMode;
-    int           mountMethod;   // MountMethod (0=carry, 1=slave)
     bool          forceSit;      // re-assert the sitting pose every frame
     int           posture;       // RiderPosture (0=sit, 1=stand)
     float         lateral;       // side offset (right/left), world units
     Ogre::Vector3 offset;
-    SpeciesTuning() : seatMode(SEAT_MIDPOINT), mountMethod(MOUNT_CARRY), forceSit(true), posture(POSTURE_SIT), lateral(0.0f), offset(Ogre::Vector3::ZERO) {}
-    SpeciesTuning(int m, const Ogre::Vector3& o) : seatMode(m), mountMethod(MOUNT_CARRY), forceSit(true), posture(POSTURE_SIT), lateral(0.0f), offset(o) {}
-    SpeciesTuning(int m, int mm, const Ogre::Vector3& o) : seatMode(m), mountMethod(mm), forceSit(true), posture(POSTURE_SIT), lateral(0.0f), offset(o) {}
+    SpeciesTuning() : seatMode(SEAT_MIDPOINT), forceSit(true), posture(POSTURE_SIT), lateral(0.0f), offset(Ogre::Vector3::ZERO) {}
+    SpeciesTuning(int m, const Ogre::Vector3& o) : seatMode(m), forceSit(true), posture(POSTURE_SIT), lateral(0.0f), offset(o) {}
 };
 boost::unordered_map<std::string, SpeciesTuning> speciesTuning;
 
@@ -419,24 +402,24 @@ static void LoadConfig()
         if (name.empty()) continue;
         float up = 0.0f, fwd = 0.0f;
         int mode = SEAT_MIDPOINT;
-        int mm = MOUNT_CARRY;
         int sit = 1;
-        // columns 6-8 of the line format (roll/pitch/yaw orientation tunes) are obsolete
-        // - facing is always the mount's travel direction now.  Parse them into dummies
-        // only so existing cfg files keep loading with the same column layout.
+        // columns 4 and 6-8 of the line format are obsolete: column 4 "mount" is a dead
+        // legacy field (every ride uses native carry since 2026-08-20), columns 6-8 are
+        // roll/pitch/yaw orientation tunes - facing is always the mount's travel direction
+        // now.  Parse them into dummies only so existing cfg files keep loading with the
+        // same column layout.
+        int mountIg = 0;
         float rollIg = 0.0f, pitchIg = 0.0f, yawIg = 0.0f;
         int posture = POSTURE_SIT;
         float lateral = 0.0f;
-        int n = sscanf(val.c_str(), "%d,%f,%f,%d,%d,%f,%f,%f,%d,%f", &mode, &up, &fwd, &mm, &sit, &rollIg, &pitchIg, &yawIg, &posture, &lateral);
+        int n = sscanf(val.c_str(), "%d,%f,%f,%d,%d,%f,%f,%f,%d,%f", &mode, &up, &fwd, &mountIg, &sit, &rollIg, &pitchIg, &yawIg, &posture, &lateral);
         if (n >= 3)
         {
             if (mode < SEAT_EXACT) mode = SEAT_EXACT;
             if (mode > SEAT_NECK)  mode = SEAT_NECK;
-            if (mm < MOUNT_CARRY) mm = MOUNT_CARRY;
-            if (mm > MOUNT_SLAVE) mm = MOUNT_SLAVE;
             if (posture < POSTURE_SIT) posture = POSTURE_SIT;
             if (posture > POSTURE_STAND) posture = POSTURE_STAND;
-            SpeciesTuning st(mode, mm, Ogre::Vector3(fwd, up, 0.0f));
+            SpeciesTuning st(mode, Ogre::Vector3(fwd, up, 0.0f));
             st.forceSit = (sit != 0);
             st.posture = posture;
             st.lateral = lateral;
@@ -455,12 +438,12 @@ static void SaveConfig()
     FILE* f = fopen(GetConfigPath().c_str(), "w");
     if (!f) return;
     fprintf(f, "# riding.cfg - per-species seat tuning\n");
-    fprintf(f, "# <species>=<mode>,<up>,<forward>,<mount>,<sit>,<roll>,<pitch>,<yaw>,<posture>,<lateral>  mode 0=exact 1=midpoint 2=neck  mount 0=carry 1=slave  sit 0=off 1=on  posture 0=sit 1=stand  lateral=side offset\n");
-    fprintf(f, "# columns 6-8 (roll/pitch/yaw) are OBSOLETE - facing is always the mount's travel direction; always written as 0\n");
+    fprintf(f, "# <species>=<mode>,<up>,<forward>,<mount>,<sit>,<roll>,<pitch>,<yaw>,<posture>,<lateral>  mode 0=exact 1=midpoint 2=neck  sit 0=off 1=on  posture 0=sit 1=stand  lateral=side offset\n");
+    fprintf(f, "# columns 4 and 6-8 are OBSOLETE legacy fields (mount method / roll-pitch-yaw) - parsed-and-ignored, always written as 0\n");
     boost::unordered_map<std::string, SpeciesTuning>::iterator it = speciesTuning.begin();
     for (; it != speciesTuning.end(); ++it)
         fprintf(f, "%s=%d,%.2f,%.2f,%d,%d,0.0,0.0,0.0,%d,%.2f\n", it->first.c_str(), it->second.seatMode,
-                it->second.offset.y, it->second.offset.x, it->second.mountMethod,
+                it->second.offset.y, it->second.offset.x, 0,
                 it->second.forceSit ? 1 : 0, it->second.posture, it->second.lateral);
     fclose(f);
 }
@@ -604,16 +587,10 @@ SeatInfo BuildSeatInfo(Character* mount)
     }
     // SEAT_EXACT keeps the per-bone lift set above
 
-    // Per-individual size scaling REMOVED (2026-08-23, user decision).  It measured a
-    // torso proxy from live bones, but the mount's bone world reads are untrustworthy
-    // at exactly the moments we build a SeatInfo: right after pickupObject / right
-    // after a load they can come back in UNSCALED (bind) space - the same skeleton
-    // that measures torso 10.3 once settled measured 103 at mount time (its node-scale
-    // multiple).  That made sizeScale ~10 and amplified the tuned offsets (-7.1 up)
-    // into a seat 70 units underground ("rider model vanished"); clamping to 2.0 still
-    // put the rider on the floor.  There is no reliable measurement moment, so the
-    // factor is now fixed at 1.0 - seat tuning is purely per-species (riding.cfg),
-    // exactly the values the user calibrated.
+    // Per-individual size scaling is gone (2026-08-23): bone world reads are
+    // untrustworthy exactly when we build a SeatInfo - right after pickup/load they
+    // come back unscaled (~10x node-scale multiple), so no measured factor is reliable.
+    // Tuning is purely per-species via riding.cfg.
     info.sizeScale = 1.0f;
 
     return info;
@@ -740,11 +717,9 @@ static void ClampTuning(Ogre::Vector3& v)
 
 // Orient the rider's scene node after the game's own update.  The carry physics pins
 // the rider horizontally (lying flat, belly up); we override the render-node
-// orientation so the seated pose is drawn upright.
-//
-// Orientation is ALWAYS the mount's DIRECTION OF TRAVEL (not its head/body bone
-// forward).  No manual per-species facing tunes anymore - the user dropped them
-// (2026-08-23); the node is placed in world space, so no bone-local conversion needed.
+// orientation so the seated pose is drawn upright.  Facing is ALWAYS the mount's
+// direction of travel - never a head/body bone, never a manual tune (dropped
+// 2026-08-23); the node is world-space so no bone-local conversion is needed.
 static void ApplyRiderOrientation(Character* rider, const SeatInfo& seat, Character* mount)
 {
     if (!rider || !mount) return;
@@ -753,13 +728,10 @@ static void ApplyRiderOrientation(Character* rider, const SeatInfo& seat, Charac
     AnimationClass* mountAnim = mount->getAnimationClass();
     if (!mountAnim) return;
 
-    // Heading source = the mount's DIRECTION OF TRAVEL, not its head/body bone forward.
-    // We take the horizontal delta of the mount's movement (pathfinding) position
-    // between frames: while it is moving that is exactly "the way it is going", and it
-    // ignores the head/body/back bone rotating to face elsewhere mid-run.  When the
-    // mount is (nearly) stationary we HOLD the last travel direction so the rider keeps
-    // facing that way instead of snapping around; before it has ever moved (just
-    // mounted) we fall back to the body-bone forward so the rider still faces sensibly.
+    // Heading = frame-to-frame horizontal delta of the mount's pathfinding position:
+    // while moving that IS "the way it is going", and it ignores head/back bones
+    // swivelling mid-run.  Nearly stationary -> HOLD last heading; never moved yet ->
+    // fall back to body-bone forward.
     static const float kHeadingMoveEps = 0.03f;   // per-frame horizontal move to count as "traveling"
     Ogre::Vector3 fwd(0.0f, 0.0f, 1.0f);
     bool haveFwd = false;
@@ -822,35 +794,27 @@ static void ApplyRiderOrientation(Character* rider, const SeatInfo& seat, Charac
     }
 
     // The rider node is not parented to the mount bone (no slaveAttachToBoneMode), so
-    // the node orientation IS world space - apply worldQ directly.  Facing = travel
-    // direction, always; no per-species orientation tunes anymore.
+    // the node orientation IS world space - apply worldQ directly.
     rAnim->node->setOrientation(worldQ);
 }
 
 // ---- put the rider's RENDER position on the mount's back --------------------
 //
 // The renderer does NOT read the movement position or rootBonePosition - it reads the
-// rider's root bone world position (rBip).  Diagnostics (RE_NOTES section 5) measured
-// that rBip satisfies, with zero residual:
+// rider's root bone world position (rBip), which satisfies with zero residual
+// (RE_NOTES section 5):
 //
-//     rBip = node + nodeQ * boneLocal
+//     rBip = node + nodeQ * boneLocal        (boneLocal ~6.4, constant per pose)
 //
-// where boneLocal is the root bone's offset inside the node's own frame and is
-// constant for a given pose (~6.4 units, mostly vertical, for the sitting pose).
-// So writing the node straight to seatPos - what the old code did via
-// AnimationClass::setPosition - leaves the rider floating ~6.4 above the seat, and
-// worse, nodeQ rotates as the mount runs/turns, so that offset sweeps around and the
-// rider visibly swings off the back.
-//
-// Invert the equation instead and solve for the node that puts rBip where we want it:
+// Writing the node straight to seatPos therefore floats the rider ~6.4 above the
+// seat AND swings that offset around as nodeQ rotates mid-run.  Solve for the node
+// that puts rBip on the seat instead:
 //
 //     node = (seatPos + anchor) - nodeQ * boneLocal
 //
-// `anchor` is captured once per mount, on the first synced frame, as (rBip - node).
-// That keeps the rider at the same height the existing per-species seat tuning in
-// riding.cfg was calibrated against - this change removes the swing without
-// invalidating anyone's saved offsets.  boneLocal is recomputed every frame so a
-// posture switch (Numpad 7, sit <-> stand) self-corrects within one frame.
+// `anchor` is captured once per mount on the first synced frame as (rBip - node),
+// preserving the height the riding.cfg tuning was calibrated against; boneLocal is
+// recomputed every frame so a posture switch (Numpad 7) self-corrects in one frame.
 static void SyncRiderNode(Character* rider, Character* mount, AnimationClass* rAnim,
                           const Ogre::Vector3& seatPos)
 {
@@ -961,13 +925,101 @@ static void DampSeatBob(Character* mount, const SeatInfo& seat, Ogre::Vector3& s
     seatPos.y = dampedBase + uy;                   // user height tune applies at full strength
 }
 
-// Apply a live tuning step to the currently mounted seat and persist it.
-static void TuneSeat(SeatInfo& seat, float dUp, float dFwd)
+// Nothing to correct when the seat is a pure EXACT bone attach with no user tune -
+// both per-frame sync paths skip rider placement for that configuration.
+static bool SeatNeedsPlacement(const SeatInfo& seat)
 {
-    seat.userOffset.x += dFwd;
-    seat.userOffset.y += dUp;
-    ClampTuning(seat.userOffset);
+    return !(seat.seatMode == SEAT_EXACT && seat.lift == Ogre::Vector3::ZERO && seat.userOffset == Ogre::Vector3::ZERO);
+}
 
+// Seat position shared by the two per-frame sync paths (animUpdate + main loop):
+// horizontal instant from ComputeSeatPosition, vertical run-bob scaled by DampSeatBob.
+// The two writers must agree every frame - the pass running closer to the render would
+// otherwise visibly win.
+static Ogre::Vector3 ComputeDampedSeatPos(Character* mount, const SeatInfo& seat)
+{
+    Ogre::Vector3 seatPos = ComputeSeatPosition(seat, mount);
+    DampSeatBob(mount, seat, seatPos);
+    return seatPos;
+}
+
+// Continuous diagnostics (Numpad .): log EVERY frame while the mount is moving,
+// comparing the mount's root/back bones, the forward vector, the raw (unsmoothed)
+// target, the damped target, and every position/orientation readout of the rider
+// (scene node, movement pos, root bone, world rBip).  Called from the main-loop
+// sync pass right after seatPos is final for the frame.
+static void DebugLogRideFrame(Character* rider, Character* mount, const SeatInfo& seat, const Ogre::Vector3& seatPos)
+{
+    CharMovement* dmv = mount->getMovement();
+    Ogre::Vector3 dmvP = dmv ? dmv->getPosition() : Ogre::Vector3::ZERO;
+    boost::unordered_map<Character*, Ogre::Vector3>::iterator dlast = debugLastPos.find(mount);
+    bool moving = false;
+    if (dlast != debugLastPos.end())
+    {
+        Ogre::Vector3 dd = dmvP - dlast->second;
+        dd.y = 0.0f;
+        moving = (dd.length() > 0.02f);
+    }
+    debugLastPos[mount] = dmvP;
+    if (!moving)
+        return;
+
+    AnimationClass* mAnim = mount->getAnimationClass();
+    AnimationClass* rAnim = rider->getAnimationClass();
+    char dbg[1100];
+    if (mAnim && rAnim)
+    {
+        Ogre::Vector3 rootP = mAnim->getBoneWorldPosition("Bip01", 1.0f);
+        Ogre::Vector3 backP = mAnim->getBoneWorldPosition(seat.backBone, 1.0f);
+        Ogre::Vector3 fwd = GetMountForward(seat, mount);
+        Ogre::Vector3 rawT = ComputeSeatPosition(seat, mount);
+        // ghost-bone watch: the raw rear-bone read + which anchor is active
+        Ogre::Vector3 pelvP = seat.rearBone.empty() ? Ogre::Vector3::ZERO
+                            : mount->getBoneWorldPosition(seat.rearBone);
+        int anchSrc = 0;    // 0 = fallback (live rel), 1 = stored anchor
+        Ogre::Vector3 anchP = Ogre::Vector3::ZERO;
+        boost::unordered_map<Character*, Ogre::Vector3>::iterator da = mountAnchor.find(mount);
+        if (da != mountAnchor.end())
+        {
+            anchSrc = 1;
+            anchP = da->second;
+        }
+        Ogre::Vector3 nodeP = rAnim->getSceneNodePosition();
+        Ogre::Quaternion nodeQ = rAnim->getSceneNodeOrientation();
+        // The CHARACTER's own transform - this is what actually renders
+        Ogre::Vector3 riderMoveP = rider->getMovement() ? rider->getMovement()->getPosition() : Ogre::Vector3::ZERO;
+        Ogre::Vector3 riderRoot = rAnim->rootBonePosition;
+        // The RIDER's own root bone in world space (the renderer's true source)
+        Ogre::Vector3 riderBip01 = rider->getBoneWorldPosition("Bip01");
+        Ogre::Quaternion riderBip01Q = rAnim->getBoneWorldOrientation("Bip01");
+        _snprintf_s(dbg, 1100, _TRUNCATE,
+            "Riding: DBG root=(%.2f,%.2f,%.2f) back=(%.2f,%.2f,%.2f) fwd=(%.2f,%.2f,%.2f) rawT=(%.2f,%.2f,%.2f) tgt=(%.2f,%.2f,%.2f) node=(%.2f,%.2f,%.2f) rMove=(%.2f,%.2f,%.2f) rRoot=(%.2f,%.2f,%.2f) rBip=(%.2f,%.2f,%.2f) nodeQ=(%.2f,%.2f,%.2f,%.2f) rBipQ=(%.2f,%.2f,%.2f,%.2f) move=(%.2f,%.2f,%.2f) anch=(%.2f,%.2f,%.2f) st=%d pelv=(%.2f,%.2f,%.2f)",
+            rootP.x, rootP.y, rootP.z,
+            backP.x, backP.y, backP.z,
+            fwd.x, fwd.y, fwd.z,
+            rawT.x, rawT.y, rawT.z,
+            seatPos.x, seatPos.y, seatPos.z,
+            nodeP.x, nodeP.y, nodeP.z,
+            riderMoveP.x, riderMoveP.y, riderMoveP.z,
+            riderRoot.x, riderRoot.y, riderRoot.z,
+            riderBip01.x, riderBip01.y, riderBip01.z,
+            nodeQ.w, nodeQ.x, nodeQ.y, nodeQ.z,
+            riderBip01Q.w, riderBip01Q.x, riderBip01Q.y, riderBip01Q.z,
+            dmvP.x, dmvP.y, dmvP.z,
+            anchP.x, anchP.y, anchP.z,
+            anchSrc,
+            pelvP.x, pelvP.y, pelvP.z);
+        DebugLog(dbg);
+    }
+}
+
+// Persist a seat's full tuning state to its species entry + riding.cfg.  Writes ALL
+// five fields (not just the one a hotkey just changed): the seat IS the live mountSeat
+// entry, so every field is current.  Accepted trade-off (2026-08-23): two mounts of the
+// same species tuned in interleaved steps overwrite each other's cfg copy - identical to
+// what the old full-field writers (up/fwd tune, reset) already did.
+static void PersistTuning(const SeatInfo& seat)
+{
     if (!seat.species.empty())
     {
         SpeciesTuning& st = speciesTuning[seat.species];
@@ -978,6 +1030,16 @@ static void TuneSeat(SeatInfo& seat, float dUp, float dFwd)
         st.offset = seat.userOffset;
     }
     SaveConfig();
+}
+
+// Apply a live tuning step to the currently mounted seat and persist it.
+static void TuneSeat(SeatInfo& seat, float dUp, float dFwd)
+{
+    seat.userOffset.x += dFwd;
+    seat.userOffset.y += dUp;
+    ClampTuning(seat.userOffset);
+
+    PersistTuning(seat);
 
     DebugLog("Riding: tuned " + seat.species + " up=" + IntToStr((int)(seat.userOffset.y * 100.0f))
              + " fwd=" + IntToStr((int)(seat.userOffset.x * 100.0f)));
@@ -1003,16 +1065,7 @@ static void CycleSeatMode(SeatInfo& seat)
     // SEAT_EXACT: lift stays whatever the EXACT base was (recompute from bones would
     // need the mount, keep current - the user tunes on top anyway)
 
-    if (!seat.species.empty())
-    {
-        SpeciesTuning& st = speciesTuning[seat.species];
-        st.seatMode = seat.seatMode;
-        st.forceSit = seat.forceSit;
-        st.posture = seat.posture;
-        st.lateral = seat.lateral;
-        st.offset = seat.userOffset;
-    }
-    SaveConfig();
+    PersistTuning(seat);
 
     DebugLog("Riding: mode " + seat.species + " -> " + IntToStr(seat.seatMode));
 }
@@ -1127,6 +1180,7 @@ void RestoreRideAfterLoad(Character* rider, Character* mount)
     // symmetric with Dismount() in case a restore ever overwrites a live pair
     mountAnchor.erase(mount);
     mountBaseVOffset.erase(mount);
+    mountLastPos.erase(mount);   // was missed before 2026-08-23: one stale forceWalk tick after load
     mountSmoothOrient.erase(mount);
     mountHeadingPos.erase(mount);
     mountHeadingDir.erase(mount);
@@ -1351,14 +1405,13 @@ static void AnimUpdateImpl(AnimationClass* thisptr, float frameTIME)
                     {
                         const SeatInfo& seat = sit->second;
 
-                        if (!(seat.seatMode == SEAT_EXACT && seat.lift == Ogre::Vector3::ZERO && seat.userOffset == Ogre::Vector3::ZERO))
+                        if (SeatNeedsPlacement(seat))
                         {
                             // Horizontal instant; vertical bob scaled by DampSeatBob -
                             // same rule as the main loop so the two points agree.
-                            Ogre::Vector3 seatPos = ComputeSeatPosition(seat, mount);
-                            DampSeatBob(mount, seat, seatPos);
+                            Ogre::Vector3 seatPos = ComputeDampedSeatPos(mount, seat);
 
-                            if (ch && ch->getMovement())
+                            if (ch->getMovement())
                                 ch->getMovement()->_setPositionSimple(seatPos);
                             SyncRiderNode(ch, mount, thisptr, seatPos);
                         }
@@ -1397,45 +1450,56 @@ void animUpdate_hook(AnimationClass* thisptr, float frameTIME)
 
 // ---- main loop hook: sync rider positions + handle mount/dismount keys ----
 
-void (*mainLoop_orig)(GameWorld* thisptr, float time) = NULL;
-static void MainLoopImpl(GameWorld* thisptr, float time)
+// Edge detector for numpad hotkeys: true only on the frame the key transitions down.
+// Latches prev in passing, so each key needs no separate end-of-frame write-back.
+static bool KeyEdge(bool down, bool& prev)
 {
-    // call original first
-    mainLoop_orig(thisptr, time);
+    bool pressed = (down && !prev);
+    prev = down;
+    return pressed;
+}
 
-    if (!ou) return;
+void (*mainLoop_orig)(GameWorld* thisptr, float time) = NULL;
 
-    // World-reset sentinel (2026-08-23): loading a save mid-session frees every
-    // tracked Character*.  One implausible pair means the whole world was reset,
-    // so wipe ALL ride state instead of trying to surgically erase - everything
-    // else in the maps is just as stale.  If the new save has someone mounted,
-    // TryRestoreOrphanedMount rebuilds it from the native carry link.
-    if (!riderToMount.empty() || !pendingMount.empty())
+// ---- per-frame passes, invoked from MainLoopImpl below in definition order ----
+
+// Loading a save mid-session frees every tracked Character*.  One implausible pair
+// means the whole world was reset, so wipe ALL ride state instead of trying to
+// surgically erase - everything else in the maps is just as stale.  If the new save
+// has someone mounted, TryRestoreOrphanedMount rebuilds it from the native carry
+// link.  Returns true when a wipe happened (caller must bail out this frame).
+static bool WorldResetDetected()
+{
+    if (riderToMount.empty() && pendingMount.empty())
+        return false;
+
+    bool dead = false;
+    boost::unordered_map<Character*, Character*>::iterator vit = riderToMount.begin();
+    for (; vit != riderToMount.end() && !dead; ++vit)
+        if (!CharacterLooksLive(vit->first) || !CharacterLooksLive(vit->second))
+            dead = true;
+    if (!dead)
     {
-        bool dead = false;
-        boost::unordered_map<Character*, Character*>::iterator vit = riderToMount.begin();
-        for (; vit != riderToMount.end() && !dead; ++vit)
-            if (!CharacterLooksLive(vit->first) || !CharacterLooksLive(vit->second))
+        boost::unordered_map<Character*, PendingMount>::iterator pit = pendingMount.begin();
+        for (; pit != pendingMount.end() && !dead; ++pit)
+            if (!CharacterLooksLive(pit->first) || !CharacterLooksLive(pit->second.mount))
                 dead = true;
-        if (!dead)
-        {
-            boost::unordered_map<Character*, PendingMount>::iterator pit = pendingMount.begin();
-            for (; pit != pendingMount.end() && !dead; ++pit)
-                if (!CharacterLooksLive(pit->first) || !CharacterLooksLive(pit->second.mount))
-                    dead = true;
-        }
-        if (dead)
-        {
-            WipeAllRideState("tracked character vanished (world reset?)");
-            return;
-        }
     }
+    if (dead)
+    {
+        WipeAllRideState("tracked character vanished (world reset?)");
+        return true;
+    }
+    return false;
+}
 
-    // 0) Service pending "approach then mount" requests.  Each rider that was ordered
-    //    to mount from out of range is walking toward its animal; board it the moment
-    //    it enters order range.  Re-issue the destination periodically so the rider
-    //    keeps chasing a mount that is itself wandering, and drop the request if the
-    //    animal becomes invalid, gets taken by another rider, or can't be reached.
+// 0) Service pending "approach then mount" requests.  Each rider that was ordered
+//    to mount from out of range is walking toward its animal; board it the moment
+//    it enters order range.  Re-issue the destination periodically so the rider
+//    keeps chasing a mount that is itself wandering, and drop the request if the
+//    animal becomes invalid, gets taken by another rider, or can't be reached.
+static void ServicePendingMounts()
+{
     if (!pendingMount.empty())
     {
         boost::unordered_map<Character*, PendingMount>::iterator it = pendingMount.begin();
@@ -1475,18 +1539,6 @@ static void MainLoopImpl(GameWorld* thisptr, float time)
             // before pathing starts) can't board instantly.
             bool reached = move && move->isDestinationReached() && it->second.age > 20;
 
-            // Calibration log (~every 0.5s while approaching): shows whether the rider is
-            // actually closing the distance (i.e. setDestination drives movement) and at
-            // what distance arrival trips.  Remove once the approach is confirmed.
-            if ((it->second.age % 30) == 1)
-            {
-                char b[160];
-                _snprintf_s(b, sizeof(b), _TRUNCATE,
-                    "Riding: approach d=%.1f reached=%d age=%d",
-                    d, (move && move->isDestinationReached()) ? 1 : 0, it->second.age);
-                DebugLog(b);
-            }
-
             if (d < kMountArriveDist || reached)
             {
                 // Arrived: stop, board, and consume the request.
@@ -1507,13 +1559,46 @@ static void MainLoopImpl(GameWorld* thisptr, float time)
             ++it;
         }
     }
+}
 
-    // 1) Keep riders still + upright on the mount's back.
-    //    We halt the rider every frame (keeps it still while the mount walks) and,
-    //    for mounts with forceSit, re-assert the sitting pose every frame.  The
-    //    carry system forces the ANIM_CARRIED "lying flat" pose each frame; like the
-    //    forceWalk fix for pack_beast, re-running the sit anim after the game's own
-    //    update overrides it.
+// The five frame passes below are forward-declared so MainLoopImpl reads as a plain
+// ordered checklist (bodies defined after it).
+static void HaltAndForceSitPass();
+static void SyncMountedRiders();
+static void ForceWalkPass();
+static void CombatAndForceDismountPass();
+static void HotkeyPass();
+
+static void MainLoopImpl(GameWorld* thisptr, float time)
+{
+    // call original first
+    mainLoop_orig(thisptr, time);
+
+    if (!ou) return;
+
+    // Pass ORDER is load-bearing: the looks-live sweep must run before anything
+    // dereferences a tracked pointer; pose/orientation before seat placement;
+    // combat ejection after placement so an ejected rider isn't re-placed.
+    if (WorldResetDetected())
+        return;
+    ServicePendingMounts();
+
+    HaltAndForceSitPass();          // 1) riders stay still + upright
+    SyncMountedRiders();            // 1b) seat position -> movement + render node
+    ForceWalkPass();                // 1b2) pack-beast walk/run anim while moving
+    CombatAndForceDismountPass();   // 1c) KO'd/dead mounts eject; NECK riders passive
+
+    HotkeyPass();                   // 2+3) numpad mount/dismount/tune/debug keys
+}
+
+// 1) Keep riders still + upright on the mount's back.
+//    We halt the rider every frame (keeps it still while the mount walks) and,
+//    for mounts with forceSit, re-assert the sitting pose every frame.  The
+//    carry system forces the ANIM_CARRIED "lying flat" pose each frame; like the
+//    forceWalk fix for pack_beast, re-running the sit anim after the game's own
+//    update overrides it.
+static void HaltAndForceSitPass()
+{
     if (!riderToMount.empty())
     {
         boost::unordered_map<Character*, Character*>::iterator it = riderToMount.begin();
@@ -1553,10 +1638,13 @@ static void MainLoopImpl(GameWorld* thisptr, float time)
             }
         }
     }
+}
 
-    // 1b) Apply the computed seat position.  We run after the game's own update,
-    //     so our offset on top of the slave attachment sticks until next frame.
-    //     Skipped when there is nothing to correct (small/medium animals).
+// 1b) Apply the computed seat position.  We run after the game's own update,
+//     so our offset on top of the slave attachment sticks until next frame.
+//     Skipped when there is nothing to correct (small/medium animals).
+static void SyncMountedRiders()
+{
     if (!mountSeat.empty())
     {
         boost::unordered_map<Character*, Character*>::iterator it = riderToMount.begin();
@@ -1570,81 +1658,15 @@ static void MainLoopImpl(GameWorld* thisptr, float time)
             if (sit == mountSeat.end()) continue;
             const SeatInfo& seat = sit->second;
 
-            if (seat.seatMode == SEAT_EXACT && seat.lift == Ogre::Vector3::ZERO && seat.userOffset == Ogre::Vector3::ZERO)
+            if (!SeatNeedsPlacement(seat))
                 continue; // exact bone attach, no correction needed
 
             // Horizontal tracks the mount instantly (no backward lag).  DampSeatBob
             // scales the vertical run-cycle bob to kSeatBobScale of its natural size.
-            Ogre::Vector3 seatPos = ComputeSeatPosition(seat, mount);
-            DampSeatBob(mount, seat, seatPos);
+            Ogre::Vector3 seatPos = ComputeDampedSeatPos(mount, seat);
 
-            // Continuous diagnostics (Numpad .): log EVERY frame while the mount is
-            // moving, comparing the mount's root/back bones, the forward vector, the
-            // raw (unsmoothed) target, the smoothed target, and the rider's node.
             if (debugContinuous)
-            {
-                CharMovement* dmv = mount->getMovement();
-                Ogre::Vector3 dmvP = dmv ? dmv->getPosition() : Ogre::Vector3::ZERO;
-                boost::unordered_map<Character*, Ogre::Vector3>::iterator dlast = debugLastPos.find(mount);
-                bool moving = false;
-                if (dlast != debugLastPos.end())
-                {
-                    Ogre::Vector3 dd = dmvP - dlast->second;
-                    dd.y = 0.0f;
-                    moving = (dd.length() > 0.02f);
-                }
-                debugLastPos[mount] = dmvP;
-                if (moving)
-                {
-                    AnimationClass* mAnim = mount->getAnimationClass();
-                    AnimationClass* rAnim = rider->getAnimationClass();
-                    char dbg[1100];
-                    if (mAnim && rAnim)
-                    {
-                        Ogre::Vector3 rootP = mAnim->getBoneWorldPosition("Bip01", 1.0f);
-                        Ogre::Vector3 backP = mAnim->getBoneWorldPosition(seat.backBone, 1.0f);
-                        Ogre::Vector3 fwd = GetMountForward(seat, mount);
-                        Ogre::Vector3 rawT = ComputeSeatPosition(seat, mount);
-                        // ghost-bone watch: the raw rear-bone read + which anchor is active
-                        Ogre::Vector3 pelvP = seat.rearBone.empty() ? Ogre::Vector3::ZERO
-                                            : mount->getBoneWorldPosition(seat.rearBone);
-                        int anchSrc = 0;    // 0 = fallback (live rel), 1 = stored anchor
-                        Ogre::Vector3 anchP = Ogre::Vector3::ZERO;
-                        boost::unordered_map<Character*, Ogre::Vector3>::iterator da = mountAnchor.find(mount);
-                        if (da != mountAnchor.end())
-                        {
-                            anchSrc = 1;
-                            anchP = da->second;
-                        }
-                        Ogre::Vector3 nodeP = rAnim->getSceneNodePosition();
-                        Ogre::Quaternion nodeQ = rAnim->getSceneNodeOrientation();
-                        // The CHARACTER's own transform - this is what actually renders
-                        Ogre::Vector3 riderMoveP = rider->getMovement() ? rider->getMovement()->getPosition() : Ogre::Vector3::ZERO;
-                        Ogre::Vector3 riderRoot = rAnim->rootBonePosition;
-                        // The RIDER's own root bone in world space (the renderer's true source)
-                        Ogre::Vector3 riderBip01 = rider->getBoneWorldPosition("Bip01");
-                        Ogre::Quaternion riderBip01Q = rAnim->getBoneWorldOrientation("Bip01");
-                        _snprintf_s(dbg, 1100, _TRUNCATE,
-                            "Riding: DBG root=(%.2f,%.2f,%.2f) back=(%.2f,%.2f,%.2f) fwd=(%.2f,%.2f,%.2f) rawT=(%.2f,%.2f,%.2f) tgt=(%.2f,%.2f,%.2f) node=(%.2f,%.2f,%.2f) rMove=(%.2f,%.2f,%.2f) rRoot=(%.2f,%.2f,%.2f) rBip=(%.2f,%.2f,%.2f) nodeQ=(%.2f,%.2f,%.2f,%.2f) rBipQ=(%.2f,%.2f,%.2f,%.2f) move=(%.2f,%.2f,%.2f) anch=(%.2f,%.2f,%.2f) st=%d pelv=(%.2f,%.2f,%.2f)",
-                            rootP.x, rootP.y, rootP.z,
-                            backP.x, backP.y, backP.z,
-                            fwd.x, fwd.y, fwd.z,
-                            rawT.x, rawT.y, rawT.z,
-                            seatPos.x, seatPos.y, seatPos.z,
-                            nodeP.x, nodeP.y, nodeP.z,
-                            riderMoveP.x, riderMoveP.y, riderMoveP.z,
-                            riderRoot.x, riderRoot.y, riderRoot.z,
-                            riderBip01.x, riderBip01.y, riderBip01.z,
-                            nodeQ.w, nodeQ.x, nodeQ.y, nodeQ.z,
-                            riderBip01Q.w, riderBip01Q.x, riderBip01Q.y, riderBip01Q.z,
-                            dmvP.x, dmvP.y, dmvP.z,
-                            anchP.x, anchP.y, anchP.z,
-                            anchSrc,
-                            pelvP.x, pelvP.y, pelvP.z);
-                        DebugLog(dbg);
-                    }
-                }
-            }
+                DebugLogRideFrame(rider, mount, seat, seatPos);
 
             // The renderer reads the rider's root bone world position (rBip), not the
             // movement position and not rootBonePosition.  _setPositionSimple keeps the
@@ -1657,10 +1679,13 @@ static void MainLoopImpl(GameWorld* thisptr, float time)
                 SyncRiderNode(rider, mount, rAnim, seatPos);
         }
     }
+}
 
-    // 1b2) Force the walk/run animation on mounts whose carry mode suppresses it
-    //      (pack_beast family detected via "beast walk").  Only while the mount is
-    //      actually moving and not in combat, so normal idle/attack anims play.
+// 1b2) Force the walk/run animation on mounts whose carry mode suppresses it
+//      (pack_beast family detected via "beast walk").  Only while the mount is
+//      actually moving and not in combat, so normal idle/attack anims play.
+static void ForceWalkPass()
+{
     if (!mountSeat.empty())
     {
         boost::unordered_map<Character*, Character*>::iterator it = riderToMount.begin();
@@ -1692,12 +1717,15 @@ static void MainLoopImpl(GameWorld* thisptr, float time)
                 anim->runAnimation(moveDist > 0.35f ? "beast run" : "beast walk", 1.0f, 0.1f);
         }
     }
+}
 
-    // 1c) Mount combat + forced dismount.
-    //     - Any mount that is down (KO'd) or dead force-dismounts its rider.
-    //     - On NECK-mode (large) mounts the rider stays passive: their combat is
-    //       suppressed every frame and the mount fights back with its native
-    //       animal combat, defending the rider against the rider's attackers.
+// 1c) Mount combat + forced dismount.
+//     - Any mount that is down (KO'd) or dead force-dismounts its rider.
+//     - On NECK-mode (large) mounts the rider stays passive: their combat is
+//       suppressed every frame and the mount fights back with its native
+//       animal combat, defending the rider against the rider's attackers.
+static void CombatAndForceDismountPass()
+{
     if (!riderToMount.empty())
     {
         boost::unordered_map<Character*, Character*>::iterator it = riderToMount.begin();
@@ -1745,9 +1773,17 @@ static void MainLoopImpl(GameWorld* thisptr, float time)
             ++it;
         }
     }
+}
 
-    // 2) mount/dismount/tune keys (numpad, physical key detection via OIS)
-    if (key && key->keyboard && ou->player)
+// 2) mount/dismount/tune keys (numpad, physical key detection via OIS) and
+// 3) live seat tuning (applies to the currently mounted animal).  The prev-state
+//    flags are function locals on purpose: one edge consumer each, persist across
+//    frames, reset naturally on DLL reload.
+static void HotkeyPass()
+{
+    if (!(key && key->keyboard && ou->player))
+        return;
+
     {
         static bool prevNumpad1 = false;
         static bool prevNumpad2 = false;
@@ -1763,21 +1799,17 @@ static void MainLoopImpl(GameWorld* thisptr, float time)
         static bool prevNP7 = false;
         static bool prevDecimal = false;
 
-        bool numpad1down = key->keyboard->isKeyDown(OIS::KC_NUMPAD1);
-        bool numpad2down = key->keyboard->isKeyDown(OIS::KC_NUMPAD2);
-
         // Debug: Numpad decimal (.) toggles continuous ride diagnostics.  Every ~10
         // frames we log the mount's root/back bone position+orientation, our computed
         // target seat position, and the rider's actual render node, so we can see
         // whether the "fling while running" comes from position or orientation.
-        bool decimalDown = key->keyboard->isKeyDown(OIS::KC_DECIMAL);
-        if (decimalDown && !prevDecimal)
+        if (KeyEdge(key->keyboard->isKeyDown(OIS::KC_DECIMAL), prevDecimal))
         {
             debugContinuous = !debugContinuous;
             DebugLog(std::string("Riding: debug continuous ") + (debugContinuous ? "ON" : "OFF"));
         }
 
-        if (numpad1down && !prevNumpad1)
+        if (KeyEdge(key->keyboard->isKeyDown(OIS::KC_NUMPAD1), prevNumpad1))
         {
             PlayerInterface* player = ou->player;
             Character* rider = NULL;
@@ -1814,7 +1846,7 @@ static void MainLoopImpl(GameWorld* thisptr, float time)
                 DebugLog("Riding: select one human + one animal, then press Numpad1");
         }
 
-        if (numpad2down && !prevNumpad2)
+        if (KeyEdge(key->keyboard->isKeyDown(OIS::KC_NUMPAD2), prevNumpad2))
         {
             PlayerInterface* player = ou->player;
             Character* rider = NULL;
@@ -1834,30 +1866,30 @@ static void MainLoopImpl(GameWorld* thisptr, float time)
         //    Numpad 6   : toggle force-sit on/off
         //    Numpad 7   : cycle rider posture (sit -> stand)
         //    Ctrl+*/ /   : move the seat left/right (lateral)
-        if (!prevAdd || !prevSub || !prevMul || !prevDiv || !prevNP3 || !prevNP9 || !prevNP0 || !prevNP5 || !prevNP6 || !prevNP7)
         {
-            bool addD = key->keyboard->isKeyDown(OIS::KC_ADD);
-            bool subD = key->keyboard->isKeyDown(OIS::KC_SUBTRACT);
-            bool mulD = key->keyboard->isKeyDown(OIS::KC_MULTIPLY);
-            bool divD = key->keyboard->isKeyDown(OIS::KC_DIVIDE);
-            bool np3D = key->keyboard->isKeyDown(OIS::KC_NUMPAD3);
-            bool np9D = key->keyboard->isKeyDown(OIS::KC_NUMPAD9);
-            bool np0D = key->keyboard->isKeyDown(OIS::KC_NUMPAD0);
-            bool np5D = key->keyboard->isKeyDown(OIS::KC_NUMPAD5);
-            bool np6D = key->keyboard->isKeyDown(OIS::KC_NUMPAD6);
-            bool np7D = key->keyboard->isKeyDown(OIS::KC_NUMPAD7);
             bool ctrlD = key->keyboard->isKeyDown(OIS::KC_LCONTROL) || key->keyboard->isKeyDown(OIS::KC_RCONTROL);
 
-            bool stepUp = (addD && !prevAdd && !ctrlD) || (np3D && !prevNP3);
-            bool stepDn = (subD && !prevSub && !ctrlD) || (np9D && !prevNP9);
-            bool stepFw = mulD && !prevMul && !ctrlD;
-            bool stepBk = divD && !prevDiv && !ctrlD;
-            bool stepLatR = mulD && !prevMul && ctrlD;
-            bool stepLatL = divD && !prevDiv && ctrlD;
-            bool stepRst = np0D && !prevNP0;
-            bool stepMode = np5D && !prevNP5;
-            bool stepSit = np6D && !prevNP6;
-            bool stepPosture = np7D && !prevNP7;
+            bool addE = KeyEdge(key->keyboard->isKeyDown(OIS::KC_ADD),      prevAdd);
+            bool subE = KeyEdge(key->keyboard->isKeyDown(OIS::KC_SUBTRACT), prevSub);
+            bool mulE = KeyEdge(key->keyboard->isKeyDown(OIS::KC_MULTIPLY), prevMul);
+            bool divE = KeyEdge(key->keyboard->isKeyDown(OIS::KC_DIVIDE),   prevDiv);
+            bool np3E = KeyEdge(key->keyboard->isKeyDown(OIS::KC_NUMPAD3),  prevNP3);
+            bool np9E = KeyEdge(key->keyboard->isKeyDown(OIS::KC_NUMPAD9),  prevNP9);
+            bool np0E = KeyEdge(key->keyboard->isKeyDown(OIS::KC_NUMPAD0),  prevNP0);
+            bool np5E = KeyEdge(key->keyboard->isKeyDown(OIS::KC_NUMPAD5),  prevNP5);
+            bool np6E = KeyEdge(key->keyboard->isKeyDown(OIS::KC_NUMPAD6),  prevNP6);
+            bool np7E = KeyEdge(key->keyboard->isKeyDown(OIS::KC_NUMPAD7),  prevNP7);
+
+            bool stepUp = (addE && !ctrlD) || np3E;
+            bool stepDn = (subE && !ctrlD) || np9E;
+            bool stepFw = mulE && !ctrlD;
+            bool stepBk = divE && !ctrlD;
+            bool stepLatR = mulE && ctrlD;
+            bool stepLatL = divE && ctrlD;
+            bool stepRst = np0E;
+            bool stepMode = np5E;
+            bool stepSit = np6E;
+            bool stepPosture = np7E;
 
             if (stepUp || stepDn || stepFw || stepBk || stepLatR || stepLatL || stepRst || stepMode || stepSit || stepPosture)
             {
@@ -1882,23 +1914,13 @@ static void MainLoopImpl(GameWorld* thisptr, float time)
                         if (stepSit)
                         {
                             seat.forceSit = !seat.forceSit;
-                            if (!seat.species.empty())
-                            {
-                                SpeciesTuning& st = speciesTuning[seat.species];
-                                st.forceSit = seat.forceSit;
-                            }
-                            SaveConfig();
+                            PersistTuning(seat);
                             DebugLog("Riding: force-sit " + seat.species + " -> " + IntToStr(seat.forceSit ? 1 : 0));
                         }
                         else if (stepPosture)
                         {
                             seat.posture = (seat.posture == POSTURE_STAND) ? POSTURE_SIT : POSTURE_STAND;
-                            if (!seat.species.empty())
-                            {
-                                SpeciesTuning& st = speciesTuning[seat.species];
-                                st.posture = seat.posture;
-                            }
-                            SaveConfig();
+                            PersistTuning(seat);
                             DebugLog("Riding: posture " + seat.species + " -> " + IntToStr(seat.posture));
                         }
                         else if (stepLatR || stepLatL)
@@ -1907,12 +1929,7 @@ static void MainLoopImpl(GameWorld* thisptr, float time)
                             seat.lateral += dLat;
                             if (seat.lateral < -kTuningClamp) seat.lateral = -kTuningClamp;
                             if (seat.lateral >  kTuningClamp) seat.lateral =  kTuningClamp;
-                            if (!seat.species.empty())
-                            {
-                                SpeciesTuning& st = speciesTuning[seat.species];
-                                st.lateral = seat.lateral;
-                            }
-                            SaveConfig();
+                            PersistTuning(seat);
                             DebugLog("Riding: lateral " + seat.species + " -> " + IntToStr((int)(seat.lateral * 100.0f)));
                         }
                         else if (stepMode)
@@ -1925,23 +1942,14 @@ static void MainLoopImpl(GameWorld* thisptr, float time)
                         {
                             seat.userOffset = Ogre::Vector3::ZERO;
                             seat.lateral = 0.0f;
-                            if (!seat.species.empty())
-                            {
-                                SpeciesTuning& st = speciesTuning[seat.species];
-                                st.seatMode = seat.seatMode;
-                                st.forceSit = seat.forceSit;
-                                st.posture = seat.posture;
-                                st.lateral = seat.lateral;
-                                st.offset = seat.userOffset;
-                            }
-                            SaveConfig();
+                            PersistTuning(seat);
                             DebugLog("Riding: reset " + seat.species + " tuning");
                         }
                         else
                         {
                             float dUp = 0.0f, dFwd = 0.0f;
-                            if (stepUp)   dUp = (addD && !prevAdd) ? 0.1f : 0.02f;
-                            if (stepDn)   dUp = (subD && !prevSub) ? -0.1f : -0.02f;
+                            if (stepUp)   dUp = addE ? 0.1f : 0.02f;
+                            if (stepDn)   dUp = subE ? -0.1f : -0.02f;
                             if (stepFw)   dFwd = 0.1f;
                             if (stepBk)   dFwd = -0.1f;
                             TuneSeat(seat, dUp, dFwd);
@@ -1954,20 +1962,6 @@ static void MainLoopImpl(GameWorld* thisptr, float time)
                 }
             }
         }
-
-        prevNumpad1 = numpad1down;
-        prevNumpad2 = numpad2down;
-        prevAdd = key->keyboard->isKeyDown(OIS::KC_ADD);
-        prevSub = key->keyboard->isKeyDown(OIS::KC_SUBTRACT);
-        prevMul = key->keyboard->isKeyDown(OIS::KC_MULTIPLY);
-        prevDiv = key->keyboard->isKeyDown(OIS::KC_DIVIDE);
-        prevNP3 = key->keyboard->isKeyDown(OIS::KC_NUMPAD3);
-        prevNP9 = key->keyboard->isKeyDown(OIS::KC_NUMPAD9);
-        prevNP0 = key->keyboard->isKeyDown(OIS::KC_NUMPAD0);
-        prevNP5 = key->keyboard->isKeyDown(OIS::KC_NUMPAD5);
-        prevNP6 = key->keyboard->isKeyDown(OIS::KC_NUMPAD6);
-        prevNP7 = key->keyboard->isKeyDown(OIS::KC_NUMPAD7);
-        prevDecimal = decimalDown;
     }
 }
 
