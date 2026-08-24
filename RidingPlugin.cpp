@@ -84,6 +84,7 @@ boost::unordered_map<Character*, Character*> riderToMount;
 // mount -> rider
 boost::unordered_map<Character*, Character*> mountToRider;
 
+
 // Seat modes: how the rider's seat anchor is chosen for this animal.
 //   0 = EXACT    - pin to the back bone (Spine2 etc.)
 //   1 = MIDPOINT - torso midpoint between the front back bone and the pelvis
@@ -170,6 +171,34 @@ boost::unordered_map<Character*, Ogre::Vector3> mountHeadingDir;
 // seat tuning (which was calibrated against that offset) stays valid.
 boost::unordered_map<Character*, Ogre::Vector3> mountAnchor;
 
+// Per-mount constant-capture bookkeeping.  The anchor (above) and the DampSeatBob
+// baseline are only trustworthy once the post-mount / post-load pose storm (carried-
+// pose blend-out, skeleton settling) has finished - capturing them on the FIRST sync
+// froze transient values (anchor 9.3 vs the settled sitting ~6.5) that then never
+// corrected, leaving the rider mis-seated after every save/load.  These counters
+// track how many consecutive syncs each quantity has held steady; capture and
+// revalidation key off them.  (SyncRiderNode/DampSeatBob run from animUpdate AND
+// mainLoop, so a "sync" is either hook - thresholds count syncs, not frames.)
+struct CapTrack
+{
+    Ogre::Vector3 prevRel;   // last raw (rBip - node)
+    float         prevBase;  // last raw seat-height-above-reference
+    int           relStable;
+    int           baseStable;
+    CapTrack() : prevRel(Ogre::Vector3::ZERO), prevBase(0.0f), relStable(0), baseStable(0) {}
+};
+boost::unordered_map<Character*, CapTrack> mountCap;
+// A quantity must hold this many consecutive stable syncs before it is captured
+// or a stored copy is adopted over the live reading.
+static const int kCaptureStableNeed = 15;
+// Anchor clamp shared by SyncRiderNode and SeedPersistedConstants (was local to
+// SyncRiderNode; hoisted when cfg persistence needed it).
+static const float kMaxAnchorLen = 12.0f;
+// DBG only: last scene-node value WE wrote per rider.  When a later read back shows
+// drift from this, some engine writer re-positioned the carried rider AFTER us -
+// quantifies the who-writes-last race instead of guessing.
+boost::unordered_map<Character*, Ogre::Vector3> dbgNodeWritten;
+
 // Pending "approach then mount" requests.  When the player picks "上马" (the repurposed
 // Bodyguard menu order) on an animal, the rider does NOT teleport onto it if it is far
 // away.  Instead it paths toward the animal - exactly like the native "pick up" order -
@@ -204,8 +233,15 @@ struct SpeciesTuning
     int           posture;       // RiderPosture (0=sit, 1=stand)
     float         lateral;       // side offset (right/left), world units
     Ogre::Vector3 offset;
-    SpeciesTuning() : seatMode(SEAT_MIDPOINT), forceSit(true), posture(POSTURE_SIT), lateral(0.0f), offset(Ogre::Vector3::ZERO) {}
-    SpeciesTuning(int m, const Ogre::Vector3& o) : seatMode(m), forceSit(true), posture(POSTURE_SIT), lateral(0.0f), offset(o) {}
+    // Settled per-pose constants persisted in riding.cfg columns 11-14 (2026-08-23):
+    // anchor = rider root-bone offset from its scene node while seated, base = seat
+    // height above the bob reference.  Mount/load replays SEED these instead of
+    // live-capturing them, so placement is correct from frame one ("remember, don't
+    // re-derive").  ZERO/0 = never captured for this species.
+    Ogre::Vector3 anchor;
+    float         base;
+    SpeciesTuning() : seatMode(SEAT_MIDPOINT), forceSit(true), posture(POSTURE_SIT), lateral(0.0f), offset(Ogre::Vector3::ZERO), anchor(Ogre::Vector3::ZERO), base(0.0f) {}
+    SpeciesTuning(int m, const Ogre::Vector3& o) : seatMode(m), forceSit(true), posture(POSTURE_SIT), lateral(0.0f), offset(o), anchor(Ogre::Vector3::ZERO), base(0.0f) {}
 };
 boost::unordered_map<std::string, SpeciesTuning> speciesTuning;
 
@@ -275,6 +311,8 @@ static void WipeAllRideState(const char* why)
     mountToRider.clear();
     mountSeat.clear();
     mountAnchor.clear();
+    mountCap.clear();
+    dbgNodeWritten.clear();
     mountBaseVOffset.clear();
     mountSmoothOrient.clear();
     mountHeadingPos.clear();
@@ -423,6 +461,14 @@ static void LoadConfig()
             st.forceSit = (sit != 0);
             st.posture = posture;
             st.lateral = lateral;
+            // columns 11-14: persisted seat constants (anchor xyz + bob baseline),
+            // written by the capture path - optional so old cfg files still load.
+            float ax = 0.0f, ay = 0.0f, az = 0.0f, abase = 0.0f;
+            if (sscanf(val.c_str(), "%*d,%*f,%*f,%*d,%*d,%*f,%*f,%*f,%*d,%*f,%f,%f,%f,%f", &ax, &ay, &az, &abase) == 4)
+            {
+                st.anchor = Ogre::Vector3(ax, ay, az);
+                st.base   = abase;
+            }
             speciesTuning[name] = st;
         }
         else if (sscanf(val.c_str(), "%f,%f", &up, &fwd) == 2)
@@ -440,11 +486,13 @@ static void SaveConfig()
     fprintf(f, "# riding.cfg - per-species seat tuning\n");
     fprintf(f, "# <species>=<mode>,<up>,<forward>,<mount>,<sit>,<roll>,<pitch>,<yaw>,<posture>,<lateral>  mode 0=exact 1=midpoint 2=neck  sit 0=off 1=on  posture 0=sit 1=stand  lateral=side offset\n");
     fprintf(f, "# columns 4 and 6-8 are OBSOLETE legacy fields (mount method / roll-pitch-yaw) - parsed-and-ignored, always written as 0\n");
+    fprintf(f, "# columns 11-14 = persisted seat constants (anchor x/y/z + bob baseline), auto-captured - do not hand-edit\n");
     boost::unordered_map<std::string, SpeciesTuning>::iterator it = speciesTuning.begin();
     for (; it != speciesTuning.end(); ++it)
-        fprintf(f, "%s=%d,%.2f,%.2f,%d,%d,0.0,0.0,0.0,%d,%.2f\n", it->first.c_str(), it->second.seatMode,
+        fprintf(f, "%s=%d,%.2f,%.2f,%d,%d,0.0,0.0,0.0,%d,%.2f,%.3f,%.3f,%.3f,%.3f\n", it->first.c_str(), it->second.seatMode,
                 it->second.offset.y, it->second.offset.x, 0,
-                it->second.forceSit ? 1 : 0, it->second.posture, it->second.lateral);
+                it->second.forceSit ? 1 : 0, it->second.posture, it->second.lateral,
+                it->second.anchor.x, it->second.anchor.y, it->second.anchor.z, it->second.base);
     fclose(f);
 }
 
@@ -816,7 +864,7 @@ static void ApplyRiderOrientation(Character* rider, const SeatInfo& seat, Charac
 // preserving the height the riding.cfg tuning was calibrated against; boneLocal is
 // recomputed every frame so a posture switch (Numpad 7) self-corrects in one frame.
 static void SyncRiderNode(Character* rider, Character* mount, AnimationClass* rAnim,
-                          const Ogre::Vector3& seatPos)
+                          const Ogre::Vector3& seatPos, bool mainPhase)
 {
     if (!rider || !mount || !rAnim || !rAnim->node) return;
 
@@ -828,38 +876,91 @@ static void SyncRiderNode(Character* rider, Character* mount, AnimationClass* rA
     Ogre::Vector3 boneLocal = nodeQ.Inverse() * (rBip - nodeP);
 
     // The pose offset rBip-node for a playable character is small (~6.4 sitting).
-    // A save/load can hand us control while the engine still has the rider's node and
-    // bones far apart - capturing THEN stores a huge garbage anchor (~20+) that pins
-    // the rider off the seat forever (seen 2026-08-23: rider dragged on the ground
-    // beside the mount).  So: refuse to store an implausible offset (keep retrying
-    // each frame until the pose relation is sane), and self-heal a previously stored
-    // poisoned one.
-    static const float kMaxAnchorLen = 12.0f;
+    // Right after pickupObject / right after a load the rider is still blending out
+    // of the carried/bind pose, so rel reads TRANSIENT values there (2026-08-23:
+    // anchor frozen at 9.3 while the settled sitting relation is ~6.5 -> rider
+    // permanently mis-seated after every save/load).  A value is only captured once
+    // it has held steady for kCaptureStableNeed syncs, and a stored anchor is
+    // re-validated against firmly-settled live readings - that heals both poison
+    // and staleness (a Numpad-7 posture switch changes the pose constant too).
+    //
+    // Capture/heal bookkeeping happens ONLY at the main-loop sync: the raw relation
+    // read mid-animation-phase differs by >1.5u between call sites (bones lag node
+    // writes until the scene flush), which first kept rs at 0 forever, then - once
+    // every character's update re-synced - made capture/stale ping-pong rewrite the
+    // cfg several times a second.  One consistent measurement point fixes both.
+    static const float kRelStableTol    = 0.35f;
+    static const float kAnchorStaleDiff = 1.5f;
     Ogre::Vector3 rel = rBip - nodeP;
+
+    if (mainPhase)
     {
+        CapTrack& ct = mountCap[mount];
+        ct.relStable = ((rel - ct.prevRel).length() < kRelStableTol) ? ct.relStable + 1 : 0;
+        ct.prevRel = rel;
+
         boost::unordered_map<Character*, Ogre::Vector3>::iterator ai = mountAnchor.find(mount);
-        if (ai != mountAnchor.end() && ai->second.length() > kMaxAnchorLen)
+        if (ai != mountAnchor.end())
         {
-            // poisoned anchor -> drop it AND the bob baseline captured in the same
-            // corrupted instant; both recapture from a sane frame
-            mountAnchor.erase(ai);
-            mountBaseVOffset.erase(mount);
+            bool poisoned = ai->second.length() > kMaxAnchorLen;
+            bool stale = (ct.relStable >= kCaptureStableNeed)
+                         && (ai->second - rel).length() > kAnchorStaleDiff;
+            if (poisoned || stale)
+            {
+                // drop it AND the bob baseline captured in the same corrupted instant;
+                // both recapture from settled frames
+                mountAnchor.erase(ai);
+                mountBaseVOffset.erase(mount);
+                ct.baseStable = 0;
+                try { DebugLog(std::string("Riding: anchor recapture (") + (poisoned ? "poisoned" : "stale") + ")"); } catch(...) {}
+            }
         }
-        ai = mountAnchor.find(mount);
-        if (ai == mountAnchor.end() && rel.length() <= kMaxAnchorLen)
-            ai = mountAnchor.insert(std::make_pair(mount, rel)).first;
-        // while capture is still deferred, use the LIVE offset so this frame still
-        // lands sensibly instead of jumping to a wrong fixed point - but CLAMPED,
-        // otherwise a stretched post-load pose feeds an unbounded self-referential
-        // offset back into the placement (seen 2026-08-23 as a constant ~74 drift)
-        Ogre::Vector3 anchor = (ai != mountAnchor.end()) ? ai->second : rel;
+        if (mountAnchor.find(mount) == mountAnchor.end()
+            && rel.length() <= kMaxAnchorLen && ct.relStable >= kCaptureStableNeed)
+        {
+            mountAnchor.insert(std::make_pair(mount, rel));
+            // Persist so every future mount/load SEEDS this value instead of re-capturing
+            // through the pose storm ("remember, don't re-derive").
+            boost::unordered_map<Character*, SeatInfo>::iterator ssi = mountSeat.find(mount);
+            if (ssi != mountSeat.end() && !ssi->second.species.empty())
+            {
+                speciesTuning[ssi->second.species].anchor = rel;
+                SaveConfig();
+                try { DebugLog("Riding: anchor captured+saved [" + ssi->second.species + "]"); } catch(...) {}
+            }
+        }
+    }
+
+    // Until capture succeeds, use the LIVE offset so this frame still lands sensibly.
+    // With anchor = live rel the solved node lands exactly ON seatPos - i.e. the
+    // original direct node placement the riding.cfg tuning was calibrated against -
+    // so deferring costs no jump once capture completes.  The live fallback must stay
+    // CLAMPED, otherwise a stretched post-load pose feeds an unbounded self-
+    // referential offset back into the placement (seen 2026-08-23 as constant ~74 drift).
+    Ogre::Vector3 anchor;
+    boost::unordered_map<Character*, Ogre::Vector3>::iterator af = mountAnchor.find(mount);
+    if (af != mountAnchor.end())
+        anchor = af->second;
+    else
+    {
+        anchor = rel;
         if (anchor.length() > kMaxAnchorLen)
             anchor *= kMaxAnchorLen / anchor.length();
-
-        Ogre::Vector3 target = seatPos + anchor;
-        rAnim->node->setPosition(target - nodeQ * boneLocal);
-        rAnim->rootBonePosition = seatPos;
     }
+
+    Ogre::Vector3 target = seatPos + anchor;
+    // Servo removed 2026-08-24: it existed to pre-cancel the engine's ragdoll-carry
+    // slot pin, which no longer exists - Mount() dissolves the carry link right after
+    // pickupObject (dropCarriedObject removeOnly).  With no pinner, the measured
+    // "drift" was ordinary physics displacement (gravity/ground snap) and pre-
+    // subtracting it inflated the write height every frame until the clamp - the
+    // free rider hovered above the back (Numpad8 probe, 2026-08-24).
+    Ogre::Vector3 written = target - nodeQ * boneLocal;
+    rAnim->node->setPosition(written);
+    rAnim->rootBonePosition = seatPos;
+    // DBG: remember what we wrote - a later read-back that differs from this proves
+    // an engine writer re-positioned the carried rider after us (who-writes-last race).
+    dbgNodeWritten[rider] = written;
 }
 
 // Shrink the vertical run-cycle bob of the seat.  The seat anchor bone (neck/spine)
@@ -903,8 +1004,23 @@ static void DampSeatBob(Character* mount, const SeatInfo& seat, Ogre::Vector3& s
         refY = mount->getBoneWorldPosition("Bip01").y;
 
     // strip the user's height tune so only the bone-anchor bob gets damped
-    float uy    = seat.userOffset.y;
-    float baseY = seatPos.y - uy;
+    float uy      = seat.userOffset.y;
+    float baseY   = seatPos.y - uy;
+    float rawBase = baseY - refY;   // seat height above the reference (bob-free mean, no user tune)
+
+    // Same settle-gate as the SyncRiderNode anchor: right after mount/load rawBase is
+    // transient (pose blending, ghost bones); freezing THEN baked a wrong baseline
+    // into every later frame (persistent "rider sits too low" after loading a save).
+    // Capture only once rawBase has held steady, and re-validate a stored baseline
+    // against firmly-settled readings.  Until captured, damping is skipped entirely -
+    // the ride bobs naturally for a moment instead of being pulled toward a wrong
+    // constant.  While the mount is RUNNING the bob itself keeps the counter from
+    // accumulating, so recapture only fires when readings are genuinely settled.
+    static const float kBaseStableTol     = 0.35f;
+    static const float kBaselineStaleDiff = 3.0f;
+    CapTrack& ct = mountCap[mount];
+    ct.baseStable = (fabsf(rawBase - ct.prevBase) < kBaseStableTol) ? ct.baseStable + 1 : 0;
+    ct.prevBase = rawBase;
 
     boost::unordered_map<Character*, float>::iterator vo = mountBaseVOffset.find(mount);
     if (vo != mountBaseVOffset.end() && fabsf(vo->second) > 25.0f)
@@ -914,10 +1030,30 @@ static void DampSeatBob(Character* mount, const SeatInfo& seat, Ogre::Vector3& s
         mountBaseVOffset.erase(mount);
         vo = mountBaseVOffset.end();
     }
+    if (vo != mountBaseVOffset.end()
+        && ct.baseStable >= kCaptureStableNeed
+        && fabsf(rawBase - vo->second) > kBaselineStaleDiff)
+    {
+        // stale: stored baseline disagrees with a settled reading (captured mid-blend)
+        mountBaseVOffset.erase(mount);
+        vo = mountBaseVOffset.end();
+    }
     if (vo == mountBaseVOffset.end())
     {
-        mountBaseVOffset[mount] = baseY - refY;    // stable seat height above the reference (no bob, no user tune)
-        return;                                    // first frame: nothing to damp yet
+        if (ct.baseStable >= kCaptureStableNeed)
+        {
+            mountBaseVOffset[mount] = rawBase;   // settled -> begin damping next sync
+            // Persist once per ride so future mounts/loads seed it directly instead of
+            // live-capturing through the post-mount/post-load pose storm.
+            boost::unordered_map<Character*, SeatInfo>::iterator ssi = mountSeat.find(mount);
+            if (ssi != mountSeat.end() && !ssi->second.species.empty())
+            {
+                speciesTuning[ssi->second.species].base = rawBase;
+                SaveConfig();
+                try { DebugLog("Riding: baseline captured+saved [" + ssi->second.species + "]"); } catch(...) {}
+            }
+        }
+        return;                                  // nothing to damp yet (or still settling)
     }
 
     float stableY    = refY + vo->second;
@@ -966,7 +1102,6 @@ static void DebugLogRideFrame(Character* rider, Character* mount, const SeatInfo
 
     AnimationClass* mAnim = mount->getAnimationClass();
     AnimationClass* rAnim = rider->getAnimationClass();
-    char dbg[1100];
     if (mAnim && rAnim)
     {
         Ogre::Vector3 rootP = mAnim->getBoneWorldPosition("Bip01", 1.0f);
@@ -992,8 +1127,27 @@ static void DebugLogRideFrame(Character* rider, Character* mount, const SeatInfo
         // The RIDER's own root bone in world space (the renderer's true source)
         Ogre::Vector3 riderBip01 = rider->getBoneWorldPosition("Bip01");
         Ogre::Quaternion riderBip01Q = rAnim->getBoneWorldOrientation("Bip01");
-        _snprintf_s(dbg, 1100, _TRUNCATE,
-            "Riding: DBG root=(%.2f,%.2f,%.2f) back=(%.2f,%.2f,%.2f) fwd=(%.2f,%.2f,%.2f) rawT=(%.2f,%.2f,%.2f) tgt=(%.2f,%.2f,%.2f) node=(%.2f,%.2f,%.2f) rMove=(%.2f,%.2f,%.2f) rRoot=(%.2f,%.2f,%.2f) rBip=(%.2f,%.2f,%.2f) nodeQ=(%.2f,%.2f,%.2f,%.2f) rBipQ=(%.2f,%.2f,%.2f,%.2f) move=(%.2f,%.2f,%.2f) anch=(%.2f,%.2f,%.2f) st=%d pelv=(%.2f,%.2f,%.2f)",
+        // capture-gate state: raw pose relation + how settled anchor/baseline are
+        Ogre::Vector3 relDbg = riderBip01 - nodeP;
+        int rsDbg = 0, bsDbg = 0;
+        boost::unordered_map<Character*, CapTrack>::iterator ci = mountCap.find(mount);
+        if (ci != mountCap.end()) { rsDbg = ci->second.relStable; bsDbg = ci->second.baseStable; }
+        // drift since OUR last node write: nonzero = an engine writer re-positioned
+        // the rider's scene node after us (who-writes-last race meter)
+        Ogre::Vector3 wnDbg(0.0f, 0.0f, 0.0f);
+        boost::unordered_map<Character*, Ogre::Vector3>::iterator wi = dbgNodeWritten.find(rider);
+        if (wi != dbgNodeWritten.end()) wnDbg = nodeP - wi->second;
+        // ragdoll/carry state of the RIDER, per frame.  Needed because the Numpad8 probe
+        // can only read the flags in the same frame it calls ragdollModeUT, and a same-
+        // frame read is inconclusive when a call lands deferred (exactly how carryModeT
+        // behaved).  With these fields a probe press shows up as a 1->0 transition on a
+        // later frame - or proves the flag is being re-asserted every frame.
+        int ragDbg  = rider->isRagdoll() ? 1 : 0;
+        int aRagDbg = rAnim->isRagdoll() ? 1 : 0;
+        int bcDbg   = rider->_isBeingCarried ? 1 : 0;
+        char dbg[1400];
+        _snprintf_s(dbg, 1400, _TRUNCATE,
+            "Riding: DBG root=(%.2f,%.2f,%.2f) back=(%.2f,%.2f,%.2f) fwd=(%.2f,%.2f,%.2f) rawT=(%.2f,%.2f,%.2f) tgt=(%.2f,%.2f,%.2f) node=(%.2f,%.2f,%.2f) rMove=(%.2f,%.2f,%.2f) rRoot=(%.2f,%.2f,%.2f) rBip=(%.2f,%.2f,%.2f) nodeQ=(%.2f,%.2f,%.2f,%.2f) rBipQ=(%.2f,%.2f,%.2f,%.2f) move=(%.2f,%.2f,%.2f) anch=(%.2f,%.2f,%.2f) st=%d pelv=(%.2f,%.2f,%.2f) rel=(%.2f,%.2f,%.2f) rs=%d bs=%d wn=(%.2f,%.2f,%.2f) rag=%d aRag=%d bc=%d",
             rootP.x, rootP.y, rootP.z,
             backP.x, backP.y, backP.z,
             fwd.x, fwd.y, fwd.z,
@@ -1008,7 +1162,11 @@ static void DebugLogRideFrame(Character* rider, Character* mount, const SeatInfo
             dmvP.x, dmvP.y, dmvP.z,
             anchP.x, anchP.y, anchP.z,
             anchSrc,
-            pelvP.x, pelvP.y, pelvP.z);
+            pelvP.x, pelvP.y, pelvP.z,
+            relDbg.x, relDbg.y, relDbg.z,
+            rsDbg, bsDbg,
+            wnDbg.x, wnDbg.y, wnDbg.z,
+            ragDbg, aRagDbg, bcDbg);
         DebugLog(dbg);
     }
 }
@@ -1070,6 +1228,24 @@ static void CycleSeatMode(SeatInfo& seat)
     DebugLog("Riding: mode " + seat.species + " -> " + IntToStr(seat.seatMode));
 }
 
+// Seed persisted per-species constants into a fresh ride's maps so placement is
+// correct from frame one - mounting or restoring after a load no longer depends on
+// live-capturing through the post-mount/post-load pose storm.  Species never ridden
+// before simply have nothing to seed; the live-capture path remains their fallback.
+static void SeedPersistedConstants(Character* mount)
+{
+    boost::unordered_map<Character*, SeatInfo>::iterator si = mountSeat.find(mount);
+    if (si == mountSeat.end() || si->second.species.empty()) return;
+    boost::unordered_map<std::string, SpeciesTuning>::iterator ti = speciesTuning.find(si->second.species);
+    if (ti == speciesTuning.end()) return;
+    if (ti->second.anchor.length() > 0.01f && ti->second.anchor.length() <= kMaxAnchorLen)
+        mountAnchor.insert(std::make_pair(mount, ti->second.anchor));
+    if (fabsf(ti->second.base) > 0.001f)
+        mountBaseVOffset.insert(std::make_pair(mount, ti->second.base));
+    try { DebugLog("Riding: seeded constants [" + si->second.species + "] anchor=" + IntToStr((int)(ti->second.anchor.length() * 100.0f))
+                   + " base=" + IntToStr((int)(ti->second.base * 100.0f))); } catch(...) {}
+}
+
 void Mount(Character* rider, Character* mount)
 {
     if (!rider || !mount) return;
@@ -1085,7 +1261,40 @@ void Mount(Character* rider, Character* mount)
 
     // 1) Have the animal carry the rider using Kenshi's native carry system.
     //    This provides auto-follow + no physics collision fighting.
+    try { DebugLog(std::string("Riding: ragdoll probe pre-pickup=")
+        + IntToStr(rider->isRagdoll() ? 1 : 0)); } catch(...) {}
     mount->pickupObject(rider);
+    // Probes (2026-08-23/24): pickupObject ALWAYS ragdolls the rider (pre=0/post=1)
+    // and the ragdoll-carry drag ABSOLUTELY pins the rider's node to a carrier-local
+    // slot every frame - our writes can never win while it is active.  The Numpad8
+    // probe also showed carryModeT(true,false,false) stops the drag but dissolves
+    // the whole carry link anyway (carrying/beingCarried -> 0) and leaves the mount
+    // stuck in a carry pose - so native carry is all-or-nothing.  Dissolve the link
+    // cleanly right away (removeOnly = no ragdoll fling) and own placement outright.
+    //
+    // CAUTION (2026-08-24, log-proven): dropping the link does NOT end the ragdoll
+    // pickupObject started.  The "carry dissolved:" line below reports rag=1 every
+    // single mount, and from the second mount on the "pre-pickup=" probe above also
+    // reads 1 - the ragdoll survives Dismount and accumulates across rides.  The
+    // sitting pose is only a per-frame cover over it (AnimUpdateImpl's forcedSlaveLoop
+    // plus HaltAndForceSitPass), which is why the ride looks right but Dismount's
+    // endSlaveAnim uncovers a live ragdoll and the rider collapses, and why a mounted
+    // rider's context menu offers nothing but "knock down".  Candidate teardown is
+    // isolated in the Numpad8 probe (see HotkeyPass) until it is validated in-game.
+    mount->dropCarriedObject(false, true);
+    // NOTE (2026-08-24): pickupObject ragdolls the rider and it CANNOT be cleared while
+    // mounted - DBG proved rag=1/aRag=1 stays for the whole ride even after an immediate
+    // ragdollModeUT(false) here (Path A, reverted).  The ragdoll is a consequence of the
+    // carry state (_isBeingCarried=1 re-applies it every frame), and _isBeingCarried must
+    // stay 1 during the ride or the mount's collision volume shoves the rider off.  The
+    // sitting-pose cover hides the ragdoll, so the ride looks correct.  Ragdoll teardown
+    // (with the QUEUED recovery so the rider stands up) is done at Dismount instead, where
+    // the rider is leaving the mount anyway - see Dismount().
+    try { DebugLog(std::string("Riding: carry dissolved: carrying=")
+        + IntToStr(mount->isCarryingSomething ? 1 : 0)
+        + " beingCarried=" + IntToStr(rider->_isBeingCarried ? 1 : 0)
+        + " rag=" + IntToStr(rider->isRagdoll() ? 1 : 0)
+        + " down=" + IntToStr(rider->isDown() ? 1 : 0)); } catch(...) {}
 
     // 2) Do NOT slave-attach the rider's scene node to the mount's back bone.
     //    Attaching re-parents the node under the bone, so the engine re-pins it every
@@ -1104,6 +1313,7 @@ void Mount(Character* rider, Character* mount)
 
     riderToMount[rider] = mount;
     mountToRider[mount] = rider;
+    SeedPersistedConstants(mount);   // frame-one placement from riding.cfg constants
 
     if (rider->getMovement())
         rider->getMovement()->halt();
@@ -1124,12 +1334,55 @@ void Dismount(Character* rider)
     // stop the sitting animation
     rider->endSlaveAnim("sitting chair");
 
+    // THE put-down (2026-08-24 rev 6, confirmed in-game).  Mount() only severs the CARRIER's
+    // side of the carry link (dropCarriedObject with removeOnly), which leaves the rider stuck
+    // in carried-state - and for the carried side pickupObject had DESTROYED its CharMovement
+    // (pulled it out of the physics world).  A destroyed movement still honours
+    // _setPositionSimple (logical pos + render, which is why the rider looks properly seated)
+    // but never simulates: no gravity, no ground, no move orders, and isDestinationReached()
+    // answers true forever.  That one fact caused all three symptoms we chased - the ex-rider
+    // hanging frozen in mid-air, ignoring click-to-move, and "boarding from any distance".
+    // getDropped is the engine's own carried-side handler, the exact inverse of the
+    // getPickedUp that pickupObject triggered: it clears carried-state, restore()s the
+    // movement (back into the physics world), grounds the body, and with ragdollHim=false
+    // stands the rider up.  It must run FIRST, while _isBeingCarried is still 1 - that is the
+    // state it tears down - hence before the flag is cleared below.
+    //
+    // hull=true was picked by A/B (Numpad4 true vs Numpad8 false, same session): both left the
+    // rider standing and controllable, but hull=false first yanked the body ~19u ABOVE the
+    // mount before it fell (dMv 10.35 -> 18.96 -> 1.01), while hull=true descended straight to
+    // the ground (dMv 10.35 -> 9.25 -> -0.85).  No pop, closer settle.
+    if (rider->_isBeingCarried)
+        rider->getDropped(false, true);
+    else
+        DebugLog("Riding: dismount without carried-state (skipped getDropped)");
+
+    // Clear the carried-body flag.  Mount() leaves _isBeingCarried=1 on purpose (it makes
+    // the separation pass skip the rider so the mount's collision volume can't shove them
+    // off), and dropCarriedObject(...,removeOnly) never touches the rider's side, so it
+    // stays 1 for the whole ride.  getDropped above normally clears it already; this is the
+    // belt-and-suspenders for the path where it was skipped, since a lingering 1 keeps the
+    // order system treating the rider as an incapacitated carried object (context menu stuck
+    // on "knock down").  Safe here: no carrier means no collision volume to be pushed by.
+    rider->_isBeingCarried = false;
+
+    // Clear the pickup/carry ragdoll.  pickupObject ragdolls the rider on the CARRY_MODE part
+    // (0x800) - NOT WHOLE (0x1), which is why every earlier teardown attempt was a no-op - and
+    // during the ride it is merely hidden under the per-frame sitting-pose cover.  Once
+    // endSlaveAnim above drops that cover a leftover ragdoll shows as the rider collapsing
+    // limp.  This is the queued Character-level call, so it also runs postRagdollCallback's
+    // get-up recovery; the log shows chRag going 1 -> 0 on the following frame.  Normally
+    // redundant after getDropped(ragdollHim=false), kept as the safety net.
+    rider->ragdollMode(false, RagdollPart::CARRY_MODE);
+
     boost::unordered_map<Character*, Character*>::iterator it = riderToMount.find(rider);
     if (it != riderToMount.end())
     {
         Character* mount = it->second;
-        // tell the mount to drop the rider (no ragdoll, no hull)
-        if (mount)
+        // tell the mount to drop the rider (no ragdoll, no hull).  Since 2026-08-24
+        // Mount() dissolves the carry link right after pickupObject, this is normally
+        // a no-op - guarded so we never call teardown on an already-empty link.
+        if (mount && mount->isCarryingSomething)
             mount->dropCarriedObject(false, false);
         // stop the walk/run animations we force-played on pack_beast mounts while
         // ridden, so the mount's own animation selection takes back over afterwards.
@@ -1151,7 +1404,9 @@ void Dismount(Character* rider)
         mountHeadingPos.erase(mount);
         mountHeadingDir.erase(mount);
         mountAnchor.erase(mount);
+        mountCap.erase(mount);
         debugLastPos.erase(mount);
+        dbgNodeWritten.erase(rider);
     }
 
     DebugLog("Riding: dismounted");
@@ -1179,12 +1434,15 @@ void RestoreRideAfterLoad(Character* rider, Character* mount)
     // stale per-mount caches cannot exist across a reload, but erase anyway to stay
     // symmetric with Dismount() in case a restore ever overwrites a live pair
     mountAnchor.erase(mount);
+    mountCap.erase(mount);
     mountBaseVOffset.erase(mount);
     mountLastPos.erase(mount);   // was missed before 2026-08-23: one stale forceWalk tick after load
     mountSmoothOrient.erase(mount);
     mountHeadingPos.erase(mount);
     mountHeadingDir.erase(mount);
     debugLastPos.erase(mount);
+    dbgNodeWritten.erase(rider);
+    SeedPersistedConstants(mount);   // frame-one placement from riding.cfg constants
 
     DebugLog("Riding: restored ride after load [" + seat.species + "] mode="
              + IntToStr(seat.seatMode));
@@ -1385,41 +1643,37 @@ static void AnimUpdateImpl(AnimationClass* thisptr, float frameTIME)
 
     animUpdate_orig(thisptr, frameTIME);
 
-    // After the game's own animation update (which re-pins the carried rider onto
-    // the carry bone), re-place the rider onto the mount's back so the carry bone
-    // swing can't fling them around.  This runs inside the rider's own animation
-    // update, closer to the render path than the main-loop sync.
-    if (thisptr)
+#if 0
+    // DISABLED 2026-08-23 (was: re-place every mounted rider after every character's
+    // animation update).  DBG proved the engine does not apply a delta drag - it
+    // ABSOLUTELY pins the carried node to a carrier-local slot every frame (slot
+    // stayed constant at side+4.1 / down+6.4 / fwd+17.6 through a full turn), so no
+    // number of early writes wins.  The real fix is stopping the engine's ragdoll-
+    // carry drag itself (see the Numpad8 carry probe in HotkeyPass).
+    if (!mountSeat.empty())
     {
-        Character* ch = thisptr->me;
-        if (ch)
+        boost::unordered_map<Character*, Character*>::iterator rit = riderToMount.begin();
+        for (; rit != riderToMount.end(); ++rit)
         {
-            boost::unordered_map<Character*, Character*>::iterator it = riderToMount.find(ch);
-            if (it != riderToMount.end())
-            {
-                Character* mount = it->second;
-                if (mount)
-                {
-                    boost::unordered_map<Character*, SeatInfo>::iterator sit = mountSeat.find(mount);
-                    if (sit != mountSeat.end())
-                    {
-                        const SeatInfo& seat = sit->second;
+            Character* rider = rit->first;
+            Character* mount = rit->second;
+            if (!rider || !mount) continue;
+            AnimationClass* rAnim = rider->getAnimationClass();
+            if (!rAnim || !rAnim->node) continue;
+            boost::unordered_map<Character*, SeatInfo>::iterator sit = mountSeat.find(mount);
+            if (sit == mountSeat.end()) continue;
+            const SeatInfo& seat = sit->second;
+            if (!SeatNeedsPlacement(seat)) continue;
 
-                        if (SeatNeedsPlacement(seat))
-                        {
-                            // Horizontal instant; vertical bob scaled by DampSeatBob -
-                            // same rule as the main loop so the two points agree.
-                            Ogre::Vector3 seatPos = ComputeDampedSeatPos(mount, seat);
-
-                            if (ch->getMovement())
-                                ch->getMovement()->_setPositionSimple(seatPos);
-                            SyncRiderNode(ch, mount, thisptr, seatPos);
-                        }
-                    }
-                }
-            }
+            // Horizontal instant; vertical bob scaled by DampSeatBob - same rule as
+            // the main loop so every sync point agrees.
+            Ogre::Vector3 seatPos = ComputeDampedSeatPos(mount, seat);
+            if (rider->getMovement())
+                rider->getMovement()->_setPositionSimple(seatPos);
+            SyncRiderNode(rider, mount, rAnim, seatPos, false);
         }
     }
+#endif
 }
 
 // SEH shell: same rationale as mainLoop_hook.  The restore path runs here for
@@ -1536,8 +1790,13 @@ static void ServicePendingMounts()
             // The movement system's own "arrived / can get no closer" flag - scale-free
             // fallback for big-bodied mounts whose centre stays beyond kMountArriveDist.
             // Only trusted after a short settle so a spurious first-frame "reached" (set
-            // before pathing starts) can't board instantly.
-            bool reached = move && move->isDestinationReached() && it->second.age > 20;
+            // before pathing starts) can't board instantly, AND only within a sane distance:
+            // a rider whose CharMovement has been destroyed (the state a botched dismount
+            // leaves behind - see the rev6 notes) never simulates and reports "destination
+            // reached" forever, which used to board it from across the map.  The bound keeps
+            // the fallback doing its real job (huge mount, centre out of reach) and nothing else.
+            bool reached = move && move->isDestinationReached() && it->second.age > 20
+                           && d < kMountArriveDist * 6.0f;
 
             if (d < kMountArriveDist || reached)
             {
@@ -1676,7 +1935,7 @@ static void SyncMountedRiders()
                 rider->getMovement()->_setPositionSimple(seatPos);
             AnimationClass* rAnim = rider->getAnimationClass();
             if (rAnim)
-                SyncRiderNode(rider, mount, rAnim, seatPos);
+                SyncRiderNode(rider, mount, rAnim, seatPos, true);
         }
     }
 }
@@ -1857,6 +2116,13 @@ static void HotkeyPass()
             else
                 DebugLog("Riding: select the rider, then press Numpad2");
         }
+
+        // Numpad2 above now runs the full rev6 put-down (getDropped + ragdoll clear) inside
+        // Dismount() itself, confirmed in-game 2026-08-24 (both hull A/B variants stood the
+        // rider up and restored control; hull=true settles straight down, hull=false pops the
+        // body up ~19u first, so true won).  The Numpad4/Numpad8 A/B probes and the 30-frame
+        // PostDismountWatch that carried the investigation have been removed now that the fix
+        // lives on the real path.  History of the dead ends is preserved in CLAUDE.md.
 
         // 3) Live seat tuning (applies to the currently mounted animal).
         //    Rider FACING is not tunable - it always follows the mount's travel direction.
@@ -2051,42 +2317,62 @@ void contextMenu_show_hook(ContextMenuGUI* thisptr, const lektor<int>& ordersLis
 
         bool rideable = IsRideable(target);
 
-        // The ordersList is parallel to the optionsList children (same count, same
-        // order).  Identify the Bodyguard row by its ORDER value rather than caption
-        // text (caption matching is fragile: encoding + nested widgets).
-        //
         // IMPORTANT: the context-menu ordersList uses a DIFFERENT enumeration than
         // TaskType.  In-game dump (Kenshi 1.0.65) proved: 26=Trade, 31=Bodyguard,
         // 45=Follow, 69=KnockOut, 225=PickUp.  TaskType::BODYGUARD compiles to 45 here
-        // (which is Follow in the menu enum), so we must NOT use it - the menu id for
-        // Bodyguard is 31.  (newPlayerTask still uses TaskType::BODYGUARD correctly:
-        // clicking the order-31 row is dispatched by the game as TaskType 45.)
+        // (which is Follow in the menu enum), so the menu id for Bodyguard is 31.
+        // (newPlayerTask still uses TaskType::BODYGUARD correctly: clicking the
+        // order-31 row is dispatched by the game as TaskType 45.)
         const int kMenuOrderBodyguard = 31;
-        int n = childCount < orderCount ? childCount : orderCount;
-        for (int i = 0; i < n; ++i)
+
+        // per-row mapping dump, only when continuous diagnostics is on (Numpad .).
+        // Dumps EVERY child against the order AT THE SAME INDEX - keeping the two
+        // side by side is exactly what exposed the misalignment documented below.
+        if (debugContinuous)
         {
-            int order = ordersList[i];
+            for (int i = 0; i < childCount; ++i)
+            {
+                MyGUI::Widget* child = opts->getChildAt(i);
+                if (!child) continue;
+                try { std::string cap = GetWidgetCaptionDeep(child);
+                      char drow[256]; _snprintf_s(drow, 256, _TRUNCATE, "Riding:   row %d order=%s type=%s cap='%s'", i,
+                      (i < orderCount ? IntToStr(ordersList[i]).c_str() : "-"), child->getTypeName().c_str(), cap.c_str()); DebugLog(drow); } catch(...) {}
+            }
+        }
+
+        bool hasBodyguardOrder = false;
+        for (int i = 0; i < orderCount; ++i)
+            if (ordersList[i] == kMenuOrderBodyguard) { hasBodyguardOrder = true; break; }
+
+        // Only rename for rideable player-owned animals that actually offer the
+        // Bodyguard order.  Everything else (humans, wild animals) stays untouched so
+        // vanilla "Bodyguard" keeps working - no hiding, no layout change.
+        if (!rideable || !hasBodyguardOrder)
+            return;
+
+        // ⚠️ optionsList children are NOT guaranteed to be index-parallel to
+        // ordersList: observed 2026-08-23 on wounded animals - the 急救 (first aid,
+        // order 25) row renders at the TOP while sitting at the END of ordersList,
+        // shifting every later row down by one.  Index-based lookup then renamed the
+        // FOLLOW row -> "right-click UI scrambled" on bull / caged beast / beak thing.
+        // Locate the button BY ITS VANILLA CAPTION instead: the caption is literally
+        // what the user sees, so a match can never scramble the menu.  If no such row
+        // is found, leave the menu as-is - clicking vanilla 侍卫 still mounts via the
+        // newPlayerTask hook (dispatch keys on the internal order id, not the label).
+        static const std::string kBodyguardCap = "\xE4\xBE\x8D\xE5\x8D\xAB"; // "侍卫" UTF-8, explicit bytes (v100 has no /utf-8)
+        for (int i = 0; i < childCount; ++i)
+        {
             MyGUI::Widget* child = opts->getChildAt(i);
             if (!child) continue;
-
-            // per-row mapping dump, only when continuous diagnostics is on (Numpad .)
-            if (debugContinuous)
-            {
-                try { std::string cap = GetWidgetCaptionDeep(child);
-                      char drow[256]; _snprintf_s(drow, 256, _TRUNCATE, "Riding:   row %d order=%d type=%s cap='%s'", i, order, child->getTypeName().c_str(), cap.c_str()); DebugLog(drow); } catch(...) {}
-            }
-
-            if (order != kMenuOrderBodyguard) continue;   // only touch the Bodyguard row
-
-            // Only rename for rideable player-owned animals.  For everything else
-            // (humans, wild animals) leave the menu completely untouched so vanilla
-            // "Bodyguard" keeps working - no hiding, no layout change.
-            if (!rideable) continue;
+            std::string cap;
+            try { cap = GetWidgetCaptionDeep(child); } catch(...) { cap.clear(); }
+            if (cap != kBodyguardCap) continue;
 
             // rename Bodyguard -> 上马 (UTF-8 bytes; MyGUI captions are UTF-8)
             bool ok = SetWidgetCaptionDeep(child, "\xE4\xB8\x8A\xE9\xA9\xAC");
             try { opts->_updateChilds(); } catch(...) {}
             try { DebugLog(std::string("Riding: rename Bodyguard->shangma idx=") + IntToStr(i) + (ok ? " ok" : " FAILED(no caption widget)")); } catch(...) {}
+            break;
         }
 
     } catch(...) {}
