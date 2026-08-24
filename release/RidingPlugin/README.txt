@@ -26,7 +26,6 @@
     Numpad +/-    ：上 / 下
     Numpad * / /  ：前 / 后
     Ctrl + * / /  ：左 / 右
-    Numpad 3 / 9  ：高度微调（Ctrl 加大步长）
     Numpad 5      ：座椅模式
     Numpad 6      ：force-sit
     Numpad 7      ：坐 / 站

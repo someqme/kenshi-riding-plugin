@@ -30,7 +30,6 @@
   Numpad + / -      上 / 下
   Numpad * / /      前 / 后
   Ctrl + * / /      左 / 右
-  Numpad 3 / 9      高度细调（按住 Ctrl 步长更大）
   Numpad 5          切换座椅模式
   Numpad 6          force-sit 开关
   Numpad 7          坐姿 / 站姿

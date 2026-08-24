@@ -2050,8 +2050,6 @@ static void HotkeyPass()
         static bool prevSub = false;
         static bool prevMul = false;
         static bool prevDiv = false;
-        static bool prevNP3 = false;
-        static bool prevNP9 = false;
         static bool prevNP0 = false;
         static bool prevNP5 = false;
         static bool prevNP6 = false;
@@ -2127,11 +2125,13 @@ static void HotkeyPass()
         // 3) Live seat tuning (applies to the currently mounted animal).
         //    Rider FACING is not tunable - it always follows the mount's travel direction.
         //    Numpad +/- : up/down 0.1    Numpad */ : forward/back 0.1
-        //    Numpad 3/9 : fine up/down 0.02    Numpad 0 : reset this species to 0
         //    Numpad 5   : cycle seat mode (exact -> midpoint -> neck)
         //    Numpad 6   : toggle force-sit on/off
         //    Numpad 7   : cycle rider posture (sit -> stand)
         //    Ctrl+*/ /   : move the seat left/right (lateral)
+        //    Numpad 0   : reset this species to 0
+        //    (The old Numpad 3/9 ±0.02 fine step was removed 2026-08-24 - redundant with
+        //     +/- now that per-species presets cover the common animals; user call.)
         {
             bool ctrlD = key->keyboard->isKeyDown(OIS::KC_LCONTROL) || key->keyboard->isKeyDown(OIS::KC_RCONTROL);
 
@@ -2139,15 +2139,13 @@ static void HotkeyPass()
             bool subE = KeyEdge(key->keyboard->isKeyDown(OIS::KC_SUBTRACT), prevSub);
             bool mulE = KeyEdge(key->keyboard->isKeyDown(OIS::KC_MULTIPLY), prevMul);
             bool divE = KeyEdge(key->keyboard->isKeyDown(OIS::KC_DIVIDE),   prevDiv);
-            bool np3E = KeyEdge(key->keyboard->isKeyDown(OIS::KC_NUMPAD3),  prevNP3);
-            bool np9E = KeyEdge(key->keyboard->isKeyDown(OIS::KC_NUMPAD9),  prevNP9);
             bool np0E = KeyEdge(key->keyboard->isKeyDown(OIS::KC_NUMPAD0),  prevNP0);
             bool np5E = KeyEdge(key->keyboard->isKeyDown(OIS::KC_NUMPAD5),  prevNP5);
             bool np6E = KeyEdge(key->keyboard->isKeyDown(OIS::KC_NUMPAD6),  prevNP6);
             bool np7E = KeyEdge(key->keyboard->isKeyDown(OIS::KC_NUMPAD7),  prevNP7);
 
-            bool stepUp = (addE && !ctrlD) || np3E;
-            bool stepDn = (subE && !ctrlD) || np9E;
+            bool stepUp = addE && !ctrlD;
+            bool stepDn = subE && !ctrlD;
             bool stepFw = mulE && !ctrlD;
             bool stepBk = divE && !ctrlD;
             bool stepLatR = mulE && ctrlD;
@@ -2214,8 +2212,8 @@ static void HotkeyPass()
                         else
                         {
                             float dUp = 0.0f, dFwd = 0.0f;
-                            if (stepUp)   dUp = addE ? 0.1f : 0.02f;
-                            if (stepDn)   dUp = subE ? -0.1f : -0.02f;
+                            if (stepUp)   dUp = 0.1f;
+                            if (stepDn)   dUp = -0.1f;
                             if (stepFw)   dFwd = 0.1f;
                             if (stepBk)   dFwd = -0.1f;
                             TuneSeat(seat, dUp, dFwd);
@@ -2224,7 +2222,7 @@ static void HotkeyPass()
                 }
                 else
                 {
-                    DebugLog("Riding: select the rider, then tune with Numpad +/- * / 3 9 0");
+                    DebugLog("Riding: select the rider, then tune with Numpad +/- * / 0");
                 }
             }
         }

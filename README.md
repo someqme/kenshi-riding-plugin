@@ -44,7 +44,6 @@
 | 上 / 下微调 | `Numpad +` / `Numpad -` |
 | 前 / 后微调 | `Numpad *` / `Numpad /` |
 | 左右微调 | `Ctrl + *` / `Ctrl + /` |
-| 高度微调 | `Numpad 3` / `Numpad 9`（`Ctrl` 加大步长） |
 | 座椅模式 | `Numpad 5` |
 | force-sit | `Numpad 6` |
 | 坐 / 站 | `Numpad 7` |
