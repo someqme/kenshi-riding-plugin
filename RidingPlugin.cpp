@@ -943,6 +943,20 @@ static void SyncRiderNode(Character* rider, Character* mount, AnimationClass* rA
 {
     if (!rider || !mount || !rAnim || !rAnim->node) return;
 
+    // EXP5 2026-08-25: kill the carry ragdoll on EVERY sync.  Probe timeline proved
+    // the mystery ~10u node writer IS the AnimationClass ragdoll drag: one instant
+    // _NV_ragdollModeUT(false,CARRY_MODE) flipped aRag 1->0 and wn read (0,0,0) for
+    // exactly that frame - then an engine restorer re-set the ragdoll and the drag
+    // resumed.  All three sync paths (mainLoop + mount-gated + rider-gated resync)
+    // funnel through here, so the last caller before render re-kills it each frame.
+    // Instant AnimationClass-level call = no postRagdollCallback recovery, no
+    // message queue (the queued Character version never processes mid-ride - probe
+    // rev2, three presses, chRag stuck at 1).  Human-only: uses the _NV_ export stub
+    // on AnimationClassHuman (vtable-order-independent).
+    if (rAnim->isRagdoll() && rider && !rider->isAnimal())
+        static_cast<AnimationClassHuman*>(rAnim)->_NV_ragdollModeUT(
+            false, Ogre::Vector3::ZERO, RagdollPart::CARRY_MODE, std::string(), rider);
+
     Ogre::Vector3    nodeP = rAnim->getSceneNodePosition();
     Ogre::Quaternion nodeQ = rAnim->getSceneNodeOrientation();
     Ogre::Vector3    rBip  = rAnim->getBoneWorldPosition("Bip01", 1.0f);
@@ -1106,6 +1120,29 @@ static void DampSeatBob(Character* mount, const SeatInfo& seat, Ogre::Vector3& s
     // time.  Damping with the SEEDED baseline runs from frame one regardless - only
     // mutation is delayed.
     static const int   kMinSyncsBeforeCapture = 240;
+    // Pause guard (2026-08-25, rev2).  A pause freezes BOTH the animation (seat-anchor
+    // bone stuck at an arbitrary gait phase) and movement, so every stillness counter
+    // would fill with "still" evidence drawn from a frozen mid-gait rawBase.  rev1 only
+    // gated settledStill with !paused, which merely DELAYED the mutation one frame: the
+    // counters kept accumulating through the pause, so the instant the player unpaused
+    // all gates were already satisfied and the stale-wipe + recapture fired on the first
+    // unpaused frame - the jump simply moved from pause-START to pause-END (field log:
+    // 9 captures, each an unpause event).  Correct fix: while paused, do NOT advance the
+    // capture state machine at all (syncCount, the stillness window, baseStable all stay
+    // put); just re-apply damping with the EXISTING baseline and return, so the paused
+    // frame reproduces the last unpaused seat height and capture only resumes after a
+    // real post-unpause running/standing window.  ou is the global GameWorld*.
+    if (ou && ou->isPaused())
+    {
+        boost::unordered_map<Character*, float>::iterator vp = mountBaseVOffset.find(mount);
+        if (vp != mountBaseVOffset.end())
+        {
+            float stableY    = refY + vp->second;
+            float dampedBase = stableY + (baseY - stableY) * kSeatBobScale;
+            seatPos.y = dampedBase + uy;
+        }
+        return;   // no baseline yet -> leave seatPos (full follow); either way freeze counters
+    }
     CharMovement* mmv = mount->getMovement();
     Ogre::Vector3 mpos = mmv ? mmv->getPosition() : Ogre::Vector3::ZERO;
     CapTrack& ct = mountCap[mount];
@@ -1222,6 +1259,18 @@ static Ogre::Vector3 ComputeDampedSeatPos(Character* mount, const SeatInfo& seat
     return seatPos;
 }
 
+// SEH-guarded read of CharMovement::movementMode (+0x378, dumpbin-verified offset).
+// mode=0 was MOVE_NORMAL on rev4's 30-frame watch; -1 = unreadable (dead pointer).
+// Standalone helper because __try forbids unwindable objects in the same frame.
+static int SafeReadMovementMode(CharMovement* mv)
+{
+    if (!mv) return -1;
+    __try { return *(volatile int*)((char*)mv + 0x378); }
+    __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION
+                  ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH)
+    { return -1; }
+}
+
 // Continuous diagnostics (Numpad .): log EVERY frame while the mount is moving,
 // comparing the mount's root/back bones, the forward vector, the raw (unsmoothed)
 // target, the damped target, and every position/orientation readout of the rider
@@ -1285,12 +1334,16 @@ static void DebugLogRideFrame(Character* rider, Character* mount, const SeatInfo
         // frame read is inconclusive when a call lands deferred (exactly how carryModeT
         // behaved).  With these fields a probe press shows up as a 1->0 transition on a
         // later frame - or proves the flag is being re-asserted every frame.
-        int ragDbg  = rider->isRagdoll() ? 1 : 0;
+        int ragDbg  = rider->isRagdoll() ? 1: 0;
         int aRagDbg = rAnim->isRagdoll() ? 1 : 0;
         int bcDbg   = rider->_isBeingCarried ? 1 : 0;
+        // alive vs destroyed CharMovement (rev6 says pickupObject destroys it; verify
+        // per-ride) - and whether something is actively DRIVING it (locomotion modes
+        // != 0 while we only ever halt + _setPositionSimple would expose the writer)
+        int mmDbg = SafeReadMovementMode(rider->getMovement());
         char dbg[1400];
         _snprintf_s(dbg, 1400, _TRUNCATE,
-            "Riding: DBG root=(%.2f,%.2f,%.2f) back=(%.2f,%.2f,%.2f) fwd=(%.2f,%.2f,%.2f) rawT=(%.2f,%.2f,%.2f) tgt=(%.2f,%.2f,%.2f) node=(%.2f,%.2f,%.2f) rMove=(%.2f,%.2f,%.2f) rRoot=(%.2f,%.2f,%.2f) rBip=(%.2f,%.2f,%.2f) nodeQ=(%.2f,%.2f,%.2f,%.2f) rBipQ=(%.2f,%.2f,%.2f,%.2f) move=(%.2f,%.2f,%.2f) anch=(%.2f,%.2f,%.2f) st=%d pelv=(%.2f,%.2f,%.2f) rel=(%.2f,%.2f,%.2f) rs=%d bs=%d wn=(%.2f,%.2f,%.2f) rag=%d aRag=%d bc=%d",
+            "Riding: DBG root=(%.2f,%.2f,%.2f) back=(%.2f,%.2f,%.2f) fwd=(%.2f,%.2f,%.2f) rawT=(%.2f,%.2f,%.2f) tgt=(%.2f,%.2f,%.2f) node=(%.2f,%.2f,%.2f) rMove=(%.2f,%.2f,%.2f) rRoot=(%.2f,%.2f,%.2f) rBip=(%.2f,%.2f,%.2f) nodeQ=(%.2f,%.2f,%.2f,%.2f) rBipQ=(%.2f,%.2f,%.2f,%.2f) move=(%.2f,%.2f,%.2f) anch=(%.2f,%.2f,%.2f) st=%d pelv=(%.2f,%.2f,%.2f) rel=(%.2f,%.2f,%.2f) rs=%d bs=%d wn=(%.2f,%.2f,%.2f) rag=%d aRag=%d bc=%d mMode=%d",
             rootP.x, rootP.y, rootP.z,
             backP.x, backP.y, backP.z,
             fwd.x, fwd.y, fwd.z,
@@ -1309,7 +1362,8 @@ static void DebugLogRideFrame(Character* rider, Character* mount, const SeatInfo
             relDbg.x, relDbg.y, relDbg.z,
             rsDbg, bsDbg,
             wnDbg.x, wnDbg.y, wnDbg.z,
-            ragDbg, aRagDbg, bcDbg);
+            ragDbg, aRagDbg, bcDbg,
+            mmDbg);
         DebugLog(dbg);
     }
 }
@@ -1803,14 +1857,21 @@ static void AnimUpdateImpl(AnimationClass* thisptr, float frameTIME)
             Character* rider = rit->first;
             Character* mount = rit->second;
             if (!rider || !mount) continue;
-            // Fire ONLY on the mount's own animation update: once per frame, using this
-            // frame's freshly-updated mount bones.  Ungated, AnimUpdateImpl runs once per
-            // ANIMATED CHARACTER (DBG measured 41 syncs in ONE rendered frame on a busy
-            // screen), and the redundant mid-frame rewrites interleaved with the engine's
-            // own node maintenance into a visible triple-jitter.
-            if (mount->getAnimationClass() != thisptr) continue;
             AnimationClass* rAnim = rider->getAnimationClass();
             if (!rAnim || !rAnim->node) continue;
+            // Fire on the mount's own animation update (fresh mount bones) AND - probe
+            // 2026-08-25 - on the RIDER's own update.  Bonedog DBG proved an engine
+            // writer re-positions the carried rider ~10u every frame AFTER our main-loop
+            // write (wn swings 5..14u while unpaused; paused it freezes and the seat
+            // snaps correct).  Suspect: the per-frame carried-character maintenance,
+            // which keys on _isBeingCarried=1.  If it runs before the rider's own
+            // animation update, syncing here makes us the last writer and the pin loses.
+            // Still gated per character (NOT per animated char on screen): ungated this
+            // hook ran 41x/frame on a busy screen and triple-jittered against the
+            // engine's node maintenance.
+            bool mountUpdating = (mount->getAnimationClass() == thisptr);
+            bool riderUpdating = (rAnim == thisptr);
+            if (!mountUpdating && !riderUpdating) continue;
             boost::unordered_map<Character*, SeatInfo>::iterator sit = mountSeat.find(mount);
             if (sit == mountSeat.end()) continue;
             const SeatInfo& seat = sit->second;
@@ -2015,6 +2076,19 @@ static void HaltAndForceSitPass()
         {
             Character* rider = it->first;
             if (!rider) continue;
+
+            // Same carry-ragdoll re-kill as SyncRiderNode (2026-08-25), but for seats
+            // that skip placement entirely (EXACT mode with zero tune): those never
+            // reach SyncRiderNode, and a live CARRY_MODE ragdoll drags their node to a
+            // garbage slot every frame.  Runs early in the frame; SyncRiderNode repeats
+            // it late for the seats that DO get placed.
+            {
+                AnimationClass* rAnim = rider->getAnimationClass();
+                if (rAnim && rAnim->isRagdoll() && !rider->isAnimal())
+                    static_cast<AnimationClassHuman*>(rAnim)->_NV_ragdollModeUT(
+                        false, Ogre::Vector3::ZERO, RagdollPart::CARRY_MODE,
+                        std::string(), rider);
+            }
 
             CharMovement* riderMove = rider->getMovement();
             if (riderMove)
@@ -2271,6 +2345,10 @@ static void HotkeyPass()
         // body up ~19u first, so true won).  The Numpad4/Numpad8 A/B probes and the 30-frame
         // PostDismountWatch that carried the investigation have been removed now that the fix
         // lives on the real path.  History of the dead ends is preserved in CLAUDE.md.
+        // (The 2026-08-25 Numpad8 probe series - bc toggle, queued CARRY_MODE, instant
+        // _NV_ragdollModeUT - identified the carried-ragdoll drag as the node writer; the
+        // winning fix lives permanently in SyncRiderNode + HaltAndForceSitPass, so the
+        // probe key is gone again.)
 
         // 3) Live seat tuning (applies to the currently mounted animal).
         //    Rider FACING is not tunable - it always follows the mount's travel direction.
