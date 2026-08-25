@@ -119,6 +119,10 @@ struct SeatInfo
                                  // (fling skeletons: Crab/robot_worker/dog/gorilla/Crimper/beak)
     bool          neckFollow;    // 卷缩者 only: vertical follows the NECK bone (butt rides
                                  // up/down with the neck), no bob damping; horizontal still root
+    bool          flexTrack;     // dog family: vertical = LIVE mean of front+rear bone offsets
+                                 // above root - their waist see-saws against the butt/root, so a
+                                 // bind-pose constant glues the rider to one end of the flex while
+                                 // the other sweeps under them; the mean cancels anti-phase swing
     bool          forceSit;      // rider: re-assert the sitting pose every frame (overrides carried prone)
     int           posture;       // RiderPosture (0=sit, 1=stand)
     float         lateral;       // side offset (right/left), world units
@@ -185,7 +189,23 @@ struct CapTrack
     float         prevBase;  // last raw seat-height-above-reference
     int           relStable;
     int           baseStable;
-    CapTrack() : prevRel(Ogre::Vector3::ZERO), prevBase(0.0f), relStable(0), baseStable(0) {}
+    // Stationarity watch for the DampSeatBob baseline (2026-08-24).  The old belief
+    // that "running keeps the stability counter from accumulating" is FALSE for slow,
+    // shallow bobs (Beak Thing: +-0.33u, per-frame delta well under the 0.35 tolerance)
+    // - the counter filled WHILE RUNNING, so the stale-baseline wipe + recapture fired
+    // mid-gallop and every gait change flipped the baseline by ~2.2u = a visible
+    // one-frame vertical JUMP (8 captures in 3s in the field log).  These fields watch
+    // the mount's MOVEMENT position over discrete windows instead: only a full window
+    // with negligible translation counts as "still", and baseline mutation (stale wipe
+    // or fresh capture) is allowed ONLY then.
+    Ogre::Vector3 winAnchor;      // movement pos sampled at last window boundary
+    bool          winValid;       // winAnchor holds a real sample
+    int           winCountdown;   // syncs until next window boundary
+    int           stillWindows;   // consecutive stationary windows
+    int           syncCount;      // syncs since this ride's tracking started (ride age)
+    CapTrack() : prevRel(Ogre::Vector3::ZERO), prevBase(0.0f), relStable(0), baseStable(0),
+                 winAnchor(Ogre::Vector3::ZERO), winValid(false), winCountdown(0), stillWindows(0),
+                 syncCount(0) {}
 };
 boost::unordered_map<Character*, CapTrack> mountCap;
 // A quantity must hold this many consecutive stable syncs before it is captured
@@ -534,6 +554,7 @@ SeatInfo BuildSeatInfo(Character* mount)
     info.torsoLen = 0.0f;
     info.rootAnchor = false;
     info.neckFollow = false;
+    info.flexTrack  = false;
     info.sizeScale = 1.0f;
 
     AnimationClass* mountAnim = mount ? mount->getAnimationClass() : NULL;
@@ -622,6 +643,15 @@ SeatInfo BuildSeatInfo(Character* mount)
         && mountAnim && mountAnim->getHasBone("Bip01 Neck"))
         info.neckFollow = true;
 
+    // Dog family ONLY (2026-08-24): their run cycle flexes the body - the WAIST see-saws
+    // against the butt/root - so a bind-pose constant over the root glues the rider to the
+    // butt end while the waist sweeps under them.  Track the LIVE front/rear mean instead
+    // (see ComputeSeatPosition rootAnchor branch).  Scoped like neckFollow so already-tuned
+    // rigid fling skeletons keep their exact current seat.
+    if (info.rootAnchor
+        && (info.species == "骨犬" || info.species == "埋骨地狼" || info.species == "定居者的小狗"))
+        info.flexTrack = true;
+
     // base lift per mode
     if (info.seatMode == SEAT_MIDPOINT)
     {
@@ -697,7 +727,52 @@ Ogre::Vector3 ComputeSeatPosition(const SeatInfo& seat, Character* mount)
             {
                 float rootInitY = mountAnim->getBoneInitialWorldPosition("Bip01").y;
                 float backInitY  = mountAnim->getBoneInitialWorldPosition(seat.backBone).y;
-                anchor.y = rootPos.y + (backInitY - rootInitY);
+                float bindOff   = backInitY - rootInitY;
+                anchor.y = rootPos.y + bindOff;
+
+                // flexTrack (dog family, plan A): track the LIVE midpoint of the front/rear
+                // spine bones as a DEVIATION from their own bind-pose midpoint, applied on
+                // top of the classic root+bindSpine2 anchor.  At bind pose delta == 0, so
+                // the tuned seat position is preserved EXACTLY; while running, the
+                // waist-vs-butt see-saw becomes a smooth 3-axis delta the rider follows -
+                // anti-phase swing cancels in the mean, fore-aft spinal flex is tracked too
+                // (the old Y-only version missed that horizontal half).  Clamped so a ghost
+                // read can't yank the seat; falls back to the pure constant.
+                if (seat.flexTrack)
+                {
+                    Ogre::Vector3 sum(0, 0, 0), initSum(0, 0, 0);
+                    int cnt = 0;
+                    if (mountAnim->getHasBone(seat.frontBone))
+                    {
+                        sum    += mount->getBoneWorldPosition(seat.frontBone);
+                        initSum += mountAnim->getBoneInitialWorldPosition(seat.frontBone);
+                        cnt++;
+                    }
+                    if (!seat.rearBone.empty() && seat.rearBone != seat.frontBone
+                        && mountAnim->getHasBone(seat.rearBone))
+                    {
+                        sum    += mount->getBoneWorldPosition(seat.rearBone);
+                        initSum += mountAnim->getBoneInitialWorldPosition(seat.rearBone);
+                        cnt++;
+                    }
+                    if (cnt > 0)
+                    {
+                        float inv = 1.0f / cnt;
+                        Ogre::Vector3 liveRel = (sum * inv) - rootPos;
+                        Ogre::Vector3 bindRel = (initSum * inv)
+                                              - mountAnim->getBoneInitialWorldPosition("Bip01");
+                        Ogre::Vector3 delta   = liveRel - bindRel;
+                        // Soft saturation, not a binary fallback: a deep idle-stretch pose
+                        // crossing the limit used to snap the seat by the whole excess
+                        // ("idle 突变").  Clamping the MAGNITUDE keeps the direction and
+                        // stays continuous for any pose.
+                        static const float kFlexMaxDeviation = 6.0f;
+                        float dl = delta.length();
+                        if (dl > kFlexMaxDeviation)
+                            delta *= (kFlexMaxDeviation / dl);
+                        anchor += delta;
+                    }
+                }
             }
             // 卷缩者: keep the root horizontal, but pin the vertical to the live NECK bone
             // so the seat rides up and down with the neck (DampSeatBob is skipped for it).
@@ -987,6 +1062,12 @@ static void DampSeatBob(Character* mount, const SeatInfo& seat, Ogre::Vector3& s
     // rider's butt stays glued to the neck as it rises and falls.  ComputeSeatPosition
     // already set seatPos.y to the neck bone Y; leave it untouched.
     if (seat.neckFollow) return;
+    // flexTrack (dog family): same philosophy, different geometry.  The live midpoint
+    // anchor already cancelled the wild see-saw; what survives is true body motion that
+    // must NOT be flattened - flattening is exactly what re-created the float/sink
+    // complaints.  Full geometric follow also sidesteps the whole baseline lifecycle
+    // (capture/wipe snaps) these fast anchors used to trigger.
+    if (seat.flexTrack) return;
     AnimationClass* mAnim = mount->getAnimationClass();
     if (!mAnim || !mAnim->getHasBone("Bip01")) return;   // no root -> leave as-is
 
@@ -1008,41 +1089,103 @@ static void DampSeatBob(Character* mount, const SeatInfo& seat, Ogre::Vector3& s
     float baseY   = seatPos.y - uy;
     float rawBase = baseY - refY;   // seat height above the reference (bob-free mean, no user tune)
 
+    // Stationarity watch (2026-08-24).  The old assumption that running keeps baseStable
+    // from accumulating is FALSE for slow shallow bobs (Beak Thing: +-0.33u, per-frame
+    // delta under the 0.35 tolerance) - the counter filled WHILE RUNNING, the stale-wipe
+    // + recapture fired mid-gallop, and each gait change flipped the baseline ~2.2u in
+    // one frame = the reported up/down jitter.  Baseline mutation (stale wipe OR fresh
+    // capture) now requires the mount to have held still across a whole observation
+    // window; while moving, an existing baseline is always trusted and damping runs on.
+    static const float kStillWindowSyncs = 20;   // syncs per observation window (~1/3 s)
+    static const float kStillMaxDrift    = 0.35f;
+    // No baseline mutation (capture OR obsolete-seed wipe) before this many syncs of a
+    // ride: the first seconds after mount/load are pose-storm (pickup carry-blend,
+    // skeleton settling) and the field log caught a capture firing 0.11s in, baking
+    // garbage into cfg.  Counted against ~2 syncs per rendered frame now that both the
+    // animUpdate resync and the main-loop pass call DampSeatBob - 240 syncs ~= 2s real
+    // time.  Damping with the SEEDED baseline runs from frame one regardless - only
+    // mutation is delayed.
+    static const int   kMinSyncsBeforeCapture = 240;
+    CharMovement* mmv = mount->getMovement();
+    Ogre::Vector3 mpos = mmv ? mmv->getPosition() : Ogre::Vector3::ZERO;
+    CapTrack& ct = mountCap[mount];
+    ct.syncCount++;
+    if (--ct.winCountdown <= 0)
+    {
+        // First boundary only SAMPLES the anchor; stillness is judged from the SECOND
+        // boundary on.  (The old first-window shortcut granted "still" with zero
+        // evidence, which let a baseline capture fire ~0.1s after mounting - mid
+        // pose-storm - and bake a garbage constant into cfg.)
+        if (ct.winValid)
+        {
+            float drift = (mpos - ct.winAnchor).length();
+            ct.stillWindows = drift < kStillMaxDrift ? ct.stillWindows + 1 : 0;
+        }
+        ct.winAnchor    = mpos;
+        ct.winValid     = true;
+        ct.winCountdown = (int)kStillWindowSyncs;
+    }
+    bool settledStill = (ct.stillWindows >= 1) && ct.syncCount >= kMinSyncsBeforeCapture;
+
     // Same settle-gate as the SyncRiderNode anchor: right after mount/load rawBase is
     // transient (pose blending, ghost bones); freezing THEN baked a wrong baseline
     // into every later frame (persistent "rider sits too low" after loading a save).
-    // Capture only once rawBase has held steady, and re-validate a stored baseline
-    // against firmly-settled readings.  Until captured, damping is skipped entirely -
-    // the ride bobs naturally for a moment instead of being pulled toward a wrong
-    // constant.  While the mount is RUNNING the bob itself keeps the counter from
-    // accumulating, so recapture only fires when readings are genuinely settled.
+    // Capture only once rawBase has held steady AND the mount has stood still through
+    // an observation window; until then an existing baseline is always kept and used.
+    // The poison check (>25u = ghost-bone garbage) stays ungated - it must fire even
+    // mid-run or a poisoned constant would ride forever.
     static const float kBaseStableTol     = 0.35f;
     static const float kBaselineStaleDiff = 3.0f;
-    CapTrack& ct = mountCap[mount];
     ct.baseStable = (fabsf(rawBase - ct.prevBase) < kBaseStableTol) ? ct.baseStable + 1 : 0;
     ct.prevBase = rawBase;
 
     boost::unordered_map<Character*, float>::iterator vo = mountBaseVOffset.find(mount);
-    if (vo != mountBaseVOffset.end() && fabsf(vo->second) > 25.0f)
+    // Poison threshold 80 (was 25, recalibrated 2026-08-24): the old value was BELOW
+    // several species' LEGITIMATE baselines - the Beak Thing's seat sits ~29u above its
+    // movement reference - so every sync erased the baseline as "ghost garbage", damping
+    // silently never ran for those mounts (full neck-snap pass-through = the "rider's
+    // head jerks up" report), and pre-fix sessions capture-looped (8 captures in 3s).
+    // Ghost-bone readings are unscaled-space (~10x real), so real garbage is >=290;
+    // 80 separates cleanly.
+    static const float kBasePoisonLimit = 80.0f;
+    if (vo != mountBaseVOffset.end() && fabsf(vo->second) > kBasePoisonLimit)
     {
         // poisoned baseline (captured on a ghost-bone frame): drop it and recapture
         // below from this frame's values
         mountBaseVOffset.erase(mount);
         vo = mountBaseVOffset.end();
     }
+    // Obsolete-seed guard (2026-08-24): a persisted baseline THIS far from live reality
+    // is not gait drift - it predates a reference-frame change (the Beak Thing's cfg held
+    // 6.63 from the old root-bone-relative era while the current move-relative formula
+    // reads ~29.9; damping toward the stale seed dragged the seat ~20u low = deep body
+    // clipping).  Wipe immediately once readings are steady, motion or not; damping then
+    // stays OFF (natural full follow, slight bounce but no clip) until the stationary
+    // capture path below rebuilds a trusted value.
+    static const float kBaselineHugeDiff = 12.0f;
     if (vo != mountBaseVOffset.end()
+        && ct.syncCount >= kMinSyncsBeforeCapture
+        && ct.baseStable >= kCaptureStableNeed
+        && fabsf(rawBase - vo->second) > kBaselineHugeDiff)
+    {
+        mountBaseVOffset.erase(mount);
+        vo = mountBaseVOffset.end();
+    }
+    if (vo != mountBaseVOffset.end()
+        && settledStill
         && ct.baseStable >= kCaptureStableNeed
         && fabsf(rawBase - vo->second) > kBaselineStaleDiff)
     {
-        // stale: stored baseline disagrees with a settled reading (captured mid-blend)
+        // stale: stored baseline disagrees with a settled+stationary reading
+        // (captured mid-blend); only ever acted on while truly standing still
         mountBaseVOffset.erase(mount);
         vo = mountBaseVOffset.end();
     }
     if (vo == mountBaseVOffset.end())
     {
-        if (ct.baseStable >= kCaptureStableNeed)
+        if (ct.baseStable >= kCaptureStableNeed && settledStill)
         {
-            mountBaseVOffset[mount] = rawBase;   // settled -> begin damping next sync
+            mountBaseVOffset[mount] = rawBase;   // settled + stationary -> begin damping next sync
             // Persist once per ride so future mounts/loads seed it directly instead of
             // live-capturing through the post-mount/post-load pose storm.
             boost::unordered_map<Character*, SeatInfo>::iterator ssi = mountSeat.find(mount);
@@ -1643,13 +1786,15 @@ static void AnimUpdateImpl(AnimationClass* thisptr, float frameTIME)
 
     animUpdate_orig(thisptr, frameTIME);
 
-#if 0
-    // DISABLED 2026-08-23 (was: re-place every mounted rider after every character's
-    // animation update).  DBG proved the engine does not apply a delta drag - it
-    // ABSOLUTELY pins the carried node to a carrier-local slot every frame (slot
-    // stayed constant at side+4.1 / down+6.4 / fwd+17.6 through a full turn), so no
-    // number of early writes wins.  The real fix is stopping the engine's ragdoll-
-    // carry drag itself (see the Numpad8 carry probe in HotkeyPass).
+    // RE-ENABLED 2026-08-24 (disabled 2026-08-23).  The original disable reason - early
+    // writes lose to the engine's absolute carried-node pin - died with the immediate-
+    // dissolve-carry architecture: nobody else writes the rider's node anymore, so this
+    // pass OWNS placement and running it here means the seat is computed from THIS
+    // frame's bone transforms.  That freshness is load-bearing for flexTrack anchors
+    // (dog family): the waist see-saw is fast, and computing once per game frame BEFORE
+    // the skeletons update fed the rider last frame's pose - a visible one-beat lag
+    // ("pause the game and he lines up").  Same shared ComputeDampedSeatPos as the
+    // main-loop pass so both writers agree bit-for-bit.
     if (!mountSeat.empty())
     {
         boost::unordered_map<Character*, Character*>::iterator rit = riderToMount.begin();
@@ -1658,6 +1803,12 @@ static void AnimUpdateImpl(AnimationClass* thisptr, float frameTIME)
             Character* rider = rit->first;
             Character* mount = rit->second;
             if (!rider || !mount) continue;
+            // Fire ONLY on the mount's own animation update: once per frame, using this
+            // frame's freshly-updated mount bones.  Ungated, AnimUpdateImpl runs once per
+            // ANIMATED CHARACTER (DBG measured 41 syncs in ONE rendered frame on a busy
+            // screen), and the redundant mid-frame rewrites interleaved with the engine's
+            // own node maintenance into a visible triple-jitter.
+            if (mount->getAnimationClass() != thisptr) continue;
             AnimationClass* rAnim = rider->getAnimationClass();
             if (!rAnim || !rAnim->node) continue;
             boost::unordered_map<Character*, SeatInfo>::iterator sit = mountSeat.find(mount);
@@ -1665,15 +1816,14 @@ static void AnimUpdateImpl(AnimationClass* thisptr, float frameTIME)
             const SeatInfo& seat = sit->second;
             if (!SeatNeedsPlacement(seat)) continue;
 
-            // Horizontal instant; vertical bob scaled by DampSeatBob - same rule as
-            // the main loop so every sync point agrees.
+            // Horizontal instant; vertical per DampSeatBob - same rule as the main loop
+            // so every sync point agrees.
             Ogre::Vector3 seatPos = ComputeDampedSeatPos(mount, seat);
             if (rider->getMovement())
                 rider->getMovement()->_setPositionSimple(seatPos);
             SyncRiderNode(rider, mount, rAnim, seatPos, false);
         }
     }
-#endif
 }
 
 // SEH shell: same rationale as mainLoop_hook.  The restore path runs here for
@@ -2354,23 +2504,73 @@ void contextMenu_show_hook(ContextMenuGUI* thisptr, const lektor<int>& ordersLis
         // shifting every later row down by one.  Index-based lookup then renamed the
         // FOLLOW row -> "right-click UI scrambled" on bull / caged beast / beak thing.
         // Locate the button BY ITS VANILLA CAPTION instead: the caption is literally
-        // what the user sees, so a match can never scramble the menu.  If no such row
-        // is found, leave the menu as-is - clicking vanilla 侍卫 still mounts via the
-        // newPlayerTask hook (dispatch keys on the internal order id, not the label).
-        static const std::string kBodyguardCap = "\xE4\xBE\x8D\xE5\x8D\xAB"; // "侍卫" UTF-8, explicit bytes (v100 has no /utf-8)
+        // what the user sees, so a match can never scramble the menu.  Never map by
+        // position, whatever changes around here.
+        //
+        // The vanilla caption is localized, so match a per-language whitelist.
+        // Byte-collected from RE_Kenshi_log.txt row dumps (the order=31 line), one
+        // run per game language, 2026-08-25: en/de/fr/ru/es/pt/ja/ko (+zh earlier).
+        // Order mapping 26=Trade 45=Follow 31=Bodyguard 225=PickUp came out identical
+        // in every language = cross-check passed.  All non-ASCII text is explicit
+        // UTF-8 byte escapes (v100 has no /utf-8).  An unknown language finds no
+        // match -> menu left untouched; clicking the vanilla label still mounts via
+        // the newPlayerTask hook (dispatch keys on the internal order id, not the
+        // label).  To add a language: turn on Numpad-. diagnostics, right-click a
+        // rideable animal in that language, copy the order=31 cap='...' verbatim.
+        static const char* const kBodyguardCaps[] = {
+            "\xE4\xBE\x8D\xE5\x8D\xAB",                                             // zh-CN 侍卫
+            "Bodyguard",                                                            // en
+            "Leibw\xC3\xA4" "chter",                                                // de Leibwächter ("c" after \xA4 would extend the hex escape -> split literals)
+            "Garde du corps",                                                       // fr
+            "\xD0\x9E\xD1\x85\xD1\x80\xD0\xB0\xD0\xBD\xD1\x8F\xD1\x82\xD1\x8C",     // ru Охранять
+            "Guardaespaldas",                                                       // es
+            "Proteger",                                                             // pt-BR
+            "\xE3\x83\x9C\xE3\x83\x87\xE3\x82\xA3\xE3\x82\xAC\xE3\x83\xBC\xE3\x83\x89", // ja ボディガード
+            "\xED\x98\xB8\xEC\x9C\x84\xED\x95\x98\xEA\xB8\xB0",                     // ko 호위하기
+        };
+        // Replacement label for the SAME INDEX above - the match itself identifies
+        // the game language, no separate detection needed.  Non-ASCII = explicit
+        // UTF-8 bytes.  (Space after \x8C in ru is safe: it can't extend a hex escape.)
+        static const char* const kMountLabels[] = {
+            "\xE4\xB8\x8A\xE9\xA9\xAC",                                             // zh-CN 上马
+            "Ride",                                                                 // en
+            "Reiten",                                                               // de
+            "Monter",                                                               // fr
+            "\xD0\xA1\xD0\xB5\xD1\x81\xD1\x82\xD1\x8C \xD0\xB2\xD0\xB5\xD1\x80\xD1\x85\xD0\xBE\xD0\xBC", // ru Сесть верхом
+            "Montar",                                                               // es
+            "Montar",                                                               // pt-BR
+            "\xE9\xA8\x8E\xE4\xB9\x97",                                             // ja 騎乗
+            "\xED\x83\x80\xEA\xB8\xB0",                                             // ko 타기
+        };
+        const int nCaps = (int)(sizeof(kBodyguardCaps) / sizeof(kBodyguardCaps[0]));
+        MyGUI::Widget* found = NULL;
+        int foundIdx = -1, foundLang = -1, matchCount = 0;
         for (int i = 0; i < childCount; ++i)
         {
             MyGUI::Widget* child = opts->getChildAt(i);
             if (!child) continue;
             std::string cap;
             try { cap = GetWidgetCaptionDeep(child); } catch(...) { cap.clear(); }
-            if (cap != kBodyguardCap) continue;
-
-            // rename Bodyguard -> 上马 (UTF-8 bytes; MyGUI captions are UTF-8)
-            bool ok = SetWidgetCaptionDeep(child, "\xE4\xB8\x8A\xE9\xA9\xAC");
+            if (cap.empty()) continue;
+            bool isBodyguard = false;
+            for (int c = 0; c < nCaps && !isBodyguard; ++c)
+                if (cap == kBodyguardCaps[c]) { isBodyguard = true; foundLang = c; }
+            if (!isBodyguard) continue;
+            found = child; foundIdx = i; ++matchCount;
+        }
+        // Rename only on a UNIQUE match: zero hits (unknown language) and multiple
+        // hits (never guess between rows) both leave the menu untouched.
+        if (matchCount == 1 && found && foundLang >= 0)
+        {
+            // localized rename, e.g. Bodyguard -> Ride / 上马 / Reiten ...
+            const char* label = kMountLabels[foundLang];
+            bool ok = SetWidgetCaptionDeep(found, label);
             try { opts->_updateChilds(); } catch(...) {}
-            try { DebugLog(std::string("Riding: rename Bodyguard->shangma idx=") + IntToStr(i) + (ok ? " ok" : " FAILED(no caption widget)")); } catch(...) {}
-            break;
+            try { DebugLog(std::string("Riding: rename Bodyguard->label idx=") + IntToStr(foundIdx) + " lang=" + IntToStr(foundLang) + (ok ? " ok" : " FAILED(no caption widget)")); } catch(...) {}
+        }
+        else if (debugContinuous)
+        {
+            try { DebugLog(std::string("Riding: bodyguard caption matches=") + IntToStr(matchCount) + " - menu untouched"); } catch(...) {}
         }
 
     } catch(...) {}
