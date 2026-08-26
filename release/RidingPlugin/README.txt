@@ -14,7 +14,9 @@
 ----
 1. 将本 RidingPlugin 文件夹整个放入 Kenshi 游戏目录的 mods/ 目录，
    使 mods/RidingPlugin/ 下含有：
-   RidingPlugin.dll、RE_Kenshi.json、riding.cfg、RidingPlugin.mod、README.txt。
+   RidingPlugin.dll、RE_Kenshi.json、RidingPlugin.mod、README.txt。
+   （riding.cfg 不随包提供：30 个可骑物种的座位已内置在 DLL 里，
+     第一次骑就是调好的位置；你自己微调后才会生成这个文件。）
 2. 启动游戏启动器，勾选启用 RidingPlugin。
 3. 确保 RE_Kenshi 已正确注入（见 RE_Kenshi 说明）。
 
@@ -25,24 +27,30 @@
   （支持 简中/英/德/法/俄/西/葡/日/韩；其他语言保留原版菜单项，点击同样可以上马）。
 - 下马：选中骑手 -> 长按右键选「放倒」即可下马（或按 Numpad 2）。
   下马后人物立即落地站立、可正常行动。
-- 座椅微调（每个物种分别标定，自动保存到 riding.cfg）：
+- 座椅微调（可选：30 个物种的座位已经调好并内置，第一次骑即正确；
+  想改再用下面的键，每个物种分别标定，自动保存到 riding.cfg）：
     Numpad +/-    ：上 / 下
     Numpad * / /  ：前 / 后
     Ctrl + * / /  ：左 / 右
     Numpad 5      ：座椅模式
     Numpad 6      ：force-sit
     Numpad 7      ：坐 / 站
-    Numpad 0      ：重置
+    Numpad 0      ：回到默认位置
+    Ctrl+Numpad 0 ：把当前位置设为自己的默认
 
 调参文件
 --------
-mods/RidingPlugin/riding.cfg  每个物种一行，格式：
-  <物种>=<mode>,<up>,<forward>,<mount>,<sit>,<roll>,<pitch>,<yaw>,<posture>,<lateral>[,<ax>,<ay>,<az>,<abase>]
-  mode  0=精确 1=中点 2=脖子
+mods/RidingPlugin/riding.cfg 是**可选的覆盖文件**：插件内置了 30 个可骑物种的
+默认座位，这个文件只记录你自己改过的部分，删掉它即回到内置默认。
+每个物种一行，格式：
+  <物种>=<mode>,<up>,<forward>,<mount>,<sit>,<roll>,<pitch>,<yaw>,<posture>,<lateral>[,<ax>,<ay>,<az>,<abase>][,<hup>,<hfwd>,<hlat>]
+  mode  0=精确 1=中点 2=脖子 3=后臀 4=刚体（不跟骨骼，跟动物走的路，最平稳）
   sit   0=关 1=开
   posture 0=坐 1=站
   roll/pitch/yaw 为兼容保留的死字段；骑手朝向自动跟随坐骑前进方向，无手动参数。
   第 11-14 列由插件自动写入与恢复（座椅锚点），请勿手改；旧 10 列格式仍可读取。
+  第 15-17 列是你自己声明的默认位置（Numpad 0 的回归目标，Ctrl+Numpad 0 写入）。
+  文件顶部的 defaults= 一行记录内置默认的版本，请勿删改。
   注意：物种名与游戏内名字的字节一致（UTF-8 编码），请勿用会改变编码的编辑器改动。
 
 已知限制
