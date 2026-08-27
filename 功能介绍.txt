@@ -32,8 +32,9 @@
   Numpad + / -      上 / 下
   Numpad * / /      前 / 后
   Ctrl + * / /      左 / 右
-  Numpad 5          切换座椅模式
-  Numpad 6          force-sit 开关
-  Numpad 7          坐姿 / 站姿
-  Numpad 0          回到默认位置
-  Ctrl + Numpad 0   把当前位置设为自己的默认
+  Numpad .          force-sit 开关
+  Numpad 9          回到默认位置
+  Ctrl + Numpad 9   把当前位置设为自己的默认
+
+  （键位刻意避开原版占用的按键：原版把 Numpad 0-8 全用作小队状态开关，
+    而那些开关按下去没有任何提示，很容易在调座位时被误改。）

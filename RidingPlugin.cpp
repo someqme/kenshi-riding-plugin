@@ -41,7 +41,7 @@ static std::string IntToStr(int v)
 // ---------------------------------------------------------------------------
 // Riding plugin for Kenshi
 //
-// Numpad1: mount the selected human rider onto the selected animal
+// Mounting is done from the context menu ("Ride", the renamed bodyguard order).
 // Numpad2: dismount the rider
 //
 // While mounted, the rider's position is synced to the mount's back once per
@@ -104,27 +104,14 @@ boost::unordered_map<Character*, Character*> mountToRider;
 //                  player asked for it (the hindquarters read as "the part that holds
 //                  still") AND deletes the lever, so the tuned offsets collapse to small
 //                  numbers and seat jitter drops to the anchor bone's own ~4x lower
-//                  figure.  Opt-in per species via riding.cfg column 1 / Numpad5.
-//   SEAT_RIGID (2026-08-27, for the crab family): no bone at all.  The seat is built from
-//                  the mount's rigid CharMovement position plus its travel heading, so the
-//                  rider rides the animal's PATH instead of its skeleton.  Measured on a
-//                  50 s 巨型螃蟹 ride: the rigid body's per-frame sideways step averages
-//                  0.0036 units against the root bone's 0.0653 (~18x cleaner), so this is
-//                  the smoothest reference the engine offers us.  It exists because the
-//                  crabs' gait rolls the WHOLE skeleton sideways: with the sway damper on
-//                  (15% kept) the side deviation still spanned -7.7..+2.0 units, and the
-//                  fore-aft axis - which no damper touches - kept a 1.33 std slide.  The
-//                  price is that the rider no longer follows the shell's own bob/roll at
-//                  all; that is precisely what "能不能让人物静止不动" asked for.
+//                  figure.  Opt-in per species via riding.cfg column 1.
 enum SeatMode
 {
     SEAT_EXACT    = 0,
     SEAT_MIDPOINT = 1,
     SEAT_NECK     = 2,
-    SEAT_REAR     = 3,
-    SEAT_RIGID    = 4
+    SEAT_REAR     = 3
 };
-static const int SEAT_MODE_COUNT = 5;
 
 // Rider upper-body posture while mounted.
 //   0 = SIT   - "sitting chair" (the toilet-sitting pose the player confirmed)
@@ -142,7 +129,7 @@ struct SeatInfo
     std::string   backBone;      // bone used for slave attach (orientation + fallback anchor)
     std::string   frontBone;     // front torso anchor bone (Spine2/Spine1/Spine/Head)
     std::string   rearBone;      // rear torso anchor bone (Pelvis), "" if none
-    int           seatMode;      // SeatMode (0=exact 1=midpoint 2=neck 3=rear 4=rigid)
+    int           seatMode;      // SeatMode (0=exact 1=midpoint 2=neck 3=rear)
     bool          forceWalk;     // mount's walk animation is suppressed by carry mode (pack_beast)
     bool          rootAnchor;    // anchor to root bone instead of the swinging back bone
                                  // (fling skeletons: Crab/robot_worker/dog/gorilla/Crimper/beak)
@@ -152,10 +139,6 @@ struct SeatInfo
                                  // above root - their waist see-saws against the butt/root, so a
                                  // bind-pose constant glues the rider to one end of the flex while
                                  // the other sweeps under them; the mean cancels anti-phase swing
-    float         swayScale;     // kept fraction of the SIDEWAYS gait swing, 1.0 = off.
-                                 // 1.0 for every species since 2026-08-27: damping the crabs'
-                                 // skeleton roll is precisely what kept the rider from moving
-                                 // sideways WITH the shell, which is what looked like sliding
     bool          forceSit;      // rider: re-assert the sitting pose every frame (overrides carried prone)
     int           posture;       // RiderPosture (0=sit, 1=stand)
     float         lateral;       // side offset (right/left), world units
@@ -163,16 +146,10 @@ struct SeatInfo
     Ogre::Vector3 lift;          // base seat offset (mostly +Y, auto-sized)
     Ogre::Vector3 userOffset;    // live-tuned delta on top of lift (x = forward, y = up)
     Ogre::Vector3 homeOffset;    // the player's declared "zero" for this species (2026-08-26):
-    float         homeLateral;   // Numpad0 restores userOffset/lateral to these instead of
+    float         homeLateral;   // Numpad9 restores userOffset/lateral to these instead of
                                  // clearing to the bare geometric base, so a dialled-in seat
-                                 // survives experimenting.  Ctrl+Numpad0 commits the current
+                                 // survives experimenting.  Ctrl+Numpad9 commits the current
                                  // position here.  Seeded from riding.cfg cols 15-17.
-    Ogre::Vector3 preRigidOffset;  // tuning stashed when SEAT_RIGID is entered (2026-08-27).
-    float         preRigidLateral; // Mode 4's numbers are offsets from the mount's rigid body,
-    Ogre::Vector3 preRigidHome;    // not from a bone, so cycling back out has to restore the
-    float         preRigidHomeLat; // bone-anchor values rather than reinterpret the rigid ones
-    bool          havePreRigid;    // as bone offsets - a ~50-unit jump, and it took home with
-                                   // it, which is exactly what broke 巨型螃蟹 on 2026-08-27
     float         sizeScale;     // always 1.0 - per-individual size scaling was removed
                                  // (2026-08-23): bone reads at mount/load instants are
                                  // untrustworthy (can return bind-space coords), so the
@@ -193,7 +170,7 @@ boost::unordered_map<Character*, float> mountBaseVOffset;
 // (speciesRefScale removed 2026-08-23 together with per-individual size scaling:
 //  bone reads at the SeatInfo build instants are unreliable, see BuildSeatInfo)
 
-// Debug: toggled with Numpad . for continuous ride diagnostics (every 10 frames).
+// Debug: toggled with Ctrl+Numpad . for continuous ride diagnostics (every 10 frames).
 static bool debugContinuous = false;
 // Debug: per-mount last position for movement detection (independent of mountLastPos,
 // which is only written for forceWalk mounts).
@@ -430,8 +407,8 @@ struct SpeciesTuning
     Ogre::Vector3 anchor;
     float         base;
     // User-defined "zero"/home (2026-08-26): the position the player declares as the
-    // reset target.  Numpad0 restores offset/lateral to this instead of clearing to the
-    // bare geometric base; Ctrl+Numpad0 commits the current position as the new home.
+    // reset target.  Numpad9 restores offset/lateral to this instead of clearing to the
+    // bare geometric base; Ctrl+Numpad9 commits the current position as the new home.
     // Persisted in riding.cfg columns 15-17.  Old cfg files (no home columns) migrate by
     // seeding home = the already-tuned offset, so the player's existing good spot becomes
     // the zero automatically.
@@ -546,21 +523,6 @@ const float kTuneStep      = 0.1f;
 // animal is, so the ceiling has to be generous rather than exact.  Species inside the
 // default +-15 are unaffected (the headroom only applies once torsoLen exceeds it).
 const float kTuneHeadroom  = 2.0f;
-// Tuning ceiling for SEAT_RIGID.  A rigid seat is measured from the mount's rigid body at
-// ground level, so its "up" is the rider's WHOLE elevation above the animal's feet (~41 on
-// 巨型螃蟹, ~220 on a Leviathan) rather than a small delta on a bone that is already up
-// there.  torsoLen cannot bound that: the crabs' front/rear bones are nearly stacked
-// vertically (torsoLen 3.9) while their back is 41 units up, so the size-derived ceiling
-// would snap the seat to 15 on the first keypress - the exact silent-corruption bug that
-// bit the Leviathan.  Flat and generous instead; Numpad0 (home) is the recovery if a key
-// runs away, and a ceiling can never move a seat on its own.
-const float kRigidTuneLimit = 300.0f;
-// Kept fraction of the SIDEWAYS gait swing for species that get DampSeatSway.
-// UNUSED since 2026-08-27: no species asks for lateral damping any more, because damping the
-// crabs' roll is what stopped the rider from following their shell (see the long note in
-// BuildSeatInfo).  Left in place so the feature can be switched back on for one species by
-// restoring the list there; DampSeatSway itself early-returns while swayScale stays 1.0.
-const float kSeatSwayScale = 0.15f;
 
 bool IsRiding(Character* c)
 {
@@ -649,8 +611,8 @@ static void TrimStr(std::string& s)
 // tuning anything: these are the seats dialled in in-game by the author, compiled into
 // the DLL.  riding.cfg therefore becomes purely the player's own override file - it does
 // not have to ship with the mod, and deleting it restores exactly this table.
-//   * home == the tuned offset, so Numpad0 always returns to the shipped default seat;
-//     Ctrl+Numpad0 still lets a player declare a zero of their own.
+//   * home == the tuned offset, so Numpad9 always returns to the shipped default seat;
+//     Ctrl+Numpad9 still lets a player declare a zero of their own.
 //   * columns 11-14 (rider anchor + bob baseline) are shipped too, so frame one of the
 //     first ride is already placed instead of drifting in during capture.  A 0 there
 //     just means "was never captured", and the runtime captures it as before.
@@ -737,7 +699,7 @@ static void SeedDefaultSeats()
         st.lateral     = d.lateral;
         st.anchor      = Ogre::Vector3(d.ax, d.ay, d.az);
         st.base        = d.base;
-        st.home        = st.offset;    // the shipped seat IS the zero Numpad0 returns to
+        st.home        = st.offset;    // the shipped seat IS the zero Numpad9 returns to
         st.homeLateral = st.lateral;
         speciesTuning[d.species] = st;
     }
@@ -800,7 +762,11 @@ static void LoadConfig()
         if (n >= 3)
         {
             if (mode < SEAT_EXACT) mode = SEAT_EXACT;
-            if (mode > SEAT_RIGID) mode = SEAT_RIGID;
+            // mode 4 was the rigid-body seat, removed 2026-08-27.  Its numbers were offsets
+            // from the mount's rigid body rather than from a bone, so a stale row like that
+            // must not be reinterpreted as a rear/neck anchor - drop it to the neutral mode
+            // and let the built-in default / the tuning keys take it from there.
+            if (mode > SEAT_REAR) mode = SEAT_MIDPOINT;
             if (posture < POSTURE_SIT) posture = POSTURE_SIT;
             if (posture > POSTURE_STAND) posture = POSTURE_STAND;
             SpeciesTuning st(mode, Ogre::Vector3(fwd, up, 0.0f));
@@ -865,7 +831,7 @@ static void SaveConfig()
     fprintf(f, "# <species>=<mode>,<up>,<forward>,<mount>,<sit>,<roll>,<pitch>,<yaw>,<posture>,<lateral>  mode 0=exact 1=midpoint 2=neck 3=rear  sit 0=off 1=on  posture 0=sit 1=stand  lateral=side offset\n");
     fprintf(f, "# columns 4 and 6-8 are OBSOLETE legacy fields (mount method / roll-pitch-yaw) - parsed-and-ignored, always written as 0\n");
     fprintf(f, "# columns 11-14 = persisted seat constants (anchor x/y/z + bob baseline), auto-captured - do not hand-edit\n");
-    fprintf(f, "# columns 15-17 = the declared zero/home (up, forward, lateral): Numpad0 returns here, Ctrl+Numpad0 sets it to the current seat\n");
+    fprintf(f, "# columns 15-17 = the declared zero/home (up, forward, lateral): Numpad9 returns here, Ctrl+Numpad9 sets it to the current seat\n");
     fprintf(f, "# this file only OVERRIDES the seats built into RidingPlugin.dll - delete it to go back to the shipped defaults\n");
     fprintf(f, "defaults=%d\n", kDefaultsVersion);
     boost::unordered_map<std::string, SpeciesTuning>::iterator it = speciesTuning.begin();
@@ -920,13 +886,7 @@ SeatInfo BuildSeatInfo(Character* mount)
     info.rootAnchor = false;
     info.neckFollow = false;
     info.flexTrack  = false;
-    info.swayScale  = 1.0f;      // lateral damping is off for every species (see below)
     info.sizeScale = 1.0f;
-    info.preRigidOffset  = Ogre::Vector3::ZERO;
-    info.preRigidLateral = 0.0f;
-    info.preRigidHome    = Ogre::Vector3::ZERO;
-    info.preRigidHomeLat = 0.0f;
-    info.havePreRigid    = false;
 
     AnimationClass* mountAnim = mount ? mount->getAnimationClass() : NULL;
     if (mountAnim)
@@ -1023,27 +983,14 @@ SeatInfo BuildSeatInfo(Character* mount)
         }
     }
 
-    // Lateral gait damping (DampSeatSway) is OFF for every species - 2026-08-27.
-    //
-    // It was added on 2026-08-26 for the crab family, whose walk cycle rolls the whole
-    // skeleton sideways: measured against the mount's gait-free rigid body the seat swings
-    // ~2.4 units at a ~0.32 s period, and no anchor bone escapes it (root 3.45 vs neck 2.41).
-    // Scaling that component to 15% did exactly what it says on the tin - and that turned out
-    // to BE the reported "人物在螃蟹背上来回横移".  The player's own re-diagnosis:
-    // 「人在横向上没有跟着螃蟹动所以看起来是人在横向上左右摇」.  The shell rolls, the damper
-    // pins the rider near the rigid-body centreline, so the rider slides across a shell that
-    // is moving out from under them.  What reads as "glued to the back" is the rider tracking
-    // the shell's roll in full, which is what the undamped bone anchor already does.
-    //
-    // The machinery is kept (SeatInfo::swayScale, kSeatSwayScale, DampSeatSway) because it is
-    // inert at 1.0 and re-enabling it for some future species is a matter of restoring the
-    // per-species list here.  Note that the STANDING-STILL sway the player also reported is a
-    // different bug with a different fix: GetMountForward's degenerate-baseline guard (the
-    // crab's Spine sits almost straight above its Pelvis, so the bone-derived forward axis was
-    // pure noise and rotated the tuned offsets around a circle).  That guard stays.
-    //
-    // If the list comes back: names must be explicit UTF-8 escapes, plain literals compile to
-    // GBK here and never match getName() (see the kFlingSkeletons note above).
+    // No lateral gait damping, for any species.  It was tried for the crab family (whose walk
+    // cycle rolls the whole skeleton sideways) and removed again on 2026-08-27: the sideways
+    // swing is the SHELL moving, so a rider tracking it in phase is a rider staying put on the
+    // shell.  Damping it pinned the rider near the rigid-body centreline and the shell rolled
+    // out from under them - which is what the "人物在螃蟹背上来回横移" report was actually
+    // describing.  Full follow is the correct look; see RidingPlugin_RE_NOTES.md for the
+    // measurements.  The standing-still sway is a DIFFERENT bug with its own fix that stays:
+    // GetMountForward's degenerate-baseline guard.
 
     // 卷缩者 (Crimper) ONLY: the player wants the rider's butt glued to the NECK bone so
     // it rides up and down together with the neck - the flattened root-anchored height
@@ -1077,12 +1024,6 @@ SeatInfo BuildSeatInfo(Character* mount)
     else if (info.seatMode == SEAT_REAR)
     {
         // anchor IS the hindquarter bone: no geometric guess, the player tunes up from it
-        info.lift = Ogre::Vector3::ZERO;
-    }
-    else if (info.seatMode == SEAT_RIGID)
-    {
-        // no bone involved at all - the tuned offsets ARE the seat, measured from the
-        // mount's rigid body (see ComputeRigidSeatPosition)
         info.lift = Ogre::Vector3::ZERO;
     }
     // SEAT_EXACT keeps the per-bone lift set above
@@ -1122,8 +1063,8 @@ static float MountBoardEnvelope(Character* mount)
 // Travel heading of the mount (normalised, ground plane) if one has been recorded this
 // ride.  ApplyRiderOrientation maintains it from the CharMovement position delta and
 // HOLDS it while the mount stands still, so it is the one horizontal frame on the mount
-// that carries no gait wobble at all - usable both as a facing source and as the frame
-// to measure/damp sideways sway in.  false = this mount has not travelled yet.
+// that carries no gait wobble at all - used as the fallback facing source when the
+// front/rear bone baseline degenerates.  false = this mount has not travelled yet.
 static bool GetMountTravelHeading(Character* mount, Ogre::Vector3& out)
 {
     boost::unordered_map<Character*, Ogre::Vector3>::iterator hd = mountHeadingDir.find(mount);
@@ -1199,63 +1140,9 @@ Ogre::Vector3 GetMountForward(const SeatInfo& seat, Character* mount, int* srcOu
     return fwd;
 }
 
-// ---- rigid seat (SEAT_RIGID) ------------------------------------------------------
-//
-// Everything the bone anchors give us is contaminated by the walk cycle; on the crabs the
-// gait rolls the entire skeleton, so no choice of bone helps (root 3.45 units of side
-// swing vs the neck's 2.41 - measured).  The mount's CharMovement position is the one
-// horizontal reference with no gait in it, and the travel heading (held while standing
-// still) is the one rotation frame with no bone wobble in it.  Build the seat purely from
-// those two and the tuned offsets: the rider then rides the animal's PATH.
-//
-// Measured per-frame sideways step of each candidate reference on a walking 巨型螃蟹:
-//   CharMovement position  |avg| 0.0036   <- this
-//   root bone              |avg| 0.0653   (~18x noisier)
-//
-// Pure function of this frame's mount state - no capture, no baseline, no state machine,
-// so it is immune to the whole class of lifecycle bugs DampSeatBob went through, and it
-// gives identical results however many sync paths call it per frame.
-//
-// Returns false only if the mount has no movement object (then the caller falls back to
-// the bone path so a transient never produces a garbage seat).
-static bool ComputeRigidSeatPosition(const SeatInfo& seat, Character* mount, Ogre::Vector3& out)
-{
-    CharMovement* mv = mount->getMovement();
-    if (!mv) return false;
-    Ogre::Vector3 pos = mv->getPosition();
-    pos.y += seat.userOffset.y * seat.sizeScale;
-    Ogre::Vector3 hd;
-    if (GetMountTravelHeading(mount, hd))
-    {
-        Ogre::Vector3 side = Ogre::Vector3(0.0f, 1.0f, 0.0f).crossProduct(hd);
-        if (side.length() > 0.001f)
-        {
-            side.normalise();
-            pos += hd   * (seat.userOffset.x * seat.sizeScale)
-                 + side * (seat.lateral      * seat.sizeScale);
-        }
-    }
-    // No travel heading yet (this mount has not moved a step since it was mounted): keep
-    // the rider straight above the body instead of rotating the offsets by the bone axis.
-    // On exactly the species that need this mode that axis is pure noise (the crabs'
-    // front/rear bones are 0.02-0.16 apart horizontally), and a rigid seat's forward
-    // offset is large (~8 units), so borrowing it would swing the rider around an 8-unit
-    // circle while the animal stands perfectly still.
-    out = pos;
-    return true;
-}
-
 // Final seat position in world space for the given mount.
 Ogre::Vector3 ComputeSeatPosition(const SeatInfo& seat, Character* mount)
 {
-    if (seat.seatMode == SEAT_RIGID)
-    {
-        Ogre::Vector3 rigid;
-        if (ComputeRigidSeatPosition(seat, mount, rigid))
-            return rigid;
-        // no movement object: fall through to the bone anchor below rather than
-        // returning something meaningless
-    }
     Ogre::Vector3 anchor = mount->getBoneWorldPosition(seat.backBone);
     if (seat.rootAnchor)
     {
@@ -1419,13 +1306,6 @@ static float SeatTuneScale(const SeatInfo& seat)
 // default are completely unaffected.
 static float SeatTuneLimit(const SeatInfo& seat)
 {
-    if (seat.seatMode == SEAT_RIGID)
-    {
-        // rigid seats are absolute elevations above the animal's feet, not deltas on a
-        // bone that is already up there - see kRigidTuneLimit
-        float scaled = kTuningClamp * SeatTuneScale(seat) * kTuneHeadroom;
-        return (scaled > kRigidTuneLimit) ? scaled : kRigidTuneLimit;
-    }
     float scale = SeatTuneScale(seat);
     if (scale <= 1.0f)
         return kTuningClamp;                                 // normal animal: unchanged
@@ -1455,15 +1335,7 @@ static void ClampTuning(Ogre::Vector3& v, float limit)
 // giants were stuck on NECK), so switching a giant between them must not change who fights.
 static bool IsBigMount(const SeatInfo& seat)
 {
-    if (seat.seatMode == SEAT_NECK || seat.seatMode == SEAT_REAR)
-        return true;
-    // RIGID is size-agnostic (the crabs use it for smoothness, a giant could too), so for
-    // that mode ask the animal's own length instead of the anchor choice.  Keeps a giant
-    // switched to a rigid seat on the "mount does the fighting" side without dragging the
-    // crabs - torsoLen 3.9 - along with it.
-    if (seat.seatMode == SEAT_RIGID && seat.torsoLen > kTuningClamp)
-        return true;
-    return false;
+    return (seat.seatMode == SEAT_NECK || seat.seatMode == SEAT_REAR);
 }
 
 // Orient the rider's scene node after the game's own update.  The carry physics pins
@@ -1565,7 +1437,7 @@ static void ApplyRiderOrientation(Character* rider, const SeatInfo& seat, Charac
 //
 // `anchor` is captured once per mount on the first synced frame as (rBip - node),
 // preserving the height the riding.cfg tuning was calibrated against; boneLocal is
-// recomputed every frame so a posture switch (Numpad 7) self-corrects in one frame.
+// recomputed every frame so a cfg posture change self-corrects in one frame.
 static void SyncRiderNode(Character* rider, Character* mount, AnimationClass* rAnim,
                           const Ogre::Vector3& seatPos, bool mainPhase)
 {
@@ -1599,7 +1471,7 @@ static void SyncRiderNode(Character* rider, Character* mount, AnimationClass* rA
     // permanently mis-seated after every save/load).  A value is only captured once
     // it has held steady for kCaptureStableNeed syncs, and a stored anchor is
     // re-validated against firmly-settled live readings - that heals both poison
-    // and staleness (a Numpad-7 posture switch changes the pose constant too).
+    // and staleness (a cfg posture change changes the pose constant too).
     //
     // Capture/heal bookkeeping happens ONLY at the main-loop sync: the raw relation
     // read mid-animation-phase differs by >1.5u between call sites (bones lag node
@@ -1695,15 +1567,12 @@ static void SyncRiderNode(Character* rider, Character* mount, AnimationClass* rA
 //
 // Stateless/idempotent per frame (starts from the freshly computed seatPos), so calling
 // it once or several times per frame gives the same result.  The captured baseline
-// assumes lift is constant; CycleSeatMode changes lift, so it clears mountBaseVOffset.
+// assumes lift is constant, which it is: each species' seat mode is fixed by the
+// built-in defaults / riding.cfg and never changes at runtime.
 static const float kSeatBobScale = 0.15f;
 static void DampSeatBob(Character* mount, const SeatInfo& seat, Ogre::Vector3& seatPos)
 {
     if (!mount) return;
-    // Rigid seat: the height already comes from the mount's rigid body, which carries no
-    // gait bob at all (|dY| 0.033 per frame, terrain only).  There is nothing to damp and
-    // no baseline to capture - that is the whole point of the mode.
-    if (seat.seatMode == SEAT_RIGID) return;
     // 卷缩者: intentionally follow the neck bob at full strength (no damping) so the
     // rider's butt stays glued to the neck as it rises and falls.  ComputeSeatPosition
     // already set seatPos.y to the neck bone Y; leave it untouched.
@@ -1884,87 +1753,23 @@ static bool SeatNeedsPlacement(const SeatInfo& seat)
     return !(seat.seatMode == SEAT_EXACT && seat.lift == Ogre::Vector3::ZERO && seat.userOffset == Ogre::Vector3::ZERO);
 }
 
-// ---- sideways (lateral) sway damping -- DORMANT since 2026-08-27 -----------------
-//
-// No species sets swayScale below 1.0 any more, so this function returns on its second
-// line for every ride.  It stays because the measurement behind it is still true and the
-// mechanism is sound; what was wrong was the conclusion drawn from it.
-//
-// Measured on a 4708-frame crab ride (2026-08-26), projected onto the mount's travel
-// frame: the seat's SIDE offset from the mount's rigid CharMovement position swings
-// across ~2.4 units at a ~0.32 s step period, and the rider tracks it in phase.  That was
-// read as the cause of "人物在螃蟹背上来回横移" and scaled to 15%.  The player then
-// re-diagnosed it the other way round - 「人在横向上没有跟着螃蟹动」 - and that is right:
-// the swing is the SHELL moving, the rider tracking it in phase is the rider staying put
-// on the shell, and damping it pins the rider to the rigid-body centreline while the shell
-// rolls out from under them.  Following in full is the correct look; see BuildSeatInfo.
-//
-// The mount's CharMovement position is the only horizontal reference with no gait in it
-// (rigid pathfinding body), and the side offset measured against it has a stable mean
-// (-0.40 over the whole ride; per-second means -0.31..-0.63), so the oscillation can be
-// scaled toward the body centreline WITHOUT a captured baseline - the machinery whose
-// every life-cycle stage has bitten this project (see DampSeatBob).  Pure function of
-// this frame's bones plus constants: idempotent no matter how many sync paths call it.
-//
-// Only the side axis is touched.  Forward is deliberately left alone - its offset carries
-// a large species-dependent constant (the crab's anchor sits ~3.8 units ahead of the body
-// centre) which could only be separated from the swing by a baseline.  Vertical is
-// DampSeatBob's job.  The residual ~0.4-unit mean offset simply becomes part of what the
-// lateral tuning key (Ctrl + Numpad * / /) is adjusted against.
-
-// The mount's CharMovement position is the only horizontal reference with no gait in it
-// (rigid pathfinding body), and the side offset measured against it has a stable mean
-// (-0.40 over the whole ride; per-second means -0.31..-0.63), so the oscillation can be
-// scaled toward the body centreline WITHOUT a captured baseline - the machinery whose
-// every life-cycle stage has bitten this project (see DampSeatBob).  Pure function of
-// this frame's bones plus constants: idempotent no matter how many sync paths call it.
-//
-// Only the side axis is touched.  Forward is deliberately left alone - its offset carries
-// a large species-dependent constant (the crab's anchor sits ~3.8 units ahead of the body
-// centre) which could only be separated from the swing by a baseline.  Vertical is
-// DampSeatBob's job.  The residual ~0.4-unit mean offset simply becomes part of what the
-// lateral tuning key (Ctrl + Numpad * / /) is adjusted against.
-static void DampSeatSway(Character* mount, const SeatInfo& seat, Ogre::Vector3& seatPos)
-{
-    if (seat.seatMode == SEAT_RIGID) return;            // seat is already gait-free
-    if (seat.swayScale >= 0.999f) return;              // off for every species but the list
-    CharMovement* mv = mount->getMovement();
-    if (!mv) return;
-    Ogre::Vector3 hd;
-    if (!GetMountTravelHeading(mount, hd)) return;     // no gait-free frame yet: leave it
-    Ogre::Vector3 side = Ogre::Vector3(0.0f, 1.0f, 0.0f).crossProduct(hd);
-    if (side.length() < 0.001f) return;
-    side.normalise();
-
-    Ogre::Vector3 rel = seatPos - mv->getPosition();
-    rel.y = 0.0f;
-    float cur  = rel.dotProduct(side);
-    float keep = seat.lateral * seat.sizeScale;         // the tuned side offset stays full strength
-    float sway = cur - keep;
-    // Implausible reads (ghost bones, the unscaled-bone window right after pickup/load)
-    // are skipped outright rather than clamped: a clamped correction would itself be a
-    // large jump, which is exactly what this function exists to prevent.
-    //
-    // 2026-08-27: the cut-off was 8.0, which sat INSIDE the crab family's own measured
-    // swing - on a walking 巨型螃蟹 the rendered side offset spanned -7.73..+1.95, so the
-    // very frames that needed damping most were the ones that escaped it entirely (the
-    // damper worked: raw side std 3.183 -> 0.702, yet the extremes were untouched).  Raised
-    // to a value only a ghost read can reach: those come back at the node-scale multiple
-    // (~10x), i.e. 70+ on these species, so the guard still catches what it was written for.
-    static const float kMaxSway = 40.0f;
-    if (sway > kMaxSway || sway < -kMaxSway) return;
-    seatPos += side * (sway * (seat.swayScale - 1.0f));
-}
-
 // Seat position shared by the two per-frame sync paths (animUpdate + main loop):
 // horizontal instant from ComputeSeatPosition, vertical run-bob scaled by DampSeatBob.
 // The two writers must agree every frame - the pass running closer to the render would
 // otherwise visibly win.
+//
+// There is deliberately no lateral damping here.  One was written (2026-08-26) after
+// measuring the seat's side offset swinging ~2.4 units per step on a crab, and removed
+// again (2026-08-27): that swing is the SHELL moving, the rider tracking it in phase is
+// the rider staying put on the shell, and scaling it toward the rigid-body centreline
+// makes the shell roll out from under them - which is what "人在横向上左右摇" actually
+// was.  Full lateral follow is correct.  The sway visible while the animal stands STILL
+// is a different bug with a different fix (GetMountForward's degenerate-baseline guard,
+// still in place).  Measurements are archived in RidingPlugin_RE_NOTES.md.
 static Ogre::Vector3 ComputeDampedSeatPos(Character* mount, const SeatInfo& seat)
 {
     Ogre::Vector3 seatPos = ComputeSeatPosition(seat, mount);
     DampSeatBob(mount, seat, seatPos);     // vertical
-    DampSeatSway(mount, seat, seatPos);    // horizontal, side axis only (crab family)
     return seatPos;
 }
 
@@ -1980,7 +1785,7 @@ static int SafeReadMovementMode(CharMovement* mv)
     { return -1; }
 }
 
-// Continuous diagnostics (Numpad .): log EVERY frame while the mount is moving,
+// Continuous diagnostics (Ctrl+Numpad .): log EVERY frame while the mount is moving,
 // comparing the mount's root/back bones, the forward vector, the raw (unsmoothed)
 // target, the damped target, and every position/orientation readout of the rider
 // (scene node, movement pos, root bone, world rBip).  Called from the main-loop
@@ -2080,7 +1885,6 @@ static void DebugLogRideFrame(Character* rider, Character* mount, const SeatInfo
             hdD = fwd;      // never traveled: fall back to the bone-derived forward
         }
         float bFwdC = 0.0f, bLatC = 0.0f, rFwdC = 0.0f, rLatC = 0.0f, fwdDevDeg = 0.0f;
-        float sdevRaw = 0.0f, sdevDmp = 0.0f;
         hdD.y = 0.0f;
         if (hdD.length() > 0.001f)
         {
@@ -2091,14 +1895,6 @@ static void DebugLogRideFrame(Character* rider, Character* mount, const SeatInfo
             Ogre::Vector3 rRel = riderBip01 - dmvP; rRel.y = 0.0f;
             bFwdC = bRel.dotProduct(hdD);  bLatC = bRel.dotProduct(hdSide);
             rFwdC = rRel.dotProduct(hdD);  rLatC = rRel.dotProduct(hdSide);
-            // DampSeatSway effectiveness meter: the side deviation it works on, before
-            // (sdev raw) and after (damped).  Ratio should read as seat.swayScale, and the
-            // RAW value's swing across frames is the sway that was being complained about.
-            Ogre::Vector3 sRaw = rawT - dmvP;    sRaw.y = 0.0f;
-            Ogre::Vector3 sDmp = seatPos - dmvP; sDmp.y = 0.0f;
-            float keepDbg = seat.lateral * seat.sizeScale;
-            sdevRaw = sRaw.dotProduct(hdSide) - keepDbg;
-            sdevDmp = sDmp.dotProduct(hdSide) - keepDbg;
             Ogre::Vector3 fwdFlat = fwd; fwdFlat.y = 0.0f;
             if (fwdFlat.length() > 0.001f)
             {
@@ -2136,7 +1932,7 @@ static void DebugLogRideFrame(Character* rider, Character* mount, const SeatInfo
         actWDbg = rAnim->getTotalActionAnimationWeight();
         char dbg[2048];
         _snprintf_s(dbg, 2048, _TRUNCATE,
-            "Riding: DBG root=(%.2f,%.2f,%.2f) back=(%.2f,%.2f,%.2f) fwd=(%.2f,%.2f,%.2f) rawT=(%.2f,%.2f,%.2f) tgt=(%.2f,%.2f,%.2f) node=(%.2f,%.2f,%.2f) rMove=(%.2f,%.2f,%.2f) rRoot=(%.2f,%.2f,%.2f) rBip=(%.2f,%.2f,%.2f) nodeQ=(%.2f,%.2f,%.2f,%.2f) rBipQ=(%.2f,%.2f,%.2f,%.2f) move=(%.2f,%.2f,%.2f) anch=(%.2f,%.2f,%.2f) st=%d pelv=(%.2f,%.2f,%.2f) rel=(%.2f,%.2f,%.2f) rs=%d bs=%d wn=(%.2f,%.2f,%.2f) rag=%d aRag=%d bc=%d mMode=%d mv=%d hd=(%.2f,%.2f) hdSrc=%d bRel=(f%.2f,s%.2f) rRel=(f%.2f,s%.2f) fwdDev=%.1f fwSrc=%d sdev=%.2f->%.2f swy=%.2f pose=%d/%.2f/%.2f oth=%.2f act=%.2f",
+            "Riding: DBG root=(%.2f,%.2f,%.2f) back=(%.2f,%.2f,%.2f) fwd=(%.2f,%.2f,%.2f) rawT=(%.2f,%.2f,%.2f) tgt=(%.2f,%.2f,%.2f) node=(%.2f,%.2f,%.2f) rMove=(%.2f,%.2f,%.2f) rRoot=(%.2f,%.2f,%.2f) rBip=(%.2f,%.2f,%.2f) nodeQ=(%.2f,%.2f,%.2f,%.2f) rBipQ=(%.2f,%.2f,%.2f,%.2f) move=(%.2f,%.2f,%.2f) anch=(%.2f,%.2f,%.2f) st=%d pelv=(%.2f,%.2f,%.2f) rel=(%.2f,%.2f,%.2f) rs=%d bs=%d wn=(%.2f,%.2f,%.2f) rag=%d aRag=%d bc=%d mMode=%d mv=%d hd=(%.2f,%.2f) hdSrc=%d bRel=(f%.2f,s%.2f) rRel=(f%.2f,s%.2f) fwdDev=%.1f fwSrc=%d pose=%d/%.2f/%.2f oth=%.2f act=%.2f",
             rootP.x, rootP.y, rootP.z,
             backP.x, backP.y, backP.z,
             fwd.x, fwd.y, fwd.z,
@@ -2164,8 +1960,6 @@ static void DebugLogRideFrame(Character* rider, Character* mount, const SeatInfo
             rFwdC, rLatC,
             fwdDevDeg,
             fwSrc,
-            sdevRaw, sdevDmp,
-            seat.swayScale,
             posePlayDbg, poseWDbg, posePDbg,
             otherWDbg,
             actWDbg);
@@ -2207,151 +2001,6 @@ static void TuneSeat(SeatInfo& seat, float dUp, float dFwd)
              + " fwd=" + IntToStr((int)(seat.userOffset.x * 100.0f)));
 }
 
-// Seed a freshly selected rigid seat from where the rider is standing RIGHT NOW, so
-// switching into the mode does not teleport them.  The reference frame changes completely
-// (bone anchor -> rigid body + travel heading), so the old tuned numbers mean something
-// else in it: the crab's 9.70 "up" is 9.70 above its spine bone, but 9.70 above its rigid
-// body is inside the animal.  Decomposing the current world seat into the new frame gives
-// the identical position expressed in the new units, which is also a usable starting point
-// for the +/- keys (the alternative - tuning up from zero at 0.1 per press - is 400
-// keypresses on a crab).
-//
-// This is a capture, and every AUTOMATIC capture in this project's history has eventually
-// fired at a terrible moment (post-mount pose storm, unscaled-bone window, a frozen frame
-// during pause) and baked garbage into the cfg.  This one is triggered by a keypress while
-// the player is watching a steady ride, which is what makes it safe; nothing captures on
-// its own.  The declared "home" moves with it, because the old home is expressed in the
-// old frame and Numpad0 would otherwise drop the rider inside the animal.
-static void SeedRigidSeat(SeatInfo& seat, Character* mount, const Ogre::Vector3& want)
-{
-    CharMovement* mv = mount ? mount->getMovement() : 0;
-    if (!mv) return;
-    float s = (seat.sizeScale > 0.001f) ? seat.sizeScale : 1.0f;
-    Ogre::Vector3 rel = want - mv->getPosition();
-    float up  = rel.y / s;
-    float fwd = 0.0f, lat = 0.0f;
-    Ogre::Vector3 hd;
-    if (GetMountTravelHeading(mount, hd))
-    {
-        Ogre::Vector3 side = Ogre::Vector3(0.0f, 1.0f, 0.0f).crossProduct(hd);
-        if (side.length() > 0.001f)
-        {
-            side.normalise();
-            Ogre::Vector3 flat(rel.x, 0.0f, rel.z);
-            fwd = flat.dotProduct(hd)   / s;
-            lat = flat.dotProduct(side) / s;
-        }
-        // a degenerate side axis leaves the horizontal offsets at zero: rider straight
-        // above the body, which is what ComputeRigidSeatPosition would draw anyway
-    }
-    float lim = SeatTuneLimit(seat);       // seat.seatMode is already SEAT_RIGID here
-    if (up  >  lim) up  =  lim;
-    if (up  < -lim) up  = -lim;
-    if (fwd >  lim) fwd =  lim;
-    if (fwd < -lim) fwd = -lim;
-    if (lat >  lim) lat =  lim;
-    if (lat < -lim) lat = -lim;
-    seat.userOffset  = Ogre::Vector3(fwd, up, 0.0f);
-    seat.lateral     = lat;
-    seat.homeOffset  = seat.userOffset;
-    seat.homeLateral = seat.lateral;
-    DebugLog("Riding: rigid seat seeded " + seat.species
-             + " up=" + IntToStr((int)(up * 100.0f))
-             + " fwd=" + IntToStr((int)(fwd * 100.0f))
-             + " lat=" + IntToStr((int)(lat * 100.0f)));
-}
-
-// Cycle the seat mode of the currently mounted animal
-// (exact -> midpoint -> neck -> rear -> rigid).
-//
-// SEAT_RIGID is a reference-frame change, not just another anchor, so entering and leaving
-// it has to swap the tuning as well.  2026-08-27: cycling 4 -> 0 used to leave the rigid
-// numbers behind (巨型螃蟹 ended up with up 59.63 / fwd -24.54 read as bone offsets, ~50
-// units off, and SeedRigidSeat had overwritten home with the same values so Numpad0 could
-// not recover it either).  The pre-rigid tuning is now stashed on the way in and put back
-// on the way out; a ride that started in mode 4 (cfg said so, no stash) falls back to this
-// species' built-in default, which is the same thing "restore the previous state" means.
-static void CycleSeatMode(SeatInfo& seat, Character* mount)
-{
-    // where the player sees the rider right now, in the mode we are leaving
-    Ogre::Vector3 prevPos;
-    bool havePrev = false;
-    if (mount)
-    {
-        prevPos  = ComputeDampedSeatPos(mount, seat);
-        havePrev = true;
-    }
-
-    int fromMode  = seat.seatMode;
-    seat.seatMode = (seat.seatMode + 1) % SEAT_MODE_COUNT;
-    if (seat.seatMode < SEAT_EXACT) seat.seatMode = SEAT_EXACT;
-    if (seat.seatMode > SEAT_RIGID) seat.seatMode = SEAT_RIGID;
-
-    if (fromMode != SEAT_RIGID && seat.seatMode == SEAT_RIGID)
-    {
-        seat.preRigidOffset  = seat.userOffset;
-        seat.preRigidLateral = seat.lateral;
-        seat.preRigidHome    = seat.homeOffset;
-        seat.preRigidHomeLat = seat.homeLateral;
-        seat.havePreRigid    = true;
-    }
-    else if (fromMode == SEAT_RIGID && seat.seatMode != SEAT_RIGID)
-    {
-        if (seat.havePreRigid)
-        {
-            seat.userOffset  = seat.preRigidOffset;
-            seat.lateral     = seat.preRigidLateral;
-            seat.homeOffset  = seat.preRigidHome;
-            seat.homeLateral = seat.preRigidHomeLat;
-            seat.havePreRigid = false;
-            DebugLog("Riding: bone-anchor tuning restored " + seat.species);
-        }
-        else
-        {
-            const DefaultSeat* d = FindDefaultSeat(seat.species);
-            if (d)
-            {
-                seat.userOffset  = Ogre::Vector3(d->forward, d->up, 0.0f);
-                seat.lateral     = d->lateral;
-                seat.homeOffset  = seat.userOffset;
-                seat.homeLateral = seat.lateral;
-                DebugLog("Riding: no pre-rigid tuning, built-in default restored " + seat.species);
-            }
-            else
-            {
-                seat.userOffset  = Ogre::Vector3::ZERO;
-                seat.lateral     = 0.0f;
-                seat.homeOffset  = Ogre::Vector3::ZERO;
-                seat.homeLateral = 0.0f;
-                DebugLog("Riding: no pre-rigid tuning and no built-in default, seat zeroed " + seat.species);
-            }
-        }
-    }
-
-    // recompute the base lift for the new mode
-    if (seat.seatMode == SEAT_MIDPOINT)
-    {
-        if (!seat.rearBone.empty() && seat.rearBone != seat.frontBone)
-            seat.lift = Ogre::Vector3(0.0f, seat.torsoLen * kSeatLiftRatio, 0.0f);
-    }
-    else if (seat.seatMode == SEAT_NECK || seat.seatMode == SEAT_REAR)
-    {
-        seat.lift = Ogre::Vector3::ZERO;
-    }
-    else if (seat.seatMode == SEAT_RIGID)
-    {
-        seat.lift = Ogre::Vector3::ZERO;
-        if (havePrev)
-            SeedRigidSeat(seat, mount, prevPos);
-    }
-    // SEAT_EXACT: lift stays whatever the EXACT base was (recompute from bones would
-    // need the mount, keep current - the user tunes on top anyway)
-
-    PersistTuning(seat);
-
-    DebugLog("Riding: mode " + seat.species + " -> " + IntToStr(seat.seatMode));
-}
-
 // Seed persisted per-species constants into a fresh ride's maps so placement is
 // correct from frame one - mounting or restoring after a load no longer depends on
 // live-capturing through the post-mount/post-load pose storm.  Species never ridden
@@ -2376,8 +2025,9 @@ void Mount(Character* rider, Character* mount)
     if (rider == mount) return;
     // Only the player's OWN animals can be ridden (animal + in the player's party).
     // IsRideable = isAnimal() && isWithThePlayer().  This is the single chokepoint all
-    // mount paths (menu, Numpad1) funnel through, so wild/other-faction animals are
-    // blocked here regardless of how the mount was requested.
+    // mount paths (the context menu order and its approach state machine) funnel through,
+    // so wild/other-faction animals are blocked here regardless of how the mount was
+    // requested.
     if (!IsRideable(mount)) { DebugLog("Riding: mount rejected - not a player-owned animal"); return; }
     if (IsRiding(rider)) return;
     // One animal carries one rider (2026-08-26).  mountSeat / mountAnchor / the bob
@@ -3260,9 +2910,9 @@ static void HaltAndForceSitPass()
                         rAnim->stopAnimation("carry me");
                         const char* poseAnim = (sit->second.posture == POSTURE_STAND) ? "idle_stand_normal" : "sitting chair";
                         // The OTHER posture's pose has to go too (2026-08-26).  Mount()
-                        // always starts "sitting chair", and Numpad7 can switch posture
-                        // mid-ride, so a standing rider used to carry BOTH full-body poses
-                        // and render whatever blend of the two the engine settled on.
+                        // always starts "sitting chair" while the cfg may ask for the
+                        // stand posture, so a standing rider used to carry BOTH full-body
+                        // poses and render whatever blend of the two the engine settled on.
                         const char* otherAnim = (sit->second.posture == POSTURE_STAND) ? "sitting chair" : "idle_stand_normal";
                         AnimationData* otherData = rAnim->getAnimationData(otherAnim);
                         if (otherData && rAnim->getAnimationPlaying(otherData))
@@ -3435,83 +3085,43 @@ static void HotkeyPass()
         return;
 
     {
-        static bool prevNumpad1 = false;
-        static bool prevNumpad2 = false;
         static bool prevAdd = false;
         static bool prevSub = false;
         static bool prevMul = false;
         static bool prevDiv = false;
-        static bool prevNP0 = false;
-        static bool prevNP5 = false;
-        static bool prevNP6 = false;
-        static bool prevNP7 = false;
+        static bool prevNP9 = false;
         static bool prevDecimal = false;
 
-        // Debug: Numpad decimal (.) toggles continuous ride diagnostics.  Every ~10
+        // Ctrl held is read once here because two keys are now shared between a bare and a
+        // Ctrl variant (Numpad9 = home/set-home, Numpad. = force-sit/diagnostics), and the
+        // key EDGE may only be sampled once per frame - a second KeyEdge() call on the same
+        // static would see the already-updated prev state and never fire.
+        bool ctrlD = key->keyboard->isKeyDown(OIS::KC_LCONTROL) || key->keyboard->isKeyDown(OIS::KC_RCONTROL);
+        bool decE  = KeyEdge(key->keyboard->isKeyDown(OIS::KC_DECIMAL), prevDecimal);
+
+        // Debug: Ctrl+Numpad decimal (.) toggles continuous ride diagnostics.  Every ~10
         // frames we log the mount's root/back bone position+orientation, our computed
         // target seat position, and the rider's actual render node, so we can see
         // whether the "fling while running" comes from position or orientation.
-        if (KeyEdge(key->keyboard->isKeyDown(OIS::KC_DECIMAL), prevDecimal))
+        // (Bare Numpad. is force-sit since the 2026-08-27 remap; this one moved under Ctrl
+        // because it is a developer key and force-sit is the one a player might reach for.)
+        if (decE && ctrlD)
         {
             debugContinuous = !debugContinuous;
             DebugLog(std::string("Riding: debug continuous ") + (debugContinuous ? "ON" : "OFF"));
         }
 
-        if (KeyEdge(key->keyboard->isKeyDown(OIS::KC_NUMPAD1), prevNumpad1))
-        {
-            PlayerInterface* player = ou->player;
-            Character* rider = NULL;
-            Character* mount = NULL;
-
-            // iterate selected characters to find a human and an animal
-            ogre_unordered_set<hand>::type::iterator sit = player->selectedCharacters.begin();
-            for (; sit != player->selectedCharacters.end(); ++sit)
-            {
-                Character* c = sit->getCharacter();
-                if (!c) continue;
-                if (c->isAnimal())
-                    mount = c;
-                else
-                    rider = c;
-            }
-
-            // fallback: if selection was via the single selectedCharacter
-            if (!rider && !mount && player->selectedCharacter)
-            {
-                Character* sel = player->selectedCharacter.getCharacter();
-                if (sel)
-                {
-                    if (sel->isAnimal())
-                        mount = sel;
-                    else
-                        rider = sel;
-                }
-            }
-
-            if (rider && mount)
-                Mount(rider, mount);
-            else
-                DebugLog("Riding: select one human + one animal, then press Numpad1");
-        }
-
-        if (KeyEdge(key->keyboard->isKeyDown(OIS::KC_NUMPAD2), prevNumpad2))
-        {
-            PlayerInterface* player = ou->player;
-            Character* rider = NULL;
-            if (player->selectedCharacter)
-                rider = player->selectedCharacter.getCharacter();
-            if (rider)
-                Dismount(rider);
-            else
-                DebugLog("Riding: select the rider, then press Numpad2");
-        }
-
-        // Numpad2 above now runs the full rev6 put-down (getDropped + ragdoll clear) inside
-        // Dismount() itself, confirmed in-game 2026-08-24 (both hull A/B variants stood the
-        // rider up and restored control; hull=true settles straight down, hull=false pops the
-        // body up ~19u first, so true won).  The Numpad4/Numpad8 A/B probes and the 30-frame
-        // PostDismountWatch that carried the investigation have been removed now that the fix
-        // lives on the real path.  History of the dead ends is preserved in CLAUDE.md.
+        // Dismount has NO hotkey of its own (2026-08-27, user call): the right-click
+        // "put down" order is the real dismount entry point, and Numpad2 collided with
+        // the vanilla toggle_passive command - one press silently flipped the rider's
+        // combat stance as well as dismounting.  Every dismount path (right-click
+        // PUT_DOWN, forced dismount in combat) still goes through Dismount(), which runs
+        // the full rev6 put-down (getDropped + ragdoll clear) confirmed in-game
+        // 2026-08-24 (both hull A/B variants stood the rider up and restored control;
+        // hull=true settles straight down, hull=false pops the body up ~19u first, so
+        // true won).  The Numpad4/Numpad8 A/B probes and the 30-frame PostDismountWatch
+        // that carried the investigation were removed once the fix landed on the real
+        // path; the dead ends are preserved in CLAUDE.md.
         // (The 2026-08-25 Numpad8 probe series - bc toggle, queued CARRY_MODE, instant
         // _NV_ragdollModeUT - identified the carried-ragdoll drag as the node writer; the
         // winning fix lives permanently in SyncRiderNode + HaltAndForceSitPass, so the
@@ -3520,31 +3130,43 @@ static void HotkeyPass()
         // 3) Live seat tuning (applies to the currently mounted animal).
         //    Rider FACING is not tunable - it always follows the mount's travel direction.
         //    Numpad +/- : up/down 0.1    Numpad */ : forward/back 0.1
-        //    Numpad 5   : cycle seat mode (exact -> midpoint -> neck)
-        //    Numpad 6   : toggle force-sit on/off
-        //    Numpad 7   : cycle rider posture (sit -> stand)
+        //    Numpad .   : toggle force-sit on/off
+        //    (Numpad 7 posture cycling was removed 2026-08-27 - user call: the mod only
+        //     needs the one seated posture, and NUM7 is the vanilla "medic" command, so
+        //     every posture switch also silently toggled the rider's medic job.  The
+        //     stand posture itself still exists and is still honoured from the cfg's
+        //     posture column, exactly like the seat mode - there is simply no runtime
+        //     switch for it, and all 30 built-in defaults are seated.)
         //    Ctrl+*/ /   : move the seat left/right (lateral)
-        //    Numpad 0   : return to this species' declared zero (see Ctrl+Numpad0)
-        //    Ctrl+Numpad 0 : declare the CURRENT seat as this species' zero (2026-08-26).
-        //                 Before this, Numpad0 cleared the tune to the bare geometric base
-        //                 AND overwrote the cfg with zeros, so it destroyed a dialled-in
+        //    Numpad 9   : return to this species' declared zero (see Ctrl+Numpad9)
+        //    Ctrl+Numpad 9 : declare the CURRENT seat as this species' zero (2026-08-26).
+        //                 Before this, the reset key cleared the tune to the bare geometric
+        //                 base AND overwrote the cfg with zeros, so it destroyed a dialled-in
         //                 seat rather than returning to it.  The zero is now a separate
         //                 persisted slot (cfg cols 15-17) that the +/- keys never touch;
         //                 cfg files predating it migrate with zero = the tune already in
         //                 the file, so an existing good seat is the reset target already.
+        //
+        //    ** 2026-08-27 remap: every key we use has to be one the base game does NOT
+        //    ** bind, because a collision is SILENT - Kenshi's numpad commands are squad
+        //    ** state toggles (block/hold/passive/ranged/sneak/taunt/run-speed/medic/rescue
+        //    ** on NUM0..NUM8), so the old bindings quietly flipped the rider's stance or
+        //    ** job every time the seat was nudged and nothing on screen said so.  Reading
+        //    ** the live controls.cfg, the only unbound numpad keys are * / . NUM9 and
+        //    ** NumEnter.  Hence: home moved NUM0 -> NUM9, force-sit moved NUM6 -> NUM.,
+        //    ** and the diagnostics toggle moved to Ctrl+NUM. .  Still colliding, knowingly:
+        //    ** NUM+/NUM- are build_tilt_increase/decrease, which only do anything while
+        //    ** the build placement mode is up.  (Dismount on NUM2 and posture on NUM7 were
+        //    ** deleted outright the same day rather than remapped - neither key was needed.)
         //    (The old Numpad 3/9 ±0.02 fine step was removed 2026-08-24 - redundant with
-        //     +/- now that per-species presets cover the common animals; user call.)
+        //     +/- now that per-species presets cover the common animals; user call.  NUM9 is
+        //     therefore free to become the home key.)
         {
-            bool ctrlD = key->keyboard->isKeyDown(OIS::KC_LCONTROL) || key->keyboard->isKeyDown(OIS::KC_RCONTROL);
-
             bool addE = KeyEdge(key->keyboard->isKeyDown(OIS::KC_ADD),      prevAdd);
             bool subE = KeyEdge(key->keyboard->isKeyDown(OIS::KC_SUBTRACT), prevSub);
             bool mulE = KeyEdge(key->keyboard->isKeyDown(OIS::KC_MULTIPLY), prevMul);
             bool divE = KeyEdge(key->keyboard->isKeyDown(OIS::KC_DIVIDE),   prevDiv);
-            bool np0E = KeyEdge(key->keyboard->isKeyDown(OIS::KC_NUMPAD0),  prevNP0);
-            bool np5E = KeyEdge(key->keyboard->isKeyDown(OIS::KC_NUMPAD5),  prevNP5);
-            bool np6E = KeyEdge(key->keyboard->isKeyDown(OIS::KC_NUMPAD6),  prevNP6);
-            bool np7E = KeyEdge(key->keyboard->isKeyDown(OIS::KC_NUMPAD7),  prevNP7);
+            bool np9E = KeyEdge(key->keyboard->isKeyDown(OIS::KC_NUMPAD9),  prevNP9);
 
             bool stepUp = addE && !ctrlD;
             bool stepDn = subE && !ctrlD;
@@ -3552,13 +3174,11 @@ static void HotkeyPass()
             bool stepBk = divE && !ctrlD;
             bool stepLatR = mulE && ctrlD;
             bool stepLatL = divE && ctrlD;
-            bool stepRst = np0E && !ctrlD;
-            bool stepSetHome = np0E && ctrlD;
-            bool stepMode = np5E;
-            bool stepSit = np6E;
-            bool stepPosture = np7E;
+            bool stepRst = np9E && !ctrlD;
+            bool stepSetHome = np9E && ctrlD;
+            bool stepSit = decE && !ctrlD;
 
-            if (stepUp || stepDn || stepFw || stepBk || stepLatR || stepLatL || stepRst || stepSetHome || stepMode || stepSit || stepPosture)
+            if (stepUp || stepDn || stepFw || stepBk || stepLatR || stepLatL || stepRst || stepSetHome || stepSit)
             {
                 PlayerInterface* player = ou->player;
                 Character* rider = NULL;
@@ -3584,12 +3204,6 @@ static void HotkeyPass()
                             PersistTuning(seat);
                             DebugLog("Riding: force-sit " + seat.species + " -> " + IntToStr(seat.forceSit ? 1 : 0));
                         }
-                        else if (stepPosture)
-                        {
-                            seat.posture = (seat.posture == POSTURE_STAND) ? POSTURE_SIT : POSTURE_STAND;
-                            PersistTuning(seat);
-                            DebugLog("Riding: posture " + seat.species + " -> " + IntToStr(seat.posture));
-                        }
                         else if (stepLatR || stepLatL)
                         {
                             float lim  = SeatTuneLimit(seat);
@@ -3600,17 +3214,11 @@ static void HotkeyPass()
                             PersistTuning(seat);
                             DebugLog("Riding: lateral " + seat.species + " -> " + IntToStr((int)(seat.lateral * 100.0f)));
                         }
-                        else if (stepMode)
-                        {
-                            CycleSeatMode(seat, mount);
-                            // lift/anchor changed -> re-capture the bob baseline next frame
-                            mountBaseVOffset.erase(mount);
-                        }
                         else if (stepSetHome)
                         {
                             // "make where I am now the zero" - the reset target moves to
                             // the current seat, so later experimenting can always come
-                            // back to it with a bare Numpad0.
+                            // back to it with a bare Numpad9.
                             seat.homeOffset  = seat.userOffset;
                             seat.homeLateral = seat.lateral;
                             PersistTuning(seat);
@@ -3721,7 +3329,8 @@ static bool SetWidgetCaptionDeep(MyGUI::Widget* w, const std::string& utf8)
 // an animal-only selection right-clicking a rideable animal issues a REAL
 // Bodyguard order (animal guards animal), not a mount, so the vanilla "侍卫"
 // label must stay - "上马" only makes sense when a human is selected to ride.
-// Mirrors the selectedCharacters + selectedCharacter fallback used by Numpad1.
+// Reads selectedCharacters with a selectedCharacter fallback, the same way the mount
+// order handler picks the rider.
 static bool SelectionHasRider()
 {
     PlayerInterface* player = ou ? ou->player : NULL;
@@ -3774,7 +3383,7 @@ void contextMenu_show_hook(ContextMenuGUI* thisptr, const lektor<int>& ordersLis
         // order-31 row is dispatched by the game as TaskType 45.)
         const int kMenuOrderBodyguard = 31;
 
-        // per-row mapping dump, only when continuous diagnostics is on (Numpad .).
+        // per-row mapping dump, only when continuous diagnostics is on (Ctrl+Numpad .).
         // Dumps EVERY child against the order AT THE SAME INDEX - keeping the two
         // side by side is exactly what exposed the misalignment documented below.
         if (debugContinuous)

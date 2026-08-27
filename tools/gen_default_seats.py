@@ -48,9 +48,13 @@ with open(sys.argv[1], 'rb') as f:
         lateral = float(col[9])
         ax, ay, az, base = (float(col[10]), float(col[11]),
                             float(col[12]), float(col[13]))
-        if mode == 4:
-            sys.exit('%r is mode 4 (rigid): its offsets are in mount-body space and must '
-                     'not be baked as bone-anchor defaults' % name)
+        # Valid seat modes are 0=exact 1=midpoint 2=neck 3=rear.  Mode 4 was the
+        # rigid-body seat (removed 2026-08-27); its offsets are in mount-body space, so
+        # such a row must never be baked in as a bone-anchor default.  Anything above 3
+        # is likewise not a mode this DLL knows how to draw.
+        if mode < 0 or mode > 3:
+            sys.exit('%r has seat mode %d - only 0-3 (exact/midpoint/neck/rear) can be '
+                     'baked as bone-anchor defaults' % (name, mode))
         rows.append((name, mode, up, forward, lateral, posture, sit, ax, ay, az, base))
 
 rows.sort(key=lambda r: r[0])          # byte order = stable across regenerations
