@@ -299,3 +299,38 @@ KenshiLib 标 0x5CF810 严重错误（0x5CF810 在另一函数[0x5CF78E..]（身
 - 喙嘴猩猩翻转（已修复）/ 所有物种多物种共存待进一步验证
 
 
+
+---
+
+## 12. 关键 RVA / 偏移（反汇编验证；2026-08-27 从 `CLAUDE.md` 迁入）
+
+CLAUDE.md 只留指针，需要 hook 新函数 / 直调新方法时查本节。
+
+- carry：`pickupObject` 0x5CFF90、`getPickedUp` 0x5CED90、**`getDropped(bool ragdollHim, bool hull)` 0x5CC420（被携方放下 handler，下马核心）**、`dropCarriedObject` 0x5CDA60、`_carryMode` 0x5CE1E0、`setCarryMode` 0x51C8D0、`beingCarriedUpdate` 0x5B5980（死副本，勿 hook）；CharMovement `destroy`/`restore` 0x65F6C0/0x661810（pickupObject 对被携方 destroy movement，getDropped 经 restore 复活——rev4/6 根因链）
+- ragdoll：`Character::ragdollMode` 0x5CB5E0（**排队**+恢复回调，骑乘勿用）、`CharacterHuman::postRagdollCallback` 0x5CBAB0、`AnimationClass::ragdollModeUT` 0x5B9290（虚，vtable +0x50）/ **`AnimationClassHuman::_NV_ragdollModeUT` 0x5B98D0（人类 override，骑手用这个）**；`Character::isRagdoll` 0x7D01E0、`Character::isDown` 0x28D910（疑为「只出放倒」菜单的门）；`RagdollPart`(Enums.h:1001) `NONE/WHOLE/RIGHT_ARM/LEFT_ARM=4/HEAD=8/RIGHT_LEG=0x10/LEFT_LEG=0x20/CARRY_MODE=0x800/ARMS=6/LEGS=0x30/ALL=0xFFFF8000`
+- **人类骑手要调 override 版、且走 `_NV_` 导出桩**：`AnimationClassHuman` 覆写了 `ragdollModeUT`（0x5B98D0 ≠ 基类 0x5B9290），虚分派语义正确但依赖 KenshiLib 头**复现 vtable 顺序**——而头里 RVA/offset 注释已知不可靠（人类头把该 override 的 vtable offset 写成 0x0）。故 `static_cast<AnimationClassHuman*>(pAnim)->_NV_ragdollModeUT(...)`：导出桩加载时解析真实地址（= `_NV_update` hook 同一机制），单继承 offset 0x0 指针无需调整。人类判定沿用插件既有的 `!isAnimal()`（`AnimationClass::isHuman()` 是纯虚、无 `_NV_` 桩，不可直调）。
+- Character：`_isBeingCarried` 0x3D4、`isCarryingSomething` 0x348、`carryingObject` 0x380、`animation` 0x448、`ai` 0x650；`getAI` 0x268220、`setDestination(Vec3,bool)` 0x5C8E30、`getPosition`(virt) 0x5CDF00、`getRadius` 0x5C7C30（非虚，导出桩直调）
+- AI：`isTargetInRangeForOrders(RootObject*)` 0x5997B0（⚠️ 语义=「可否对目标下指令」，对玩家恒 true，**非捡起距离，勿用于到达判定**）、`isTargetInRangeForOrders(Vec3)` 0x597010、`isWithinGivenRange(hand,Vec3,float)` 0x5A2900、`addGoal(TaskType,RootObjectBase*)` 0x5C88A0（备选：若 setDestination 驱动不动，改用它的目标机制）
+- CharMovement：`pos` 0xC4、`destination` 0x0DC、`movementMode` 0x378；vtable 槽 `getPosition`=0x40、`isDestinationReached`=0x60、`halt`=0x98（AbstractMovementBase 段）
+- ContextMenuGUI：`contextMenuTarget` 0xA8、`optionsList` 0xF8；`ContextMenu::orders`(lektor<int>) = 与 optionsList 子项平行的 order 数组
+- 输入/设置窗口（未实现的自定义按键用，见 §14）：`InputHandler::addCommand` 0x363130、`InputHandler::loadConfig` 0x361F80、`controlEnabled` 偏移 0xD0、`DataPanelLine_KeyConfig` 0x3E7740、`OptionsWindow::getSingleton` 0x4067B0（`keysDatapanel` 0x100）、`resetAllKeys` 0x3E7030、`saveOptions` 0x3EC570、`DatapanelGUI::createLine` 0x6FC270（protected → 需 shim）
+
+## 13. RE 工具经验（2026-08-27 从 `CLAUDE.md` 迁入）
+
+- **inline hook 崩溃**：hook 引擎只搬 5 字节不校验指令边界。安全目标=纯 push/sub 序言，或补 replay 跳板（KenshiLib::AddHook 无）。纯 push 序列被跳过同样栈崩。
+- **cdb**：`-y C:\symbols_local -s`；`q` 杀进程、`qd` 才安全分离；`~*e ba` 每线程硬件断点；`bp` 高频函数崩。
+- **半套复刻状态下直调游戏 teardown = UB**；用 KenshiLib 直调完整原生函数才安全。
+- 源文件是 **UTF-8**；MSVC v100 无 `/utf-8`，中文字面量能否匹配游戏运行时字符串需按具体 API 编码验证（菜单 caption 与物种名都用显式 `\xNN` UTF-8 转义字节最稳）。
+- **KenshiLib 头文件 RVA 注释不可靠**（carry/骨骼系系统性错误，详见 §0）；但导出桩由 RE_Kenshi 加载时解析成真实地址——直调方法（pickupObject/dropCarriedObject/setCarryMode/ragdollModeUT/clearAllTasks）无需逆向 RVA。GetRealAddress 只用于 hook。
+- **dumpbin 定位无 PDB 崩溃点的手法**：dump 里 RidingPlugin+0x133d3 → 找 DLL 内字节模式 `ff 90 98 00 00 00` → 文件偏移−0x400+0x1000=RVA 对上 → dumpbin /imports 按 IAT 槽位序数（(槽址−IAT基址)/8）对出导入名 → 反汇编上下文与源码逐行吻合锁定函数。
+- **头冲突时的「最小 shim」技术（`AI/AI.h` vs `Character.h`）**：`Character.h` 把 `CharacterMessage` 定义成 `enum`，`AI/AI.h` 又前置声明成 `class` → C2011 硬冲突，两个头不可同时 include。只需 `AI` 的一个**非虚**方法时，别 include AI.h，改在 `Character.h` 已有的 `class AI;` 前置声明上补：`class AI { public: bool isTargetInRangeForOrders(RootObject* who); };`。调用 mangle 成 `AI::isTargetInRangeForOrders`，链接器从 KenshiLib.lib 导出桩解析（= 全插件直调方法同一机制，链接不报未解析符号即证明匹配）。非虚 + 不碰成员 → shim 空布局无所谓：`getAI()` 返回的就是规范 `AI*`，原样当 `this` 传，无 this 调整。**虚函数不能这么做**（要复现 vtable 布局）。⚠️ 该 shim 已从源码撤除（引入它的 `isTargetInRangeForOrders` 到达判定被证明是错信号），技术本身有效，留档备用；`DatapanelGUI::createLine` 是 protected，将来也要靠它直调。
+
+## 14. 自定义按键进原版设置菜单 —— 设计草案（2026-08-27 定，尚未动工）
+
+**优先级已降为「便利功能」**：撞键问题已用换键解决（见 CLAUDE.md「操作与键位」）。真正还没解决的是附带 bug：**在输入框打字时热键照样触发**（寄生原版 `addCommand` 会白送修掉，`controlEnabled` 在 0xD0）。
+
+- **路线＝寄生原版系统**，不自建配置文件：用 `InputHandler::addCommand(name, bool& value, key, alt, masks, GameMode)`（0x363130）注册动作 → 游戏替我们派发按键；UI 用 `DataPanelLine_KeyConfig(cmd, text, cat)`（0x3E7740，`btn0`/`btn1` = 主/副绑定）插进 `OptionsWindow::getSingleton()->keysDatapanel`（单例 0x4067B0，`keysDatapanel` 0x100），复用原版点击改键流程 + `默认` 按钮（`resetAllKeys` 0x3E7030）+ `controls.cfg` 持久化。`DatapanelGUI::createLine` 是 **protected**（0x6FC270）→ 用 §13 的最小 shim 技术直调。构建已链 `MyGUIEngine_x64.lib`，MyGUI API 无需逆向。
+- **截图确认（用户 2026-08-27 采集）**：控制页结构＝上半区鼠标/镜头 checkbox+slider → `addSpace` + 一行文本当 `[按键设置]` 段头 → 两列绑定按钮的 key 行 → 又一次 `addSpace` + `工具` 段头（编辑器绑定）→ `默认` 按钮。所以「加一个 `骑乘` 段」就是原版自己的做法。**"Toggle Free Camera mode" 是唯一没翻译的行** → 未收录字符串原样显示英文，我们的行必须自带 9 语言文案（同 `kMountLabels[]`）。**KEP / MOD 两个 tab 是原版的、灰的**（`data\mods.cfg` 只有 `RidingPlugin.mod`），用户确认 MOD 页只是显示当前启用的 mod 名字、不是可用容器 → 注入点就是控制页。RE_Kenshi **不注入**原版设置窗口（它开自己的独立窗口），没有现成先例可抄。
+- **`controls.cfg` 是全量重写的**（实测：用户一次会话后文件 1400→1442 B，多出 `toggle_devtools=F12` 与 `toggle_fps_camera=;`）→ 注册过的命令改键后会被写盘，不需要我们自己的存档文件；没注册的名字会被静默丢弃。**剩下的唯一持久化风险＝启动时序**：游戏 `loadConfig()`(0x361F80) 在主菜单前跑完，我们在那之后才注册，玩家的绑定可能被读掉却无处安放 → 候选解法＝注册完补调一次 `key->loadConfig()`，必须实测。
+- **待采集（只读诊断 DLL，一次跑完）**：①`OptionsWindow` 结构 dump（`getSingleton()`/`created`/`keysDatapanel` 是否非空、`tabs` 各页名字与 enabled、每个 category 的 `getNumLines`/`getLineByNum` 的 key+type+caption）②`InputHandler::commands` 全表 dump（name + `bound` + `keyString(bound,true)` + masks + gameMode）③活体实验 `addCommand("riding_test", &b, KC_NUMPAD9, …)`：出现在控制页吗／能设我们的 bool 吗／原版改键对它有效吗／`saveOptions()`(0x3EC570) 会写进 controls.cfg 吗 ④`getSingleton()` 何时非空、`created` 何时翻（决定轮询 vs hook）⑤在输入框打字时 `controlEnabled` 是否落 false ⑥**`Masks` 是不是精确匹配**（`toggle_block` 绑裸 `NUM0`，按 `Ctrl+NUM0` 触不触发）。
+- **默认键位怎么换取决于第⑥项**：精确匹配 → 整套骑乘键可以挪到 `Ctrl+数字键区`（一条规则、肌肉记忆全留）；否则只能散到 `G/L/N/O/P/U/V/X/Z/F6/F10/F11/Insert/NUM Enter` 这些空位。
