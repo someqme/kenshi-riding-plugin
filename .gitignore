@@ -12,6 +12,11 @@ RidingPlugin_HISTORY.md
 *.log
 dmp.py
 
+# Superseded seat-table snapshots: kept on disk for provenance, not worth publishing.
+# snapshots/ itself IS tracked - it holds the inputs the shipped kDefaultSeats[] was
+# generated from (see CLAUDE.md, 内置默认座位).
+snapshots/_superseded/
+
 # Build intermediates (should never be inside the tree, but just in case)
 *.obj
 *.pdb
