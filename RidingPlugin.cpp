@@ -2,6 +2,8 @@
 
 #include <kenshi/Character.h>
 #include <kenshi/CharMovement.h>
+#include <kenshi/RaceData.h>
+#include <kenshi/GameData.h>
 #include <kenshi/GameWorld.h>
 #include <kenshi/Globals.h>
 #include <kenshi/PlayerInterface.h>
@@ -134,7 +136,16 @@ enum RiderPosture
 // Per-mount seat setup (computed at mount time).
 struct SeatInfo
 {
-    std::string   species;       // mount->getName() - key for per-species tuning ("" if unknown)
+    std::string   species;       // mount->getName() - the LOCALIZED species name.  Still the
+                                 // primary tuning key and the key for every name-scoped
+                                 // behaviour below (neckFollow, the dog family, the blocklist).
+    std::string   raceKey;       // mount's race stringID ("3998-gamedata.base"), "" if unreadable
+    std::string   tuneKey;       // the speciesTuning key actually serving this mount: `species`
+                                 // when a name row exists, else `raceKey` when a race row does.
+                                 // Everything that WRITES tuning back (anchor/baseline capture,
+                                 // the tuning keys, cfg persistence) must use this, not species -
+                                 // otherwise a race-served mount would silently fork a new
+                                 // name row the moment its anchor was captured.
     std::string   backBone;      // bone used for slave attach (orientation + fallback anchor)
     std::string   frontBone;     // front torso anchor bone (Spine2/Spine1/Spine/Head)
     std::string   rearBone;      // rear torso anchor bone (Pelvis), "" if none
@@ -159,10 +170,17 @@ struct SeatInfo
                                  // clearing to the bare geometric base, so a dialled-in seat
                                  // survives experimenting.  Ctrl+Numpad9 commits the current
                                  // position here.  Seeded from riding.cfg cols 15-17.
-    float         sizeScale;     // always 1.0 - per-individual size scaling was removed
-                                 // (2026-08-23): bone reads at mount/load instants are
-                                 // untrustworthy (can return bind-space coords), so the
-                                 // measured factor poisoned the tuned offsets
+    float         sizeScale;     // k = liveScale / refScale, the per-individual adaptation
+                                 // factor applied to the TUNED offsets (never to the bone
+                                 // anchor, which scales with the mount's node by itself,
+                                 // and never to the columns 11-13 pose constants, which
+                                 // belong to the human rider).  1.0 = no adaptation, which
+                                 // is what an unknown refScale or an unreadable live scale
+                                 // falls back to - see kSeatUpConstB for the law and
+                                 // SeatSizeRatio for the guards.
+    float         refScale;      // the body size these tuned numbers were CONFIRMED at
+                                 // (riding.cfg column 18); 0 = unknown -> no adaptation
+    float         liveScale;     // this individual's size, read at mount time; 0 = unreadable
 };
 
 // mount -> seat setup
@@ -248,6 +266,12 @@ static const float kMaxAnchorLen = 12.0f;
 // drift from this, some engine writer re-positioned the carried rider AFTER us -
 // quantifies the who-writes-last race instead of guessing.
 boost::unordered_map<Character*, Ogre::Vector3> dbgNodeWritten;
+// DBG only: (movement position read straight back) - (seat we just wrote), per rider.
+// _setPositionSimple runs on a movement that pickupObject DESTROYED, so "did the write
+// land at all" and "did somebody move it afterwards" are two different questions and the
+// node-style drift meter above cannot separate them.  This one is sampled in the same
+// breath as the write, so a nonzero value means the call itself did not take.
+boost::unordered_map<Character*, Ogre::Vector3> dbgMoveWritten;
 
 // Pending "approach then mount" requests.  When the player picks "上马" (the repurposed
 // Bodyguard menu order) on an animal, the rider does NOT teleport onto it if it is far
@@ -380,6 +404,14 @@ static const float kMountEnvelopeMax = 120.0f;
 // larger animals can no longer be mounted".  30 units is still unmistakably "standing at
 // the animal" (the bogus cross-map "reached" this bound exists to reject came in at 200+).
 static const float kMountEnvelopeMin = 30.0f;
+// ...and this is the pad on the RADIUS term, which the 2026-08-28 session showed is the
+// term that actually predicts where the rider stops.  rad= (Character::getRadius) against
+// the parked distance, one row per species from that log:
+//   6.6->~10   6.8->10   15.2->18.5   20.7->24   21.7->27   22.0->25   34.9->38
+// plus two older rows (25.5->29, 7.0->10.5).  Nine points spanning a 5x size range, all
+// parking at radius + 3.0..3.5, so 5.0 leaves ~1.5u of margin without loosening the bound
+// enough to matter (the cross-map bogus "reached" this gate rejects came in at 200+).
+static const float kMountRadiusPad = 5.0f;
 // ...and re-measured this often while the rider walks in.  At order time the animal is
 // usually far away and its bones are NOT live: an in-game log had a blood spider that
 // reports torso=18 the instant it is boarded measure ~0 when the order was given, so the
@@ -423,8 +455,14 @@ struct SpeciesTuning
     // the zero automatically.
     Ogre::Vector3 home;          // (x = forward, y = up), same layout as offset
     float         homeLateral;
-    SpeciesTuning() : seatMode(SEAT_MIDPOINT), forceSit(true), posture(POSTURE_SIT), lateral(0.0f), offset(Ogre::Vector3::ZERO), anchor(Ogre::Vector3::ZERO), base(0.0f), home(Ogre::Vector3::ZERO), homeLateral(0.0f) {}
-    SpeciesTuning(int m, const Ogre::Vector3& o) : seatMode(m), forceSit(true), posture(POSTURE_SIT), lateral(0.0f), offset(o), anchor(Ogre::Vector3::ZERO), base(0.0f), home(Ogre::Vector3::ZERO), homeLateral(0.0f) {}
+    // The body size offset/lateral/base were CONFIRMED correct at (riding.cfg column 18,
+    // 2026-08-28).  0 = unknown, which disables adaptation for this species and leaves it
+    // behaving exactly as it did before the feature existed.  A species acquires one
+    // automatically the first time the player tunes it (PersistTuning adopts the live
+    // size), so no hand-editing is needed for anything ridden after an update.
+    float         refScale;
+    SpeciesTuning() : seatMode(SEAT_MIDPOINT), forceSit(true), posture(POSTURE_SIT), lateral(0.0f), offset(Ogre::Vector3::ZERO), anchor(Ogre::Vector3::ZERO), base(0.0f), home(Ogre::Vector3::ZERO), homeLateral(0.0f), refScale(0.0f) {}
+    SpeciesTuning(int m, const Ogre::Vector3& o) : seatMode(m), forceSit(true), posture(POSTURE_SIT), lateral(0.0f), offset(o), anchor(Ogre::Vector3::ZERO), base(0.0f), home(Ogre::Vector3::ZERO), homeLateral(0.0f), refScale(0.0f) {}
 };
 boost::unordered_map<std::string, SpeciesTuning> speciesTuning;
 
@@ -496,6 +534,7 @@ static void WipeAllRideState(const char* why)
     mountAnchor.clear();
     mountCap.clear();
     dbgNodeWritten.clear();
+    dbgMoveWritten.clear();
     mountBaseVOffset.clear();
     mountSmoothOrient.clear();
     mountHeadingPos.clear();
@@ -532,6 +571,53 @@ const float kTuneStep      = 0.1f;
 // animal is, so the ceiling has to be generous rather than exact.  Species inside the
 // default +-15 are unaffected (the headroom only applies once torsoLen exceeds it).
 const float kTuneHeadroom  = 2.0f;
+
+// --- per-individual size adaptation (2026-08-28) ---------------------------
+// A seat is tuned by hand on ONE animal, but a Kenshi character record carries a scale
+// RANGE, not a fixed value ("scale min"/"scale max": crab .10-1.00, leviathan .40-1.50),
+// so two animals with the same name can differ several-fold and one hand-measured offset
+// only fits the individual it was measured on.  Each seat therefore records the size it
+// was CONFIRMED correct at (refScale, cfg column 18) and the live individual's size is
+// read at mount time; the ratio k = live/ref adapts the tuned numbers.
+//
+// ⚠️ The vertical term is NOT a proportional scale.  The height a rider needs above the
+// anchor bone is
+//        up(scale) = A * scale + B
+// with B a UNIVERSAL constant: the rider's OWN sit height, which does not scale because
+// the rider is always the same human (it is the same ~6.36 that lands in cfg column 12).
+// Only "how far above the anchor this animal's back sits" scales.  So there is a constant
+// term in up, and naive proportional scaling (up * k) is wrong in principle.  Rearranged
+// for adaptation from one confirmed sample:
+//        A = (up_ref - B) / ref        ->   up(live) = (up_ref - B) * k + B
+// Regression against the 12 same-race pairs that had ALREADY been hand-tuned separately
+// (predicting each family's other members from its smallest one, sizes from the live nsc=
+// readings): this law lands within 0.07-0.34u, naive proportional scaling misses by up to
+// 7.97u.  The decisive case is 沼泽沼泽速龙 1.482 -> 巨型沼泽速龙 3.350, a 2.26x span
+// where the law predicts 7.61 against the hand-tuned 7.52 while proportional gives -0.45.
+// (Two documented non-refutations: 驮牛->野牛 0.69u on a 0.70->0.96 span where A is
+// ill-conditioned, and the two tiny robot spiders whose hand values differ by 2.6u on an
+// animal 1u long - a pure taste difference, not a size effect.)
+//
+// forward / lateral scale PROPORTIONALLY: horizontally the rider is a point, so there is
+// no rider constant to subtract out.  Same for the bob baseline (cfg column 14), which
+// DampSeatBob measures with the user's height tune already stripped off - it is purely
+// the animal's own geometry above the bob reference.
+const float kSeatUpConstB = -6.4f;     // B: the rider's own sit height, world units
+                                       // (negative - the rider's root bone sits BELOW the
+                                       // seat point, which is why up goes more negative on
+                                       // smaller animals rather than toward zero)
+// k is clamped to the widest range any FCS scale bracket can produce (crab .10-1.00 = 10x
+// against a reference near 1.0), which still separates cleanly from a garbage read.  Bone
+// world reads land in UNSCALED space (~10x) for the first frames after a mount - see
+// HISTORY §C, the failure that killed per-individual scaling the first time round - but
+// this is the scene NODE scale, a different data path: the 2026-08-28 diagnostic found
+// nsc == lsc on every mount, no spike at the mount instant, 570 consecutive stable frames,
+// and readings that reproduce the FCS brackets one for one.  The clamp and the sanity
+// checks in SeatSizeRatio are the guard rails, not the plan.
+const float kSizeRatioMin  = 0.1f;
+const float kSizeRatioMax  = 10.0f;
+// Below this a scale reading is treated as "not available" rather than as a real size.
+const float kSizeReadMin   = 0.02f;
 
 bool IsRiding(Character* c)
 {
@@ -580,6 +666,148 @@ std::string GetSpecies(Character* c)
     try { return c->getName(); } catch (...) { return ""; }
 }
 
+// The race record is the only language-independent species key the engine offers us.
+// getName() returns the LOCALIZED ANIMAL_CHARACTER name, which is why kDefaultSeats[]
+// has to spell Chinese names out in \xNN escapes and why the same tuned seat has to be
+// duplicated for every character that happens to share a skeleton.  Every animal points
+// at a RaceData, and RaceData::data->stringID (e.g. "3998-gamedata.base") is the same
+// byte string in every locale AND is shared by every character built on that
+// skeleton/mesh/collision radius - read straight out of the FCS binaries, race
+// 3998-gamedata.base = Pack Beast / Pack Beast Dead / Garru, 56089-Newwworld.mod = the
+// whole crab family, 3992-gamedata.base = Goat / Cornelius / Beloved Goat.  That is
+// exactly the identity a riding seat wants.
+//
+// Seats are STILL keyed by name; this is logged at mount time so one game session tells
+// us the race key of every species the player rides, and so we can confirm these two
+// raw field reads are safe on live characters before anything depends on them.
+static std::string GetRaceKey(Character* c, std::string* nameOut = 0)
+{
+    if (nameOut) nameOut->clear();
+    if (!c) return "";
+    try
+    {
+        RaceData* rd = c->_NV_getRace();
+        if (!rd) return "";
+        GameData* gd = rd->data;
+        if (!gd) return "";
+        if (nameOut) *nameOut = gd->name;
+        return gd->stringID;
+    }
+    catch (...) { return ""; }
+}
+
+// --- individual body size (LIVE, 2026-08-28) -------------------------------
+// A seat is tuned by hand on ONE individual, but a character record carries a scale
+// RANGE, not a fixed value ("scale min"/"scale max" in the FCS binaries: crab .10-1.00,
+// leviathan .40-1.50), so two animals with the SAME name can differ several-fold in size
+// and a hand-measured offset only fits the one it was measured on.  This is the input to
+// seat.sizeScale - see kSeatUpConstB for the adaptation law and why the vertical term is
+// affine rather than proportional.
+//
+// KenshiLib exports no scale accessor (AnimationClass offers only getSceneNodePosition /
+// getSceneNodeOrientation), but AnimationClass::node is a public Ogre::SceneNode* and
+// Node::getScale() / _getDerivedScale() are right there.  Both are logged: LOCAL tells us
+// whether the per-individual scaling lives on the animal's own node, DERIVED tells us the
+// total including any ancestor.  DERIVED is the one the adaptation uses.
+//
+// This was diagnostic-only for one session first, on purpose, because HISTORY §C is the
+// record of per-individual scaling being removed after mount/load-instant reads came back
+// in UNSCALED space (~10x).  That objection turned out not to reach this data path - it is
+// about BONE world reads, not node scale - and the 34250-line session that watched exactly
+// that window found nsc == lsc on every mount, bsc flat at 1.0 (size is not in bone
+// scale), the human rider's own reading pinned at 1.000 as a control, no 10x spike
+// anywhere including the mount instant, and values that reproduce the FCS brackets one for
+// one.  That is what promoted it from diagnostic to load-bearing.
+static Ogre::Vector3 ReadNodeScale(AnimationClass* a, bool derived)
+{
+    if (!a || !a->node) return Ogre::Vector3::ZERO;
+    try
+    {
+        return derived ? a->node->_getDerivedScale() : a->node->getScale();
+    }
+    catch (...) { return Ogre::Vector3::ZERO; }
+}
+
+// Third data point, static so it is only worth logging once per mount: Kenshi's own
+// per-bone scale.  If the size lives here instead of on the scene node, the node reads
+// will come back 1.0 for every animal and this will not.
+static Ogre::Vector3 ReadBoneScale(AnimationClass* a, const std::string& bone)
+{
+    if (!a) return Ogre::Vector3::ZERO;
+    try
+    {
+        if (!a->getHasBone(bone)) return Ogre::Vector3::ZERO;
+        return a->getBoneScale(bone);
+    }
+    catch (...) { return Ogre::Vector3::ZERO; }
+}
+
+// scale printed as x1000 ints: the values sit near 1.0, so the x100 convention the rest
+// of the logging uses would quantise away exactly the differences we are looking for.
+static std::string ScaleToStr(const Ogre::Vector3& s)
+{
+    return "(" + IntToStr((int)(s.x * 1000.0f)) + ","
+               + IntToStr((int)(s.y * 1000.0f)) + ","
+               + IntToStr((int)(s.z * 1000.0f)) + ")";
+}
+
+// One scalar size for a mount, or 0 for "could not read it".  Kenshi scales animals
+// uniformly (every reading in the diagnostic session had x == y == z), so a reading whose
+// components disagree is not a body size we understand - refuse it rather than guess which
+// axis the seat should follow.
+static float ReadMountSize(Character* mount)
+{
+    if (!mount) return 0.0f;
+    Ogre::Vector3 s = ReadNodeScale(mount->getAnimationClass(), true);
+    if (s.y < kSizeReadMin) return 0.0f;
+    if (fabsf(s.x - s.y) > 0.05f * s.y || fabsf(s.z - s.y) > 0.05f * s.y) return 0.0f;
+    return s.y;
+}
+
+// k for a (reference size, live size) pair.  Returns exactly 1.0 whenever adaptation must
+// not happen - unknown reference, unreadable live size, or a ratio outside anything an FCS
+// scale bracket can produce - so every caller can multiply unconditionally and a species
+// with no reference behaves bit-for-bit as it did before this feature.
+static float SeatSizeRatio(float refScale, float liveScale)
+{
+    if (refScale < kSizeReadMin || liveScale < kSizeReadMin) return 1.0f;
+    float k = liveScale / refScale;
+    if (k < kSizeRatioMin || k > kSizeRatioMax) return 1.0f;
+    return k;
+}
+
+// --- the adapted seat numbers ----------------------------------------------
+// Everything that consumes a tuned value goes through these three, so the stored numbers
+// stay in the REFERENCE frame (that is what riding.cfg holds and what the tuning keys
+// edit) while every consumer sees the value for the individual actually being ridden.
+// ⚠️ ComputeSeatPosition and DampSeatBob must agree to the bit: DampSeatBob strips the
+// height tune off the seat to isolate the animal's own bob and adds it back afterwards, so
+// if the two disagreed about what "the height tune" is the difference would land straight
+// in the rider's altitude.
+static float SeatUp(const SeatInfo& seat)
+{
+    if (seat.sizeScale == 1.0f) return seat.userOffset.y;    // exact, not merely equal
+    return (seat.userOffset.y - kSeatUpConstB) * seat.sizeScale + kSeatUpConstB;
+}
+
+static float SeatForward(const SeatInfo& seat)
+{
+    return seat.userOffset.x * seat.sizeScale;
+}
+
+static float SeatLateral(const SeatInfo& seat)
+{
+    return seat.lateral * seat.sizeScale;
+}
+
+// The bob baseline (cfg column 14) is measured with the height tune already stripped off,
+// so it is pure mount geometry above the bob reference and scales proportionally - no
+// rider constant to carry.
+static float SeatBase(const SeatInfo& seat, float storedBase)
+{
+    return storedBase * seat.sizeScale;
+}
+
 // --- riding.cfg persistence (v100-safe plain text, no JSON) ----------------
 // Format per line: <species>=<mode>,<up>,<forward>
 //   mode    0=exact, 1=midpoint, 2=neck
@@ -615,23 +843,53 @@ static void TrimStr(std::string& s)
     s = s.substr(a, b - a + 1);
 }
 
-// --- built-in default seats (2026-08-26) -----------------------------------
+// --- built-in default seats (2026-08-26, one row per RACE since v9) --------
 // A player who downloads the mod must ride correctly on the very FIRST mount, without
 // tuning anything: these are the seats dialled in in-game by the author, compiled into
 // the DLL.  riding.cfg therefore becomes purely the player's own override file - it does
 // not have to ship with the mod, and deleting it restores exactly this table.
+//   * KEYS ARE RACE stringIDs ("3998-gamedata.base"), not localized animal names.  v8's 42
+//     name rows were 42 hand-tuned seats for these same 21 races: the duplicates existed
+//     only because a seat could not follow body size, so every scaled-up relative needed its
+//     own numbers.  Column 18 (v7) removed that need, so v9 keeps ONE standardized row per
+//     race and lets the size law cover the rest.  Where two relatives' hand-tuned numbers
+//     disagreed the author chose the survivor: bull family -> 野牛 (not 驮牛), robot spiders
+//     -> 铁蜘蛛 and 安全蜘蛛 (one row per race, they are two different races), Crimper family
+//     -> 卷缩者 (not 国王), crab family -> the small-crab mode-2 seat.
+//   * ⚠️ THE CRAB ROW COVERS TWO SCALE BRACKETS TUNED IN DIFFERENT SEAT MODES.  56089's
+//     .10-1.00 members (螃蟹/提多) were tuned on the NECK anchor, its 1.5-2.25 members
+//     (巨型螃蟹/螃蟹终结者/巨蟹先生/巴纳布斯) on the EXACT anchor, and the size law only
+//     converts within one anchor frame - so the four big crabs are misplaced until someone
+//     re-tunes them.  The author picked the small-crab seat knowingly.  The fix is to ride a
+//     big crab and tune it (that writes a NAME row, which wins over this race row), not to
+//     rescale these numbers.
+//   * a name-keyed row still overrides its race row - that is how a player gives one animal
+//     its own seat, and it is what the tuning keys write.  BuildSeatInfo looks up the name
+//     first and the race second; this table simply no longer ships any name rows.
+//   * a race row is the ONLY layer that works on a non-Chinese install, where getName()
+//     returns "Garru" and no name row could ever match.
+//   * every race key here is CONFIRMED, never inferred: from the plugin's own mount-log
+//     race= field, or from an offline scan of data\*.base/.mod that reproduces those same
+//     pairings exactly.  The numeric half of a stringID is unique only WITHIN the file that
+//     created the record and the suffix is that file's name kept forever (hence
+//     small_changes_otto.mod), so a suffix can never be guessed - two such guesses were
+//     already disproved (the raptors are 42071-small_changes_otto.mod, NOT 42068-gamedata.base
+//     which is an animation, and 42068-small_changes_otto.mod is the Cage Beast).
 //   * home == the tuned offset, so Numpad9 always returns to the shipped default seat;
 //     Ctrl+Numpad9 still lets a player declare a zero of their own.
 //   * columns 11-14 (rider anchor + bob baseline) are shipped too, so frame one of the
 //     first ride is already placed instead of drifting in during capture.  A 0 there
 //     just means "was never captured", and the runtime captures it as before.
-//   * species names MUST be explicit \xNN UTF-8 escapes - a Chinese literal in this file
-//     compiles to GBK and never matches getName() (see the encoding note near
-//     kNonRideable).  Regenerate rows by dumping a tuned riding.cfg, never by hand.
-//   * three name pairs are the SAME animal wearing two names (山犬/骨犬, 科尼利厄斯/山羊,
-//     铁蜘蛛/铁之蜘蛛).  Both names need a row so both match getName(), but they carry one
-//     shared set of numbers - the twin that had captured constants.  Retuning one in-game
-//     does NOT move the other; copy the value across by hand when regenerating.
+//   * keys are pure ASCII now, but any Chinese literal added to this file would still have to
+//     be an explicit \xNN UTF-8 escape - a plain one compiles to GBK and never matches
+//     getName() (see the encoding note near kNonRideable).  Regenerate rows by dumping a
+//     tuned riding.cfg through tools\gen_default_seats.py, never by hand.
+//   * column 18 (the last field) is the body size the row was CONFIRMED correct at, which
+//     is what lets one tuned individual cover every size in its race - see kSeatUpConstB.
+//     It is NOT a guess: every non-zero value here is an nsc= reading logged on a mount the
+//     player then reported as correctly seated.  0 means "never measured", and such a row
+//     is used unadapted, exactly as it was before the feature existed - which is harmless
+//     for the one row that has it (42070's scale is fixed 1.0-1.0).
 //   * the frog_gorilla family is deliberately absent: it stays in kNonRideable, so no seat
 //     of ours would ever be used.
 struct DefaultSeat
@@ -642,39 +900,32 @@ struct DefaultSeat
     int   posture;               // POSTURE_SIT / POSTURE_STAND
     int   sit;                   // force-sit
     float ax, ay, az, base;      // captured constants (cfg columns 11-14), 0 = capture live
+    float ref;                   // body size these numbers were confirmed at (column 18),
+                                 // 0 = unknown -> this species is never size-adapted
 };
 
 static const DefaultSeat kDefaultSeats[] = {
-    { "2\xE7\xBA\xA7\xE5\xAE\x89\xE5\x85\xA8\xE8\x9C\x98\xE8\x9B\x9B", 1,   -1.20f,    0.60f,   0.00f, 0, 1,  0.684f,  6.319f, -0.043f,   0.367f },  // 2级安全蜘蛛
-    { "Megaraptor", 1,    0.00f,    0.00f,   0.00f, 0, 1,  0.645f,  6.050f,  0.356f,   8.318f },  // Megaraptor
-    { "Pack Bull", 1,   -3.30f,    2.30f,   0.00f, 0, 1,  0.746f,  5.920f,  0.133f,   1.042f },  // Pack Bull
-    { "\xE4\xBA\xBA\xE7\x9A\xAE\xE8\x9C\x98\xE8\x9B\x9B", 2,   -4.40f,    0.00f,  -0.90f, 0, 1, -0.211f,  6.356f, -0.663f,   2.059f },  // 人皮蜘蛛
-    { "\xE5\x88\xA9\xE7\xBB\xB4\xE5\x9D\xA6", 1,   69.84f,  -16.50f,   0.00f, 0, 1, -0.527f,  6.364f,  0.168f,   0.608f },  // 利维坦
-    { "\xE5\x89\xAA\xE5\x98\xB4\xE9\xB8\xA5", 0,   -0.40f,    2.80f,   0.00f, 0, 1,  0.598f,  6.363f, -0.354f,   0.623f },  // 剪嘴鸥
-    { "\xE5\x8D\xB7\xE7\xBC\xA9\xE8\x80\x85", 2,    0.10f,   -0.50f,   0.00f, 0, 1, -0.688f,  6.362f,  0.102f,   0.000f },  // 卷缩者
-    { "\xE5\x96\x99\xE5\x98\xB4\xE5\x85\xBD", 2,   -1.20f,   -3.50f,   0.00f, 0, 1,  0.414f,  6.363f, -0.561f,   6.039f },  // 喙嘴兽
-    { "\xE5\x9F\x8B\xE9\xAA\xA8\xE5\x9C\xB0\xE7\x8B\xBC", 0,   -2.50f,   -5.10f,   0.00f, 0, 1,  0.398f,  6.354f, -0.570f,  -1.054f },  // 埋骨地狼
-    { "\xE5\xAE\x89\xE5\x85\xA8\xE8\x9C\x98\xE8\x9B\x9B", 1,    1.40f,    2.00f,   0.00f, 0, 1,  0.316f,  6.358f,  0.619f,   0.733f },  // 安全蜘蛛
-    { "\xE5\xAE\xB6\xE7\x89\x9B", 1,   -4.50f,    0.00f,   0.00f, 0, 1,  0.277f,  6.353f, -0.640f,   1.495f },  // 家牛
-    { "\xE5\xB1\xB1\xE7\x8A\xAC", 1,   -5.40f,    0.20f,   0.00f, 0, 1, -0.090f,  6.336f, -0.673f,   1.382f },  // 山犬
-    { "\xE5\xB1\xB1\xE7\xBE\x8A", 1,   -4.20f,    0.00f,   0.00f, 0, 1, -0.008f,  6.362f,  0.607f,   0.397f },  // 山羊
-    { "\xE5\xB7\xA8\xE5\x9E\x8B\xE6\xB2\xBC\xE6\xB3\xBD\xE9\x80\x9F\xE9\xBE\x99", 1,    7.52f,    0.00f,   0.00f, 0, 1, -0.215f,  6.359f, -0.662f,   8.340f },  // 巨型沼泽速龙
-    { "\xE5\xB7\xA8\xE5\x9E\x8B\xE8\x9E\x83\xE8\x9F\xB9", 0,    7.10f,    6.20f,   0.00f, 0, 1, -0.422f,  6.378f,  0.545f,   3.912f },  // 巨型螃蟹
-    { "\xE6\xB2\xB3\xE4\xB9\x8B\xE6\xB2\xBC\xE6\xB3\xBD\xE9\x80\x9F\xE9\xBE\x99", 1,   -1.70f,    0.00f,   0.00f, 0, 1,  0.168f,  6.357f, -0.676f,   2.631f },  // 河之沼泽速龙
-    { "\xE6\xB2\xBC\xE6\xB3\xBD\xE4\xB9\x8C\xE9\xBE\x9F", 2,    2.00f,   11.90f,   0.00f, 0, 1, -0.551f,  6.355f,  0.428f,   4.773f },  // 沼泽乌龟
-    { "\xE6\xB2\xBC\xE6\xB3\xBD\xE6\xB2\xBC\xE6\xB3\xBD\xE9\x80\x9F\xE9\xBE\x99", 1,   -0.20f,    0.00f,   0.00f, 0, 1,  0.656f,  6.355f, -0.229f,   3.553f },  // 沼泽沼泽速龙
-    { "\xE6\xB8\x85\xE6\xB4\x81\xE7\xBB\x84\xE4\xBB\xB6", 1,   -0.71f,    5.70f,   0.00f, 0, 1, -0.230f,  6.103f, -0.695f,   0.503f },  // 清洁组件
-    { "\xE7\xA7\x91\xE5\xB0\xBC\xE5\x88\xA9\xE5\x8E\x84\xE6\x96\xAF", 1,   -4.20f,    0.00f,   0.00f, 0, 1, -0.008f,  6.362f,  0.607f,   0.397f },  // 科尼利厄斯
-    { "\xE7\xAC\xBC\xE4\xB8\xAD\xE9\x87\x8E\xE5\x85\xBD", 2,   -4.02f,   -6.50f,   0.00f, 0, 1, -0.148f,  6.354f, -0.681f,  11.576f },  // 笼中野兽
-    { "\xE8\x9E\x83\xE8\x9F\xB9", 2,    0.00f,   -0.70f,   0.00f, 0, 1, -0.688f,  6.361f,  0.102f,   1.157f },  // 螃蟹
-    { "\xE8\xA1\x80\xE4\xB9\x8B\xE8\x9C\x98\xE8\x9B\x9B", 1,   -5.50f,    0.00f,   0.10f, 0, 1, -0.070f,  6.353f, -0.693f,   0.662f },  // 血之蜘蛛
-    { "\xE9\x87\x8E\xE7\x89\x9B", 1,   -2.70f,    0.20f,   0.00f, 0, 1,  0.520f,  6.508f,  0.429f,  -0.384f },  // 野牛
-    { "\xE9\x93\x81\xE4\xB9\x8B\xE8\x9C\x98\xE8\x9B\x9B", 0,    6.56f,    5.80f,   0.10f, 0, 1,  0.047f,  6.360f,  0.694f,   1.745f },  // 铁之蜘蛛
-    { "\xE9\x93\x81\xE8\x9C\x98\xE8\x9B\x9B", 0,    6.56f,    5.80f,   0.10f, 0, 1,  0.047f,  6.360f,  0.694f,   1.745f },  // 铁蜘蛛
-    { "\xE9\x99\x86\xE5\x9C\xB0\xE8\x9D\x99\xE8\x9D\xA0", 1,   -2.40f,    5.10f,   0.00f, 0, 1, -0.426f,  6.361f,  0.551f,   1.484f },  // 陆地蝙蝠
-    { "\xE9\xA9\xAE\xE5\x85\xBD", 2,    1.10f,   -3.30f,   0.00f, 0, 1, -0.234f,  5.978f, -0.404f,  -6.313f },  // 驮兽
-    { "\xE9\xA9\xAE\xE7\x89\x9B", 1,   -4.20f,    1.60f,   0.30f, 0, 1, -0.602f,  5.951f, -0.448f,   1.889f },  // 驮牛
-    { "\xE9\xAA\xA8\xE7\x8A\xAC", 1,   -5.40f,    0.20f,   0.00f, 0, 1, -0.090f,  6.336f, -0.673f,   1.382f }  // 骨犬
+    { "2860-gamedata.base", 2,   -1.20f,   -3.50f,   0.00f, 0, 1,  0.414f,  6.363f, -0.561f,   6.039f, 0.999f },  // 2860-gamedata.base
+    { "3966-gamedata.base", 1,   69.84f,  -16.50f,   0.00f, 0, 1, -0.527f,  6.364f,  0.168f,   0.608f, 1.394f },  // 3966-gamedata.base
+    { "3976-gamedata.base", 1,   -5.40f,    0.20f,   0.00f, 0, 1, -0.090f,  6.336f, -0.673f,   1.382f, 1.039f },  // 3976-gamedata.base
+    { "3985-gamedata.base", 1,   -2.70f,    0.20f,   0.00f, 0, 1,  0.520f,  6.508f,  0.429f,  -0.384f, 0.956f },  // 3985-gamedata.base
+    { "3987-gamedata.base", 2,    2.00f,   11.90f,   0.00f, 0, 1, -0.551f,  6.355f,  0.428f,   4.773f, 1.441f },  // 3987-gamedata.base
+    { "3992-gamedata.base", 1,   -4.20f,    0.00f,   0.00f, 0, 1, -0.008f,  6.362f,  0.607f,   0.397f, 0.938f },  // 3992-gamedata.base
+    { "3998-gamedata.base", 2,    1.10f,   -3.30f,   0.00f, 0, 1, -0.234f,  5.978f, -0.404f,  -6.313f, 0.959f },  // 3998-gamedata.base
+    { "42068-small_changes_otto.mod", 2,   -4.02f,   -6.50f,   0.00f, 0, 1, -0.148f,  6.354f, -0.681f,  11.576f, 1.088f },  // 42068-small_changes_otto.mod
+    { "42070-small_changes_otto.mod", 0,    6.56f,    5.80f,   0.10f, 0, 1,  0.047f,  6.360f,  0.694f,   1.745f, 0.000f },  // 42070-small_changes_otto.mod
+    { "42071-small_changes_otto.mod", 1,   -0.20f,    0.00f,   0.00f, 0, 1,  0.656f,  6.355f, -0.229f,   3.553f, 1.482f },  // 42071-small_changes_otto.mod
+    { "43870-rebirth.mod", 2,   -4.40f,    0.00f,  -0.90f, 0, 1, -0.211f,  6.356f, -0.663f,   2.059f, 0.987f },  // 43870-rebirth.mod
+    { "43947-rebirth.mod", 1,   -4.50f,    0.00f,   0.00f, 0, 1,  0.277f,  6.353f, -0.640f,   1.495f, 0.957f },  // 43947-rebirth.mod
+    { "44910-rebirth.mod", 1,   -1.70f,    0.00f,   0.00f, 0, 1,  0.168f,  6.357f, -0.676f,   2.631f, 0.985f },  // 44910-rebirth.mod
+    { "48689-rebirth.mod", 1,    1.40f,    2.00f,   0.00f, 0, 1,  0.316f,  6.358f,  0.619f,   0.733f, 0.600f },  // 48689-rebirth.mod
+    { "50641-rebirth.mod", 1,   -5.50f,    0.00f,   0.10f, 0, 1, -0.070f,  6.353f, -0.693f,   0.662f, 0.295f },  // 50641-rebirth.mod
+    { "56088-rebirth.mod", 0,   -0.40f,    2.80f,   0.00f, 0, 1,  0.598f,  6.363f, -0.354f,   0.623f, 0.790f },  // 56088-rebirth.mod
+    { "56089-Newwworld.mod", 2,    0.00f,   -0.70f,   0.00f, 0, 1, -0.688f,  6.361f,  0.102f,   1.157f, 0.988f },  // 56089-Newwworld.mod
+    { "56112-Newwworld.mod", 1,   -0.71f,    5.70f,   0.00f, 0, 1, -0.230f,  6.103f, -0.695f,   0.503f, 1.000f },  // 56112-Newwworld.mod
+    { "65260-Newwworld.mod", 2,    0.10f,   -0.50f,   0.00f, 0, 1, -0.688f,  6.362f,  0.102f,   0.000f, 1.500f },  // 65260-Newwworld.mod
+    { "66294-Newwworld.mod", 0,   -2.50f,   -5.10f,   0.00f, 0, 1,  0.398f,  6.354f, -0.570f,  -1.054f, 1.441f },  // 66294-Newwworld.mod
+    { "97570-Newwworld.mod", 1,   -2.40f,    5.10f,   0.00f, 0, 1, -0.426f,  6.361f,  0.551f,   1.484f, 1.196f }  // 97570-Newwworld.mod
 };
 static const int kDefaultSeatCount = (int)(sizeof(kDefaultSeats) / sizeof(kDefaultSeats[0]));
 
@@ -685,7 +936,36 @@ static const int kDefaultSeatCount = (int)(sizeof(kDefaultSeats) / sizeof(kDefau
 // mean an updated mod still rides badly for them, so while the file is older than the
 // table an all-zero line yields to the built-in default.  Once the file has been rewritten
 // with the current version it is authoritative for everything, zeros included.
-static const int kDefaultsVersion = 3;
+// v7 (2026-08-28): every row gained column 18, the body size its numbers were confirmed at.
+// v8 (2026-08-28): 12 race-keyed fallback rows appended (keys are race stringIDs, not
+// species names).  They are byte copies of a confirmed name row and are only consulted
+// when the mount's own localized name has no row - see BuildSeatInfo's two-layer lookup.
+// v9 (2026-08-28): the 42 name rows are GONE - the table is now one standardized race row
+// per race (21 of them).  This version number does a second job here: a cfg written by v8 or
+// earlier lists up to 42 name-keyed rows, and a name row WINS over a race row, so those rows
+// would mask the entire new table and nothing shipped here would ever be used.  While the
+// file is older than v9, LoadConfig therefore drops its name-keyed rows and keeps only the
+// race-keyed ones (which are byte-identical to the rows here anyway).  Once the file has been
+// rewritten it is authoritative again, name rows included - a player's own tuning survives
+// because tuning rewrites its row (a RACE row, see BuildSeatInfo) under the current version.
+// v10 (2026-08-28): exactly one number moved - the crab race (56089-Newwworld.mod) up
+// 0.00 -> 0.27, tuned in game on 巨型螃蟹 (k=1.846) and then confirmed by the player on BOTH
+// crab scale brackets at once, which is what falsified v9's prediction that the four big crabs
+// would need name rows of their own.  Everything else is byte-identical to v9.
+// v11 (2026-08-28): that same number moved back - crab up 0.27 -> 0.00, so the row is once more
+// byte-identical to v9.  Not a retraction of the size law: the player rode the 0.27 default on
+// six freshly randomized crabs (k=0.93..2.28) and reported it fine, then Numpad9 reset one of
+// them to the 0.00 home, compared the two seats and picked 0.00.  Pure taste, 0.27u apart in
+// the reference frame.
+static const int kDefaultsVersion = 11;
+
+// The version at which name rows were merged away.  ⚠️ Keep this FIXED at 9 and do NOT write
+// kDefaultsVersion in the drop test: the drop is a one-time v8->v9 migration, not "always
+// discard name rows from an older file".  Since v9 nothing in the plugin creates a name row
+// (tuning writes back through tuneKey, which is the race key whenever the race layer served
+// the mount), so any name row in a cfg written at v9 or later was typed there by hand as a
+// deliberate per-animal override - and a later kDefaultsVersion bump must not silently eat it.
+static const int kNameRowMergeVersion = 9;
 
 static const DefaultSeat* FindDefaultSeat(const std::string& species)
 {
@@ -693,6 +973,22 @@ static const DefaultSeat* FindDefaultSeat(const std::string& species)
         if (species == kDefaultSeats[i].species)
             return &kDefaultSeats[i];
     return NULL;
+}
+
+// Is this cfg key a race stringID rather than a localized animal name?  Kenshi's IDs look
+// like "3998-gamedata.base" / "42070-small_changes_otto.mod": a decimal number, a dash, the
+// name of the file that created the record, and that file's extension.  getName() can never
+// produce such a string, which is why both kinds of key share one map with no collision risk.
+static bool IsRaceKey(const std::string& key)
+{
+    size_t dash = key.find('-');
+    if (dash == std::string::npos || dash == 0) return false;
+    for (size_t i = 0; i < dash; ++i)
+        if (key[i] < '0' || key[i] > '9') return false;
+    size_t n = key.size();
+    if (n > 5 && key.compare(n - 5, 5, ".base") == 0) return true;
+    if (n > 4 && key.compare(n - 4, 4, ".mod")  == 0) return true;
+    return false;
 }
 
 // Populate speciesTuning from the built-in table.  Always runs before riding.cfg is read,
@@ -708,6 +1004,7 @@ static void SeedDefaultSeats()
         st.lateral     = d.lateral;
         st.anchor      = Ogre::Vector3(d.ax, d.ay, d.az);
         st.base        = d.base;
+        st.refScale    = d.ref;
         st.home        = st.offset;    // the shipped seat IS the zero Numpad9 returns to
         st.homeLateral = st.lateral;
         speciesTuning[d.species] = st;
@@ -745,6 +1042,7 @@ static void LoadConfig()
             break;
         }
     }
+    int droppedNameRows = 0;
     for (li = 0; li < lines.size(); ++li)
     {
         std::string s = lines[li];
@@ -755,6 +1053,20 @@ static void LoadConfig()
         TrimStr(name);
         TrimStr(val);
         if (name.empty() || name == "defaults") continue;
+        // v9 MIGRATION: the built-in table stopped shipping name-keyed rows and now carries
+        // one standardized row per race.  A name row still WINS over a race row (that is how
+        // a player overrides one animal), so a cfg written by v8 or earlier - which lists a
+        // name row for every species its author ever rode - would mask the entire new table
+        // and the merge would have no effect at all.  While the file is older, keep only its
+        // race-keyed rows; those are byte copies of the same seats, and anything the player
+        // retunes from here on is written back under the current version and then persists.
+        // ⚠️ The test is against kNameRowMergeVersion (fixed at 9), NOT kDefaultsVersion - see
+        // that constant: a name row in a v9+ file is a hand-typed override and must survive.
+        if (cfgVersion < kNameRowMergeVersion && !IsRaceKey(name))
+        {
+            ++droppedNameRows;
+            continue;
+        }
         float up = 0.0f, fwd = 0.0f;
         int mode = SEAT_MIDPOINT;
         int sit = 1;
@@ -806,6 +1118,27 @@ static void LoadConfig()
                 st.home        = st.offset;
                 st.homeLateral = st.lateral;
             }
+            // column 18: the body size this row's numbers were confirmed at.
+            //
+            // MIGRATION.  A cfg written before this column existed cannot say what size its
+            // numbers belong to, and guessing would silently MOVE a seat the player already
+            // dialled in - so the default is 0 = "unknown" = no adaptation, i.e. exactly
+            // the old behaviour.  The one case where the answer is actually known is a row
+            // the player never retuned: if its offsets still match the built-in seat byte
+            // for byte, it IS the built-in seat and shares its reference size.  That covers
+            // most of an upgrading player's file (riding.cfg records every species they ever
+            // rode, tuned or not), and everything else self-heals on the next tune, which
+            // adopts the live size.
+            float rsc = 0.0f;
+            if (sscanf(val.c_str(), "%*d,%*f,%*f,%*d,%*d,%*f,%*f,%*f,%*d,%*f,%*f,%*f,%*f,%*f,%*f,%*f,%*f,%f", &rsc) == 1)
+                st.refScale = rsc;
+            else
+            {
+                const DefaultSeat* rd = FindDefaultSeat(name);
+                if (rd && fabsf(rd->up - up) < 0.005f && fabsf(rd->forward - fwd) < 0.005f
+                       && fabsf(rd->lateral - lateral) < 0.005f)
+                    st.refScale = rd->ref;
+            }
             // A pre-defaults cfg lists every species the player ever rode, tuned or not
             // (the first ride captures the anchor and saves the file).  An untouched line
             // like that must not bury the seat this build ships - see kDefaultsVersion.
@@ -814,8 +1147,21 @@ static void LoadConfig()
                 && up == 0.0f && fwd == 0.0f && lateral == 0.0f)
             {
                 SpeciesTuning& cur = speciesTuning[name];   // the seeded default
-                if (st.anchor.y != 0.0f) cur.anchor = st.anchor;  // keep their captures
-                if (st.base != 0.0f)     cur.base   = st.base;
+                if (st.anchor.y != 0.0f) cur.anchor = st.anchor;  // rider-side, size-invariant
+                // The bob baseline is NOT size-invariant, so it can only be adopted if we
+                // know which individual it was captured on.  With column 18 present that is
+                // answerable - convert it into the built-in row's frame.  Without it, drop it:
+                // the built-in row already ships a baseline in the reference frame, and
+                // letting an unknown-sized animal's reading through is exactly the hybrid-
+                // constant trap the v5/v6 clone rows hit (a never-tuned line donated a
+                // baseline 0.5-0.9u off and quietly undid the clone it was meant to inherit).
+                if (st.base != 0.0f)
+                {
+                    if (st.refScale >= kSizeReadMin && cur.refScale >= kSizeReadMin)
+                        cur.base = st.base * (cur.refScale / st.refScale);
+                    else if (cur.refScale < kSizeReadMin)
+                        cur.base = st.base;      // no reference on either side: as before
+                }
                 continue;
             }
             speciesTuning[name] = st;
@@ -830,6 +1176,10 @@ static void LoadConfig()
             speciesTuning[name] = st;
         }
     }
+    if (droppedNameRows)
+        DebugLog("Riding: cfg v" + IntToStr(cfgVersion) + " < " + IntToStr(kNameRowMergeVersion)
+                 + " - dropped " + IntToStr(droppedNameRows)
+                 + " name-keyed row(s) so the built-in race seats apply");
 }
 
 static void SaveConfig()
@@ -841,15 +1191,18 @@ static void SaveConfig()
     fprintf(f, "# columns 4 and 6-8 are OBSOLETE legacy fields (mount method / roll-pitch-yaw) - parsed-and-ignored, always written as 0\n");
     fprintf(f, "# columns 11-14 = persisted seat constants (anchor x/y/z + bob baseline), auto-captured - do not hand-edit\n");
     fprintf(f, "# columns 15-17 = the declared zero/home (up, forward, lateral): Numpad9 returns here, Ctrl+Numpad9 sets it to the current seat\n");
+    fprintf(f, "# column 18 = the animal size columns 2/3/10/14 were tuned at; the seat is rescaled for bigger/smaller individuals of the same species (0 = unknown, no rescaling)\n");
+    fprintf(f, "# rows whose name has the shape <number>-<datafile>.base/.mod are keyed by RACE, not species: they seat any animal of that race that has no row of its own (and are the only rows that work on a non-Chinese install)\n");
     fprintf(f, "# this file only OVERRIDES the seats built into RidingPlugin.dll - delete it to go back to the shipped defaults\n");
     fprintf(f, "defaults=%d\n", kDefaultsVersion);
     boost::unordered_map<std::string, SpeciesTuning>::iterator it = speciesTuning.begin();
     for (; it != speciesTuning.end(); ++it)
-        fprintf(f, "%s=%d,%.2f,%.2f,%d,%d,0.0,0.0,0.0,%d,%.2f,%.3f,%.3f,%.3f,%.3f,%.2f,%.2f,%.2f\n", it->first.c_str(), it->second.seatMode,
+        fprintf(f, "%s=%d,%.2f,%.2f,%d,%d,0.0,0.0,0.0,%d,%.2f,%.3f,%.3f,%.3f,%.3f,%.2f,%.2f,%.2f,%.3f\n", it->first.c_str(), it->second.seatMode,
                 it->second.offset.y, it->second.offset.x, 0,
                 it->second.forceSit ? 1 : 0, it->second.posture, it->second.lateral,
                 it->second.anchor.x, it->second.anchor.y, it->second.anchor.z, it->second.base,
-                it->second.home.y, it->second.home.x, it->second.homeLateral);
+                it->second.home.y, it->second.home.x, it->second.homeLateral,
+                it->second.refScale);
     fclose(f);
 }
 
@@ -880,6 +1233,8 @@ SeatInfo BuildSeatInfo(Character* mount)
 {
     SeatInfo info;
     info.species = GetSpecies(mount);
+    info.raceKey = GetRaceKey(mount);
+    info.tuneKey = info.species;
     info.backBone = PickBackBone(mount);
     info.frontBone = info.backBone;
     info.lift = Ogre::Vector3::ZERO;
@@ -896,6 +1251,8 @@ SeatInfo BuildSeatInfo(Character* mount)
     info.neckFollow = false;
     info.flexTrack  = false;
     info.sizeScale = 1.0f;
+    info.refScale  = 0.0f;
+    info.liveScale = ReadMountSize(mount);
 
     AnimationClass* mountAnim = mount ? mount->getAnimationClass() : NULL;
     if (mountAnim)
@@ -934,8 +1291,32 @@ SeatInfo BuildSeatInfo(Character* mount)
         }
     }
 
-    // per-species override: mode + tuned delta
+    // Which row serves this mount?  LOCALIZED NAME first, RACE stringID second (v8,
+    // 2026-08-28).  Since v9 the built-in table ships ONLY race rows - one standardized seat
+    // per race - so on a fresh install every mount is served by the second layer:
+    //   * a race row covers every member we have never seen (宠物犬 needed a hand-added clone
+    //     row in v6 for exactly this reason) and it is the ONLY layer that works on a
+    //     non-Chinese install, where getName() returns "Garru" and no name row can match.
+    //   * a name row is a hand-written OVERRIDE for one animal.  ⚠️ Nothing in the plugin ever
+    //     CREATES one: the tuning keys write back through info.tuneKey, which IS the race key
+    //     whenever the race layer won, so tuning any member re-tunes its whole race.  The only
+    //     way to get a name row is to type it into riding.cfg.  That turned out to be enough -
+    //     the four big crabs (56089's 1.5-2.25 bracket) were supposed to be the case that
+    //     needed one, since their old hand tune was on the EXACT anchor while the shipped race
+    //     row is the small crabs' NECK anchor and the size law only converts within one anchor
+    //     frame; in game (2026-08-28) a single +0.27 nudge on the shared row seated the whole
+    //     0.94-2.24 span correctly, big crabs and small ones alike.
+    // Whichever layer wins is recorded in info.tuneKey, and ⚠️ every write-back path must use
+    // tuneKey rather than species - otherwise the first anchor capture on a race-served mount
+    // silently forks a name row for it and the race layer stops covering it.
+    info.tuneKey = info.species;
     boost::unordered_map<std::string, SpeciesTuning>::iterator tit = speciesTuning.find(info.species);
+    if (tit == speciesTuning.end() && !info.raceKey.empty())
+    {
+        tit = speciesTuning.find(info.raceKey);
+        if (tit != speciesTuning.end())
+            info.tuneKey = info.raceKey;
+    }
     if (tit != speciesTuning.end())
     {
         info.seatMode = tit->second.seatMode;
@@ -945,6 +1326,8 @@ SeatInfo BuildSeatInfo(Character* mount)
         info.lateral = tit->second.lateral;
         info.homeOffset = tit->second.home;
         info.homeLateral = tit->second.homeLateral;
+        info.refScale = tit->second.refScale;
+        info.sizeScale = SeatSizeRatio(info.refScale, info.liveScale);
     }
 
     // pack_beast family (Garru / Pack Beast / Dead Pack Beast) share the "beast walk"
@@ -962,11 +1345,16 @@ SeatInfo BuildSeatInfo(Character* mount)
     // decodes them and RE-ENCODES the narrow literals into the system ANSI codepage
     // (936/GBK) - confirmed in the built DLL: "骨犬" is present only as GBK B9 C7 C8 AE,
     // while the \x-escaped 卷缩者 below is present as UTF-8.  GetSpecies() returns the
-    // game's UTF-8 name, so NONE of these 19 names ever compares equal: rootAnchor (and
-    // therefore flexTrack and neckFollow, which are only READ inside the rootAnchor
-    // branch of ComputeSeatPosition) has never once been enabled in game.  Every seat in
-    // riding.cfg was tuned against the neck/midpoint anchor that these species silently
-    // fall through to.  Escaping the names would move all of those seats at once
+    // game's UTF-8 name, so NONE of these 19 names ever compares equal: rootAnchor has
+    // never once been enabled in game, and flexTrack (gated on rootAnchor AND on its own
+    // GBK names below) is dead twice over.  Every seat in riding.cfg was tuned against the
+    // neck/midpoint anchor that these species silently fall through to.
+    // neckFollow is NOT part of the dead set (2026-08-28): its comparison below IS
+    // \x-escaped, so it fires for 卷缩者 - and although ComputeSeatPosition only reads it
+    // inside the (unreachable) rootAnchor branch, DampSeatBob reads it too, outside that
+    // branch, where it skips the 15% bob damping outright.  That is live behaviour: the
+    // Crimper's mode-2 neck seat follows the neck bone's Y at full strength, which is what
+    // the player asked for.  Escaping the fling names would move all of those seats at once
     // (the crab's neck anchor is ~7.85 units from its root), so it is left switched off
     // deliberately - and measurement says root-anchoring is not even the fix for the
     // reported sway: over a 4708-frame crab ride the ROOT bone's sideways swing (3.45
@@ -1001,12 +1389,17 @@ SeatInfo BuildSeatInfo(Character* mount)
     // measurements.  The standing-still sway is a DIFFERENT bug with its own fix that stays:
     // GetMountForward's degenerate-baseline guard.
 
-    // 卷缩者 (Crimper) ONLY: the player wants the rider's butt glued to the NECK bone so
+    // Crimper race ONLY: the player wants the rider's butt glued to the NECK bone so
     // it rides up and down together with the neck - the flattened root-anchored height
     // looks right while running but floats when the mount stands still.  Keep the stable
     // root horizontal (rootAnchor stays on), but follow the neck bone's Y with no bob
-    // damping.  Deliberately scoped to this one species.
-    if (info.species == "\xE5\x8D\xB7\xE7\xBC\xA9\xE8\x80\x85"    // 卷缩者 (UTF-8)
+    // damping.  Deliberately scoped to this one race.
+    // Matched on the RACE as well as the name since v9: 卷缩者 and 国王 are the same race at
+    // the same fixed scale and now share one seat row, so leaving this name-only would make
+    // the merged row behave two different ways depending on which name the animal wears
+    // (国王 would keep the 15% bob damping the row's baseline of 0.000 does not belong to).
+    if ((info.species == "\xE5\x8D\xB7\xE7\xBC\xA9\xE8\x80\x85"    // 卷缩者 (UTF-8)
+         || info.raceKey == "65260-Newwworld.mod")
         && mountAnim && mountAnim->getHasBone("Bip01 Neck"))
         info.neckFollow = true;
 
@@ -1037,11 +1430,13 @@ SeatInfo BuildSeatInfo(Character* mount)
     }
     // SEAT_EXACT keeps the per-bone lift set above
 
-    // Per-individual size scaling is gone (2026-08-23): bone world reads are
-    // untrustworthy exactly when we build a SeatInfo - right after pickup/load they
-    // come back unscaled (~10x node-scale multiple), so no measured factor is reliable.
-    // Tuning is purely per-species via riding.cfg.
-    info.sizeScale = 1.0f;
+    // ⚠️ Do NOT reset info.sizeScale here.  A line doing exactly that survived the
+    // 2026-08-23 removal of the old bone-read-based size scaling and sat at the end of this
+    // function until 2026-08-28, silently wiping the value computed from refScale/liveScale
+    // ~100 lines above - every mount logged k=1000 and the v7 adaptation never ran once
+    // (found by a diagnostic session where 骨犬 printed ref=802 live=350 k=1000).  The only
+    // place sizeScale is decided is the speciesTuning branch above; anything that wants
+    // "no adaptation" must get it from SeatSizeRatio returning exactly 1.0.
 
     return info;
 }
@@ -1059,11 +1454,25 @@ SeatInfo BuildSeatInfo(Character* mount)
 static float MountBoardEnvelope(Character* mount)
 {
     float len = 0.0f;
+    float rad = 0.0f;
     if (mount)
+    {
         len = BuildSeatInfo(mount).torsoLen;   // pure measurement, no side effects
+        rad = mount->getRadius();              // non-virtual, exported stub
+    }
     // distance is measured centre-to-centre, so a body reaches out roughly half its own
     // length in any direction; add the rider's own standing-next-to-it distance on top.
     float env = len * 0.75f + kMountArriveDist;
+    // 2026-08-28: torsoLen is a PROXY and it is the wrong one - the rad= field logged over
+    // 8 species (radius 6.6 .. 34.9) shows the rider always parks at radius + 3.0..3.5,
+    // with torsoLen uncorrelated and sometimes inverted (a crab measures torsoLen 3.8 but
+    // parks the rider 25u out; a cow measures 10.4 and parks it at 10).  The Swamp Turtle
+    // is the case the torso term cannot reach: radius 34.9, parked at d=38, envelope 30 -
+    // it stood there for 461 frames with both scale-free signals gated off and only
+    // boarded when `pressing` finally opened the stall path.  So take the larger of the
+    // two terms.  kMountRadiusPad is the measured standoff (3.5) plus margin.
+    float radEnv = rad + kMountRadiusPad;
+    if (radEnv > env) env = radEnv;
     if (env < kMountEnvelopeMin)  env = kMountEnvelopeMin;
     if (env > kMountEnvelopeMax)  env = kMountEnvelopeMax;
     return env;
@@ -1086,6 +1495,32 @@ static bool GetMountTravelHeading(Character* mount, Ogre::Vector3& out)
     return true;
 }
 
+// The mount's own facing vector, straight out of its movement component
+// (AbstractMovementBase::getFacingDirection, non-virtual, CharMovement.h:122).  This is what
+// the ENGINE thinks the animal is pointing at, so unlike the bone axis it cannot degenerate,
+// and unlike the travel heading it exists before the animal has ever taken a step.  Used as
+// the facing source when the bone baseline is unusable AND no heading has been recorded -
+// i.e. exactly the "mounted a crab that is standing still" case, which was rotating the tuned
+// forward/lateral offsets around a circle every frame (2026-08-28 log: 167 frames of
+// mv=0 hdSrc=0 fwSrc=3 on the Barnabus ride, shaking, then rock solid from the first step).
+// It is a real world-space direction, so no axis convention has to be guessed.
+static bool GetMountFacingDirection(Character* mount, Ogre::Vector3& out)
+{
+    CharMovement* mv = mount ? mount->getMovement() : 0;
+    if (!mv) return false;
+    Ogre::Vector3 d;
+    try
+    {
+        d = mv->getFacingDirection();
+    }
+    catch (...) { return false; }
+    d.y = 0.0f;
+    if (d.length() < 0.001f) return false;
+    d.normalise();
+    out = d;
+    return true;
+}
+
 // Smallest front<->rear HORIZONTAL separation that can be trusted as a forward axis.
 // Measured on the crab 2026-08-26: "Bip01 Spine" sits almost straight above
 // "Bip01 Pelvis" (horizontal 0.02..0.16, vertical 1.83, torsoLen 1.7), so normalising
@@ -1097,7 +1532,10 @@ static const float kMinForwardBaseline = 0.5f;
 
 // Facing direction of the mount (headward), projected on the ground plane.
 // srcOut (optional, for the DBG line): 0 = default axis, 1 = bones, 2 = travel heading
-// after rejecting a degenerate bone baseline, 3 = degenerate bones and no heading yet.
+// after rejecting a degenerate bone baseline, 4 = the mount's own facing vector (bones
+// degenerate and never travelled), 3 = nothing left but the noisy bone residue.
+// The codes are NOT in ladder order on purpose: 3 kept its number so the field stays
+// comparable with the logs the crab shake was diagnosed from.
 Ogre::Vector3 GetMountForward(const SeatInfo& seat, Character* mount, int* srcOut = 0)
 {
     Ogre::Vector3 fwd(0.0f, 0.0f, 1.0f);
@@ -1140,9 +1578,13 @@ Ogre::Vector3 GetMountForward(const SeatInfo& seat, Character* mount, int* srcOu
         {
             if (srcOut) *srcOut = 2;   // gait-free substitute for the unusable bone axis
         }
+        else if (GetMountFacingDirection(mount, fwd))
+        {
+            if (srcOut) *srcOut = 4;   // standing still and never walked: ask the engine
+        }
         else if (len > 0.001f)
         {
-            fwd = d / len;             // never travelled yet: noisy, but still on-model
+            fwd = d / len;             // nothing left: noisy, but still on-model
             if (srcOut) *srcOut = 3;
         }
     }
@@ -1277,13 +1719,14 @@ Ogre::Vector3 ComputeSeatPosition(const SeatInfo& seat, Character* mount)
     // SEAT_EXACT keeps the back-bone anchor
 
     Ogre::Vector3 pos = anchor + seat.lift;
-    // user-tuned offsets (seat.sizeScale is fixed 1.0 since the per-individual size
-    // scaling was removed - kept as a multiplier so the plumbing stays)
+    // user-tuned offsets, adapted to this individual's body size (SeatUp is affine, not a
+    // plain multiply - see kSeatUpConstB).  The bone anchor and seat.lift above already
+    // scale with the mount's own scene node, so only the hand-tuned deltas need this.
     if (seat.userOffset != Ogre::Vector3::ZERO)
     {
         Ogre::Vector3 fwd = GetMountForward(seat, mount);
-        pos += fwd * (seat.userOffset.x * seat.sizeScale)
-             + Ogre::Vector3(0.0f, seat.userOffset.y * seat.sizeScale, 0.0f);
+        pos += fwd * SeatForward(seat)
+             + Ogre::Vector3(0.0f, SeatUp(seat), 0.0f);
     }
     if (seat.lateral != 0.0f)
     {
@@ -1294,7 +1737,7 @@ Ogre::Vector3 ComputeSeatPosition(const SeatInfo& seat, Character* mount)
             side = Ogre::Vector3(1.0f, 0.0f, 0.0f);
         else
             side.normalise();
-        pos += side * (seat.lateral * seat.sizeScale);
+        pos += side * SeatLateral(seat);
     }
     return pos;
 }
@@ -1328,6 +1771,27 @@ static float SeatTuneLimit(const SeatInfo& seat)
 static float SeatTuneStep(const SeatInfo& seat)
 {
     return kTuneStep * SeatTuneScale(seat);
+}
+
+// The same limit and step expressed in the REFERENCE frame that the stored numbers live in.
+// Both are derived from the LIVE torsoLen, and torsoLen is itself already a scaled quantity
+// (torsoLen / nsc is constant inside a race), so on a half-size individual they come back
+// half-size as well.  Applying them straight to a stored reference-frame value would clamp
+// a perfectly good tune down to the small individual's ceiling - the same silent
+// destruction HISTORY §F records for the Leviathan, one size bracket away from happening
+// again.  Dividing by k converts both into the stored frame, which also makes a keypress
+// move the rider by the on-screen step no matter which individual is being ridden (the
+// on-screen response to a stored delta is exactly k, for up as well as for forward and
+// lateral).  sizeScale is either exactly 1.0 or inside [kSizeRatioMin, kSizeRatioMax], so
+// there is nothing to guard against here.
+static float SeatTuneLimitRef(const SeatInfo& seat)
+{
+    return SeatTuneLimit(seat) / seat.sizeScale;
+}
+
+static float SeatTuneStepRef(const SeatInfo& seat)
+{
+    return SeatTuneStep(seat) / seat.sizeScale;
 }
 
 static void ClampTuning(Ogre::Vector3& v, float limit)
@@ -1520,11 +1984,11 @@ static void SyncRiderNode(Character* rider, Character* mount, AnimationClass* rA
             // Persist so every future mount/load SEEDS this value instead of re-capturing
             // through the pose storm ("remember, don't re-derive").
             boost::unordered_map<Character*, SeatInfo>::iterator ssi = mountSeat.find(mount);
-            if (ssi != mountSeat.end() && !ssi->second.species.empty())
+            if (ssi != mountSeat.end() && !ssi->second.tuneKey.empty())
             {
-                speciesTuning[ssi->second.species].anchor = rel;
+                speciesTuning[ssi->second.tuneKey].anchor = rel;
                 SaveConfig();
-                try { DebugLog("Riding: anchor captured+saved [" + ssi->second.species + "]"); } catch(...) {}
+                try { DebugLog("Riding: anchor captured+saved [" + ssi->second.tuneKey + "]"); } catch(...) {}
             }
         }
     }
@@ -1608,8 +2072,11 @@ static void DampSeatBob(Character* mount, const SeatInfo& seat, Ogre::Vector3& s
     else
         refY = mount->getBoneWorldPosition("Bip01").y;
 
-    // strip the user's height tune so only the bone-anchor bob gets damped
-    float uy      = seat.userOffset.y;
+    // strip the user's height tune so only the bone-anchor bob gets damped.
+    // ⚠️ This must be the SAME number ComputeSeatPosition added, i.e. the ADAPTED one -
+    // if the two disagreed about what "the height tune" is, the difference would land
+    // straight in the rider's altitude.  Hence SeatUp on both sides, never userOffset.y.
+    float uy      = SeatUp(seat);
     float baseY   = seatPos.y - uy;
     float rawBase = baseY - refY;   // seat height above the reference (bob-free mean, no user tune)
 
@@ -1740,11 +2207,16 @@ static void DampSeatBob(Character* mount, const SeatInfo& seat, Ogre::Vector3& s
             // Persist once per ride so future mounts/loads seed it directly instead of
             // live-capturing through the post-mount/post-load pose storm.
             boost::unordered_map<Character*, SeatInfo>::iterator ssi = mountSeat.find(mount);
-            if (ssi != mountSeat.end() && !ssi->second.species.empty())
+            if (ssi != mountSeat.end() && !ssi->second.tuneKey.empty())
             {
-                speciesTuning[ssi->second.species].base = rawBase;
+                // rawBase was measured on THIS individual; the species row is in the
+                // reference frame, so undo the size adaptation before storing it.  Without
+                // this divide, riding one oversized crab would overwrite the family's
+                // baseline with a number ~2.2x too large and every normal-sized member
+                // would then be damped toward a seat well above its back.
+                speciesTuning[ssi->second.tuneKey].base = rawBase / ssi->second.sizeScale;
                 SaveConfig();
-                try { DebugLog("Riding: baseline captured+saved [" + ssi->second.species + "]"); } catch(...) {}
+                try { DebugLog("Riding: baseline captured+saved [" + ssi->second.tuneKey + "]"); } catch(...) {}
             }
         }
         return;                                  // nothing to damp yet (or still settling)
@@ -1854,6 +2326,11 @@ static void DebugLogRideFrame(Character* rider, Character* mount, const SeatInfo
         Ogre::Vector3 wnDbg(0.0f, 0.0f, 0.0f);
         boost::unordered_map<Character*, Ogre::Vector3>::iterator wi = dbgNodeWritten.find(rider);
         if (wi != dbgNodeWritten.end()) wnDbg = nodeP - wi->second;
+        // read-back of OUR movement write from last frame (see dbgMoveWritten): nonzero =
+        // _setPositionSimple did not land, which is the click-hull question, not a race
+        Ogre::Vector3 mvwDbg(0.0f, 0.0f, 0.0f);
+        boost::unordered_map<Character*, Ogre::Vector3>::iterator mwi = dbgMoveWritten.find(rider);
+        if (mwi != dbgMoveWritten.end()) mvwDbg = mwi->second;
         // ragdoll/carry state of the RIDER, per frame.  Needed because the Numpad8 probe
         // can only read the flags in the same frame it calls ragdollModeUT, and a same-
         // frame read is inconclusive when a call lands deferred (exactly how carryModeT
@@ -1939,9 +2416,27 @@ static void DebugLogRideFrame(Character* rider, Character* mount, const SeatInfo
         if (otherDataDbg)
             otherWDbg = rAnim->getAnimationCurrentWeight(otherDataDbg);
         actWDbg = rAnim->getTotalActionAnimationWeight();
-        char dbg[2048];
-        _snprintf_s(dbg, 2048, _TRUNCATE,
-            "Riding: DBG root=(%.2f,%.2f,%.2f) back=(%.2f,%.2f,%.2f) fwd=(%.2f,%.2f,%.2f) rawT=(%.2f,%.2f,%.2f) tgt=(%.2f,%.2f,%.2f) node=(%.2f,%.2f,%.2f) rMove=(%.2f,%.2f,%.2f) rRoot=(%.2f,%.2f,%.2f) rBip=(%.2f,%.2f,%.2f) nodeQ=(%.2f,%.2f,%.2f,%.2f) rBipQ=(%.2f,%.2f,%.2f,%.2f) move=(%.2f,%.2f,%.2f) anch=(%.2f,%.2f,%.2f) st=%d pelv=(%.2f,%.2f,%.2f) rel=(%.2f,%.2f,%.2f) rs=%d bs=%d wn=(%.2f,%.2f,%.2f) rag=%d aRag=%d bc=%d mMode=%d mv=%d hd=(%.2f,%.2f) hdSrc=%d bRel=(f%.2f,s%.2f) rRel=(f%.2f,s%.2f) fwdDev=%.1f fwSrc=%d pose=%d/%.2f/%.2f oth=%.2f act=%.2f",
+        // body-size watch (diagnostic only, see ReadNodeScale): msc = mount node DERIVED
+        // scale, mls = its LOCAL scale, rsc = the RIDER's derived scale for a control
+        // reading (a human should be a flat 1.0 - if rsc moves, the field is not what it
+        // claims to be).  The point of logging these per frame is stability: a value that
+        // is right at mount and drifts, or right and then briefly 10x, is unusable as a
+        // seat multiplier no matter how correct its steady state looks.
+        Ogre::Vector3 mscDbg = ReadNodeScale(mAnim, true);
+        Ogre::Vector3 mlsDbg = ReadNodeScale(mAnim, false);
+        Ogre::Vector3 rscDbg = ReadNodeScale(rAnim, true);
+        // mfd = the mount's own facing vector, the new fwSrc=4 source.  Logged even when it
+        // is NOT the active source so it can be checked against hd= (the proven travel
+        // heading) on animals that do walk: if the two point the same way, fwSrc=4 is
+        // trustworthy for the animals that never walk; if they are consistently opposed the
+        // sign can be flipped without another round trip.  (0,0) = unavailable.
+        Ogre::Vector3 mfdDbg;
+        if (!GetMountFacingDirection(mount, mfdDbg)) mfdDbg = Ogre::Vector3::ZERO;
+        // buffer 3072 (was 2048): the new scale fields sit at the END of the line, so a
+        // truncation would silently eat exactly the data this pass was added to collect.
+        char dbg[3072];
+        _snprintf_s(dbg, 3072, _TRUNCATE,
+            "Riding: DBG root=(%.2f,%.2f,%.2f) back=(%.2f,%.2f,%.2f) fwd=(%.2f,%.2f,%.2f) rawT=(%.2f,%.2f,%.2f) tgt=(%.2f,%.2f,%.2f) node=(%.2f,%.2f,%.2f) rMove=(%.2f,%.2f,%.2f) rRoot=(%.2f,%.2f,%.2f) rBip=(%.2f,%.2f,%.2f) nodeQ=(%.2f,%.2f,%.2f,%.2f) rBipQ=(%.2f,%.2f,%.2f,%.2f) move=(%.2f,%.2f,%.2f) anch=(%.2f,%.2f,%.2f) st=%d pelv=(%.2f,%.2f,%.2f) rel=(%.2f,%.2f,%.2f) rs=%d bs=%d wn=(%.2f,%.2f,%.2f) mvW=(%.2f,%.2f,%.2f) rag=%d aRag=%d bc=%d mMode=%d mv=%d hd=(%.2f,%.2f) hdSrc=%d bRel=(f%.2f,s%.2f) rRel=(f%.2f,s%.2f) fwdDev=%.1f fwSrc=%d pose=%d/%.2f/%.2f oth=%.2f act=%.2f msc=(%.3f,%.3f,%.3f) mls=(%.3f,%.3f,%.3f) rsc=%.3f mfd=(%.2f,%.2f)",
             rootP.x, rootP.y, rootP.z,
             backP.x, backP.y, backP.z,
             fwd.x, fwd.y, fwd.z,
@@ -1960,6 +2455,7 @@ static void DebugLogRideFrame(Character* rider, Character* mount, const SeatInfo
             relDbg.x, relDbg.y, relDbg.z,
             rsDbg, bsDbg,
             wnDbg.x, wnDbg.y, wnDbg.z,
+            mvwDbg.x, mvwDbg.y, mvwDbg.z,
             ragDbg, aRagDbg, bcDbg,
             mmDbg,
             moving ? 1 : 0,
@@ -1971,21 +2467,39 @@ static void DebugLogRideFrame(Character* rider, Character* mount, const SeatInfo
             fwSrc,
             posePlayDbg, poseWDbg, posePDbg,
             otherWDbg,
-            actWDbg);
+            actWDbg,
+            mscDbg.x, mscDbg.y, mscDbg.z,
+            mlsDbg.x, mlsDbg.y, mlsDbg.z,
+            rscDbg.y,
+            mfdDbg.x, mfdDbg.z);
         DebugLog(dbg);
     }
 }
 
-// Persist a seat's full tuning state to its species entry + riding.cfg.  Writes ALL
+// Diagnostic tag naming the tuning row that actually served this seat.  Prints nothing in
+// the common case (a per-name row) so existing log lines stay unchanged; prints
+// " key=<raceID>" whenever the race fallback layer is what supplied the numbers.  Reading
+// a log without this you cannot tell "this species is tuned" from "this species inherited
+// its family's row", and those two want opposite follow-up actions.
+static std::string SeatKeyTag(const SeatInfo& seat)
+{
+    if (seat.tuneKey.empty() || seat.tuneKey == seat.species) return std::string();
+    return " key=" + seat.tuneKey;
+}
+
+// Persist a seat's full tuning state to its tuning entry + riding.cfg.  Writes ALL
 // five fields (not just the one a hotkey just changed): the seat IS the live mountSeat
 // entry, so every field is current.  Accepted trade-off (2026-08-23): two mounts of the
 // same species tuned in interleaved steps overwrite each other's cfg copy - identical to
 // what the old full-field writers (up/fwd tune, reset) already did.
+// The key is seat.tuneKey, NOT seat.species: a mount served by a race row must keep
+// writing back to that race row, otherwise the first tuning keypress (or anchor capture)
+// would silently fork a fresh per-name row and the race layer would stop covering it.
 static void PersistTuning(const SeatInfo& seat)
 {
-    if (!seat.species.empty())
+    if (!seat.tuneKey.empty())
     {
-        SpeciesTuning& st = speciesTuning[seat.species];
+        SpeciesTuning& st = speciesTuning[seat.tuneKey];
         st.seatMode = seat.seatMode;
         st.forceSit = seat.forceSit;
         st.posture = seat.posture;
@@ -1993,21 +2507,37 @@ static void PersistTuning(const SeatInfo& seat)
         st.offset = seat.userOffset;
         st.home = seat.homeOffset;
         st.homeLateral = seat.homeLateral;
+        // A species that had no reference size adopts this individual's: the player is
+        // looking at the seat they just dialled in, so the animal in front of them IS the
+        // size these numbers are confirmed at.  That is the same rule the whole feature
+        // rests on, applied to the one moment where it is provably true.  Never overwrite
+        // an existing reference - the stored numbers are expressed in THAT frame, and the
+        // tuning keys hand us deltas already converted into it.
+        if (st.refScale < kSizeReadMin && seat.liveScale >= kSizeReadMin)
+            st.refScale = seat.liveScale;
     }
     SaveConfig();
 }
 
-// Apply a live tuning step to the currently mounted seat and persist it.
+// Apply a live tuning step to the currently mounted seat and persist it.  The deltas come
+// in as ON-SCREEN world units and are converted into the frame the numbers are stored in,
+// so one keypress always moves the rider by the nominal step - see SeatTuneLimitRef.
 static void TuneSeat(SeatInfo& seat, float dUp, float dFwd)
 {
-    seat.userOffset.x += dFwd;
-    seat.userOffset.y += dUp;
-    ClampTuning(seat.userOffset, SeatTuneLimit(seat));
+    seat.userOffset.x += dFwd / seat.sizeScale;
+    seat.userOffset.y += dUp / seat.sizeScale;
+    ClampTuning(seat.userOffset, SeatTuneLimitRef(seat));
 
     PersistTuning(seat);
 
-    DebugLog("Riding: tuned " + seat.species + " up=" + IntToStr((int)(seat.userOffset.y * 100.0f))
-             + " fwd=" + IntToStr((int)(seat.userOffset.x * 100.0f)));
+    // up=/fwd= are the STORED numbers (reference frame, what riding.cfg holds); live= is
+    // what this individual actually gets.  They differ whenever k != 1, and printing only
+    // one of them would make a tuning log unreadable a size bracket later.
+    DebugLog("Riding: tuned " + seat.species + SeatKeyTag(seat) + " up=" + IntToStr((int)(seat.userOffset.y * 100.0f))
+             + " fwd=" + IntToStr((int)(seat.userOffset.x * 100.0f))
+             + " live=" + IntToStr((int)(SeatUp(seat) * 100.0f))
+             + "/" + IntToStr((int)(SeatForward(seat) * 100.0f))
+             + " k=" + IntToStr((int)(seat.sizeScale * 1000.0f)));
 }
 
 // Seed persisted per-species constants into a fresh ride's maps so placement is
@@ -2017,15 +2547,23 @@ static void TuneSeat(SeatInfo& seat, float dUp, float dFwd)
 static void SeedPersistedConstants(Character* mount)
 {
     boost::unordered_map<Character*, SeatInfo>::iterator si = mountSeat.find(mount);
-    if (si == mountSeat.end() || si->second.species.empty()) return;
-    boost::unordered_map<std::string, SpeciesTuning>::iterator ti = speciesTuning.find(si->second.species);
+    if (si == mountSeat.end() || si->second.tuneKey.empty()) return;
+    boost::unordered_map<std::string, SpeciesTuning>::iterator ti = speciesTuning.find(si->second.tuneKey);
     if (ti == speciesTuning.end()) return;
     if (ti->second.anchor.length() > 0.01f && ti->second.anchor.length() <= kMaxAnchorLen)
-        mountAnchor.insert(std::make_pair(mount, ti->second.anchor));
+        mountAnchor.insert(std::make_pair(mount, ti->second.anchor));   // rider-side, size-invariant
     if (fabsf(ti->second.base) > 0.001f)
-        mountBaseVOffset.insert(std::make_pair(mount, ti->second.base));
-    try { DebugLog("Riding: seeded constants [" + si->second.species + "] anchor=" + IntToStr((int)(ti->second.anchor.length() * 100.0f))
-                   + " base=" + IntToStr((int)(ti->second.base * 100.0f))); } catch(...) {}
+    {
+        // The baseline is stored per species in the reference frame but consumed in world
+        // units by DampSeatBob, so it has to be adapted to this individual on the way in -
+        // otherwise a scaled member would be damped toward the reference member's back and
+        // the kBaselineHugeDiff wipe would fire on every big one.
+        float base = SeatBase(si->second, ti->second.base);
+        mountBaseVOffset.insert(std::make_pair(mount, base));
+    }
+    try { DebugLog("Riding: seeded constants [" + si->second.species + "]" + SeatKeyTag(si->second) + " anchor=" + IntToStr((int)(ti->second.anchor.length() * 100.0f))
+                   + " base=" + IntToStr((int)(SeatBase(si->second, ti->second.base) * 100.0f))
+                   + " k=" + IntToStr((int)(si->second.sizeScale * 1000.0f))); } catch(...) {}
 }
 
 void Mount(Character* rider, Character* mount)
@@ -2069,24 +2607,27 @@ void Mount(Character* rider, Character* mount)
     // stuck in a carry pose - so native carry is all-or-nothing.  Dissolve the link
     // cleanly right away (removeOnly = no ragdoll fling) and own placement outright.
     //
-    // CAUTION (2026-08-24, log-proven): dropping the link does NOT end the ragdoll
-    // pickupObject started.  The "carry dissolved:" line below reports rag=1 every
-    // single mount, and from the second mount on the "pre-pickup=" probe above also
-    // reads 1 - the ragdoll survives Dismount and accumulates across rides.  The
-    // sitting pose is only a per-frame cover over it (AnimUpdateImpl's forcedSlaveLoop
-    // plus HaltAndForceSitPass), which is why the ride looks right but Dismount's
-    // endSlaveAnim uncovers a live ragdoll and the rider collapses, and why a mounted
-    // rider's context menu offers nothing but "knock down".  Candidate teardown is
-    // isolated in the Numpad8 probe (see HotkeyPass) until it is validated in-game.
+    // Dropping the link does NOT end the ragdoll pickupObject started: the "carry
+    // dissolved:" line below reports rag=1 on every single mount (the probes read
+    // pre/post-pickup/carried = 0/1/1 every time).
     mount->dropCarriedObject(false, true);
-    // NOTE (2026-08-24): pickupObject ragdolls the rider and it CANNOT be cleared while
-    // mounted - DBG proved rag=1/aRag=1 stays for the whole ride even after an immediate
-    // ragdollModeUT(false) here (Path A, reverted).  The ragdoll is a consequence of the
-    // carry state (_isBeingCarried=1 re-applies it every frame), and _isBeingCarried must
-    // stay 1 during the ride or the mount's collision volume shoves the rider off.  The
-    // sitting-pose cover hides the ragdoll, so the ride looks correct.  Ragdoll teardown
-    // (with the QUEUED recovery so the rider stands up) is done at Dismount instead, where
-    // the rider is leaving the mount anyway - see Dismount().
+    // RESOLVED 2026-08-25.  This used to say the ragdoll CANNOT be cleared mid-ride and
+    // that the sitting pose was only a per-frame cover over a live ragdoll (Path A of
+    // 2026-08-24 cleared it once here, saw rag=1 again, and concluded it was unclearable).
+    // It is clearable - it just has to be re-killed EVERY frame, with the right API:
+    //   - the node writer that dragged the rider ~10u off the seat is the ANIMATION-LAYER
+    //     ragdoll itself, not the carry link and not _isBeingCarried (bc=0 kept dragging;
+    //     zeroing aRag killed the drag outright, wn=(0,0,0) for that frame).
+    //   - an engine restorer re-sets it the very next frame, and the QUEUED
+    //     Character::ragdollMode is never processed while the movement is destroyed and
+    //     the character is carried (probe rev2: three presses, chRag stuck at 1).  So the
+    //     teardown must be the INSTANT animation-layer call, _NV_ragdollModeUT(false,
+    //     ZERO, CARRY_MODE, ...), issued from SyncRiderNode and HaltAndForceSitPass so the
+    //     last writer before render kills it again on every frame of the ride.
+    // The sitting pose is therefore just the pose, not a cover.  Two things did NOT change:
+    // _isBeingCarried must stay 1 for the whole ride (clearing it lets the mount's collision
+    // volume shove the rider off the back), and the carried-side teardown - getDropped,
+    // which restores the movement and stands the rider up - still happens at Dismount().
     try { DebugLog(std::string("Riding: carry dissolved: carrying=")
         + IntToStr(mount->isCarryingSomething ? 1 : 0)
         + " beingCarried=" + IntToStr(rider->_isBeingCarried ? 1 : 0)
@@ -2115,13 +2656,38 @@ void Mount(Character* rider, Character* mount)
     if (rider->getMovement())
         rider->getMovement()->halt();
 
-    DebugLog("Riding: mounted [" + seat.species + "] mode=" + IntToStr(seat.seatMode)
+    std::string raceName;
+    std::string raceKey = GetRaceKey(mount, &raceName);
+
+    // body-size probe.  Logged HERE because the mount instant is the documented worst case:
+    // HISTORY §C has the mount's BONE reads landing in unscaled space for the first frames.
+    // The 2026-08-28 session showed the scene-node reads are clean at this exact moment,
+    // which is what allowed the seat adaptation to key off them - keep logging it so a
+    // future regression shows up as a bad nsc= on the very line the seat was built from.
+    AnimationClass* mAnimDbg = mount->getAnimationClass();
+    Ogre::Vector3 nscDbg = ReadNodeScale(mAnimDbg, true);
+    Ogre::Vector3 lscDbg = ReadNodeScale(mAnimDbg, false);
+    Ogre::Vector3 bscDbg = ReadBoneScale(mAnimDbg, "Bip01");
+
+    DebugLog("Riding: mounted [" + seat.species + "]" + SeatKeyTag(seat) + " mode=" + IntToStr(seat.seatMode)
+             + " race=" + (raceKey.empty() ? std::string("?") : raceKey)
+             + (raceName.empty() ? std::string("") : "(" + raceName + ")")
+             + " nsc=" + ScaleToStr(nscDbg)
+             + " lsc=" + ScaleToStr(lscDbg)
+             + " bsc=" + ScaleToStr(bscDbg)
              + (seat.forceWalk ? " walk=1" : " walk=0")
              + " bone=" + seat.backBone
              + " torso=" + IntToStr((int)(seat.torsoLen * 10.0f))
              + " lift=" + IntToStr((int)(seat.lift.y * 100.0f))
-             + " size=" + IntToStr((int)(seat.sizeScale * 100.0f))
-             + " tune=" + IntToStr((int)(seat.userOffset.y * 100.0f)) + "/" + IntToStr((int)(seat.userOffset.x * 100.0f)));
+             // ref/live/k are the size adaptation: ref= the size the stored numbers were
+             // confirmed at (0 = never measured -> no adaptation), live= this individual,
+             // k= the ratio actually applied.  tune= stays the STORED pair and live= the
+             // adapted one, so a wrong seat can be read off this single line.
+             + " ref=" + IntToStr((int)(seat.refScale * 1000.0f))
+             + " live=" + IntToStr((int)(seat.liveScale * 1000.0f))
+             + " k=" + IntToStr((int)(seat.sizeScale * 1000.0f))
+             + " tune=" + IntToStr((int)(seat.userOffset.y * 100.0f)) + "/" + IntToStr((int)(seat.userOffset.x * 100.0f))
+             + " adapt=" + IntToStr((int)(SeatUp(seat) * 100.0f)) + "/" + IntToStr((int)(SeatForward(seat) * 100.0f)));
 }
 
 void Dismount(Character* rider)
@@ -2208,6 +2774,7 @@ void Dismount(Character* rider)
         mountCap.erase(mount);
         debugLastPos.erase(mount);
         dbgNodeWritten.erase(rider);
+        dbgMoveWritten.erase(rider);
     }
 
     DebugLog("Riding: dismounted");
@@ -2243,9 +2810,10 @@ void RestoreRideAfterLoad(Character* rider, Character* mount)
     mountHeadingDir.erase(mount);
     debugLastPos.erase(mount);
     dbgNodeWritten.erase(rider);
+    dbgMoveWritten.erase(rider);
     SeedPersistedConstants(mount);   // frame-one placement from riding.cfg constants
 
-    DebugLog("Riding: restored ride after load [" + seat.species + "] mode="
+    DebugLog("Riding: restored ride after load [" + seat.species + "]" + SeatKeyTag(seat) + " mode="
              + IntToStr(seat.seatMode));
 }
 
@@ -2981,8 +3549,37 @@ static void SyncMountedRiders()
             // movement position and not rootBonePosition.  _setPositionSimple keeps the
             // movement/collision position on the back; SyncRiderNode solves for the
             // scene node so the RENDERED root bone lands on the seat and stops swinging.
+            //
+            // 2026-08-28: the rider cannot be CLICKED while mounted, and not just on the
+            // Beak Thing - on every species tested.  The DBG rMove field is 10..27u off the
+            // seat and down at ground level, sitting where the carry system parks a carried
+            // body (+23.6 fwd / -4.3 down on a Swamp Turtle; the bison drag slot measured
+            // +17.6 / -6.4), so the logical position never gets to the back at all.  Two
+            // things follow from that: the mouse picks characters through
+            // CharMovement::clickHull - a separate physics object that has to be told where
+            // the body went - and _setPositionSimple is being called on a movement that
+            // pickupObject DESTROYED, so it may not be landing in the first place.  Hence
+            // the read-back into mvW (answers exactly that, in the same breath as the
+            // write) and the click hull refresh.  Read mvW like this: ~0 means the write
+            // DID land and something later in the frame drags it back to the slot (the
+            // engine's own beingCarriedUpdate is the prime suspect, and we are forbidden
+            // from hooking it - see the DISABLED HOOKS block - so the answer there is to
+            // move this write to the last pass of the frame, not to fight it here);
+            // nonzero means the call itself is a no-op on a destroyed movement, and the
+            // next lever is teleportCollisionHull(seatPos).
+            //
+            // There is no setCurrentPosition to write the field behind getPosition():
+            // that name belongs to FlockingTools (get-out-of-the-way state), not to
+            // AbstractMovementBase.  The field itself is AbstractMovementBase::pos
+            // (+0xC4, public) if it ever comes to poking it directly.
             if (rider->getMovement())
-                rider->getMovement()->_setPositionSimple(seatPos);
+            {
+                CharMovement* rMv = rider->getMovement();
+                rMv->_setPositionSimple(seatPos);
+                dbgMoveWritten[rider] = rMv->getPosition() - seatPos;
+                if (rMv->hasClickHull())
+                    rMv->refreshClickHull();
+            }
             AnimationClass* rAnim = rider->getAnimationClass();
             if (rAnim)
                 SyncRiderNode(rider, mount, rAnim, seatPos, true);
@@ -3470,13 +4067,17 @@ static void HotkeyPass()
                         }
                         else if (stepLatR || stepLatL)
                         {
-                            float lim  = SeatTuneLimit(seat);
-                            float dLat = stepLatR ? SeatTuneStep(seat) : -SeatTuneStep(seat);
+                            // reference frame, exactly like TuneSeat: the step the player
+                            // feels is SeatTuneStep, what gets stored is that divided by k.
+                            float lim  = SeatTuneLimitRef(seat);
+                            float step = SeatTuneStepRef(seat);
+                            float dLat = stepLatR ? step : -step;
                             seat.lateral += dLat;
                             if (seat.lateral < -lim) seat.lateral = -lim;
                             if (seat.lateral >  lim) seat.lateral =  lim;
                             PersistTuning(seat);
-                            DebugLog("Riding: lateral " + seat.species + " -> " + IntToStr((int)(seat.lateral * 100.0f)));
+                            DebugLog("Riding: lateral " + seat.species + " -> " + IntToStr((int)(seat.lateral * 100.0f))
+                                     + " live=" + IntToStr((int)(SeatLateral(seat) * 100.0f)));
                         }
                         else if (stepSetHome)
                         {

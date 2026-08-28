@@ -48,6 +48,12 @@ with open(sys.argv[1], 'rb') as f:
         lateral = float(col[9])
         ax, ay, az, base = (float(col[10]), float(col[11]),
                             float(col[12]), float(col[13]))
+        # col[17] = the body size columns 2/3/10/14 were confirmed correct at (added
+        # 2026-08-28).  Optional: a cfg written before it existed says nothing about size,
+        # and 0 means "unknown" = the seat is used unadapted, exactly as it was before the
+        # feature existed.  Never invent a value here - guessing would silently move a seat
+        # the author had already dialled in.
+        ref = float(col[17]) if len(col) > 17 else 0.0
         # Valid seat modes are 0=exact 1=midpoint 2=neck 3=rear.  Mode 4 was the
         # rigid-body seat (removed 2026-08-27); its offsets are in mount-body space, so
         # such a row must never be baked in as a bone-anchor default.  Anything above 3
@@ -55,16 +61,16 @@ with open(sys.argv[1], 'rb') as f:
         if mode < 0 or mode > 3:
             sys.exit('%r has seat mode %d - only 0-3 (exact/midpoint/neck/rear) can be '
                      'baked as bone-anchor defaults' % (name, mode))
-        rows.append((name, mode, up, forward, lateral, posture, sit, ax, ay, az, base))
+        rows.append((name, mode, up, forward, lateral, posture, sit, ax, ay, az, base, ref))
 
 rows.sort(key=lambda r: r[0])          # byte order = stable across regenerations
 out = io.StringIO()
 for i, r in enumerate(rows):
     name = r[0]
     tail = '' if i == len(rows) - 1 else ','
-    out.write('    { "%s", %d, %7.2ff, %7.2ff, %6.2ff, %d, %d, %6.3ff, %6.3ff, %6.3ff, %7.3ff }%s  // %s\n'
+    out.write('    { "%s", %d, %7.2ff, %7.2ff, %6.2ff, %d, %d, %6.3ff, %6.3ff, %6.3ff, %7.3ff, %5.3ff }%s  // %s\n'
               % (esc(name), r[1], r[2], r[3], r[4], r[5], r[6],
-                 r[7], r[8], r[9], r[10], tail, name.decode('utf-8')))
+                 r[7], r[8], r[9], r[10], r[11], tail, name.decode('utf-8')))
 # write BYTES: the source file is UTF-8, and a redirect on Windows would otherwise encode
 # the trailing "// 名字" comments as CP936 and leave mixed encodings in a BOM'd UTF-8 file.
 sys.stdout.buffer.write(out.getvalue().encode('utf-8'))

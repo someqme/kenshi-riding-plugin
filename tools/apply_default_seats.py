@@ -29,7 +29,14 @@ def parse(body):
     return seats
 
 old, new = parse(old_body), parse(new_body)
-FIELDS = ['mode', 'up', 'forward', 'lateral', 'posture', 'sit', 'ax', 'ay', 'az', 'base']
+FIELDS = ['mode', 'up', 'forward', 'lateral', 'posture', 'sit', 'ax', 'ay', 'az', 'base',
+          'ref']
+
+def field(row, i):
+    # A row from a table written before a column existed simply has fewer numbers; treat
+    # the missing ones as 0, which is also what the C++ aggregate initialiser does, so the
+    # diff shows the column being filled in rather than crashing on it.
+    return row[i] if i < len(row) else 0.0
 
 for name in sorted(set(old) | set(new)):
     label = name.decode('utf-8')
@@ -37,8 +44,9 @@ for name in sorted(set(old) | set(new)):
         print('REMOVED %s' % label); continue
     if name not in old:
         print('ADDED   %s  %s' % (label, new[name])); continue
-    diffs = ['%s %g->%g' % (FIELDS[i], old[name][i], new[name][i])
-             for i in range(len(FIELDS)) if abs(old[name][i] - new[name][i]) > 1e-9]
+    diffs = ['%s %g->%g' % (FIELDS[i], field(old[name], i), field(new[name], i))
+             for i in range(len(FIELDS))
+             if abs(field(old[name], i) - field(new[name], i)) > 1e-9]
     if diffs:
         print('CHANGED %-8s %s' % (label, ', '.join(diffs)))
 
