@@ -325,12 +325,18 @@ CLAUDE.md 只留指针，需要 hook 新函数 / 直调新方法时查本节。
 - **dumpbin 定位无 PDB 崩溃点的手法**：dump 里 RidingPlugin+0x133d3 → 找 DLL 内字节模式 `ff 90 98 00 00 00` → 文件偏移−0x400+0x1000=RVA 对上 → dumpbin /imports 按 IAT 槽位序数（(槽址−IAT基址)/8）对出导入名 → 反汇编上下文与源码逐行吻合锁定函数。
 - **头冲突时的「最小 shim」技术（`AI/AI.h` vs `Character.h`）**：`Character.h` 把 `CharacterMessage` 定义成 `enum`，`AI/AI.h` 又前置声明成 `class` → C2011 硬冲突，两个头不可同时 include。只需 `AI` 的一个**非虚**方法时，别 include AI.h，改在 `Character.h` 已有的 `class AI;` 前置声明上补：`class AI { public: bool isTargetInRangeForOrders(RootObject* who); };`。调用 mangle 成 `AI::isTargetInRangeForOrders`，链接器从 KenshiLib.lib 导出桩解析（= 全插件直调方法同一机制，链接不报未解析符号即证明匹配）。非虚 + 不碰成员 → shim 空布局无所谓：`getAI()` 返回的就是规范 `AI*`，原样当 `this` 传，无 this 调整。**虚函数不能这么做**（要复现 vtable 布局）。⚠️ 该 shim 已从源码撤除（引入它的 `isTargetInRangeForOrders` 到达判定被证明是错信号），技术本身有效，留档备用；`DatapanelGUI::createLine` 是 protected，将来也要靠它直调。
 
-## 14. 自定义按键进原版设置菜单 —— 设计草案（2026-08-27 定，尚未动工）
+## 14. 自定义按键进原版设置菜单 —— **已实现（2026-08-28 游戏内实测通过）**
 
-**优先级已降为「便利功能」**：撞键问题已用换键解决（见 CLAUDE.md「操作与键位」）。真正还没解决的是附带 bug：**在输入框打字时热键照样触发**（寄生原版 `addCommand` 会白送修掉，`controlEnabled` 在 0xD0）。
+落地实现与硬约束见 `CLAUDE.md`「当前实现 → 自定义按键」与「关键机制」；本节只留 RE 侧的结论、以及**被推翻的草案判断**（免得下次照着错结论再走一遍）。
 
-- **路线＝寄生原版系统**，不自建配置文件：用 `InputHandler::addCommand(name, bool& value, key, alt, masks, GameMode)`（0x363130）注册动作 → 游戏替我们派发按键；UI 用 `DataPanelLine_KeyConfig(cmd, text, cat)`（0x3E7740，`btn0`/`btn1` = 主/副绑定）插进 `OptionsWindow::getSingleton()->keysDatapanel`（单例 0x4067B0，`keysDatapanel` 0x100），复用原版点击改键流程 + `默认` 按钮（`resetAllKeys` 0x3E7030）+ `controls.cfg` 持久化。`DatapanelGUI::createLine` 是 **protected**（0x6FC270）→ 用 §13 的最小 shim 技术直调。构建已链 `MyGUIEngine_x64.lib`，MyGUI API 无需逆向。
-- **截图确认（用户 2026-08-27 采集）**：控制页结构＝上半区鼠标/镜头 checkbox+slider → `addSpace` + 一行文本当 `[按键设置]` 段头 → 两列绑定按钮的 key 行 → 又一次 `addSpace` + `工具` 段头（编辑器绑定）→ `默认` 按钮。所以「加一个 `骑乘` 段」就是原版自己的做法。**"Toggle Free Camera mode" 是唯一没翻译的行** → 未收录字符串原样显示英文，我们的行必须自带 9 语言文案（同 `kMountLabels[]`）。**KEP / MOD 两个 tab 是原版的、灰的**（`data\mods.cfg` 只有 `RidingPlugin.mod`），用户确认 MOD 页只是显示当前启用的 mod 名字、不是可用容器 → 注入点就是控制页。RE_Kenshi **不注入**原版设置窗口（它开自己的独立窗口），没有现成先例可抄。
-- **`controls.cfg` 是全量重写的**（实测：用户一次会话后文件 1400→1442 B，多出 `toggle_devtools=F12` 与 `toggle_fps_camera=;`）→ 注册过的命令改键后会被写盘，不需要我们自己的存档文件；没注册的名字会被静默丢弃。**剩下的唯一持久化风险＝启动时序**：游戏 `loadConfig()`(0x361F80) 在主菜单前跑完，我们在那之后才注册，玩家的绑定可能被读掉却无处安放 → 候选解法＝注册完补调一次 `key->loadConfig()`，必须实测。
-- **待采集（只读诊断 DLL，一次跑完）**：①`OptionsWindow` 结构 dump（`getSingleton()`/`created`/`keysDatapanel` 是否非空、`tabs` 各页名字与 enabled、每个 category 的 `getNumLines`/`getLineByNum` 的 key+type+caption）②`InputHandler::commands` 全表 dump（name + `bound` + `keyString(bound,true)` + masks + gameMode）③活体实验 `addCommand("riding_test", &b, KC_NUMPAD9, …)`：出现在控制页吗／能设我们的 bool 吗／原版改键对它有效吗／`saveOptions()`(0x3EC570) 会写进 controls.cfg 吗 ④`getSingleton()` 何时非空、`created` 何时翻（决定轮询 vs hook）⑤在输入框打字时 `controlEnabled` 是否落 false ⑥**`Masks` 是不是精确匹配**（`toggle_block` 绑裸 `NUM0`，按 `Ctrl+NUM0` 触不触发）。
-- **默认键位怎么换取决于第⑥项**：精确匹配 → 整套骑乘键可以挪到 `Ctrl+数字键区`（一条规则、肌肉记忆全留）；否则只能散到 `G/L/N/O/P/U/V/X/Z/F6/F10/F11/Insert/NUM Enter` 这些空位。
+**⚠️ 草案里最关键的一句是错的：「RE_Kenshi 不注入原版设置窗口，没有现成先例可抄」。** 先例就在注入本插件的加载器里，而且做的正是同一件事（给控制页加一行可重绑定的 "Toggle Free Camera mode"）：`D:\KenshiModDev\RE_Kenshi\MiscHooks.cpp:270-286`（hook `DatapanelGUI::addCustomLine`，看到 `command == "editor_toggle"` 就在其后 `addCustomLine(new DataPanelLine_KeyConfig(...))`）+ `:313-314`（hook `InputHandler::loadConfig`，在 orig 之前 `addCommand`），派发在 `dllmain.cpp:236-283`（自己包 `OIS::KeyListener`，从 `key->map[arg.key]->name` 读命令名）。**据此整个方案简化掉了草案的大半**：不需要 shim、不需要碰 `OptionsWindow`/`getSingleton`/`keysDatapanel`/`createLine`、不需要单独的只读诊断 DLL。§335 那五六项「待采集」里只有 ⑤⑥ 还有意义。
+
+实测结论（按草案的编号回答）：
+- ③ `addCommand` **单独不会**让行出现在控制页——那只是把命令加进名字表。菜单行要**另外**用 `DatapanelGUI::addCustomLine` 追加一个 `DataPanelLine_KeyConfig`。原版改键流程/`默认` 按钮/`controls.cfg` 读写对我们的命令全部照常生效。
+- ④ 不需要轮询 `OptionsWindow::created`/`getSingleton`：hook `addCustomLine`，`thisptr` 就是控制页的 keysDatapanel，行随原版每次 `create()` 重建被重新追加。
+- ⑤ `controlEnabled`（0xD0）**确实在 UI 吃键盘时落 false**，`HotkeyPass` 开头查它即修掉「打字触发热键」。
+- ⑥ **Masks 是精确匹配的，但机制和草案设想的不一样**：`InputHandler::map` 的键是**复合整数 `keycode | mask`**（原版自己就把 `editor_toggle` 存成 Shift+F12），所以裸 `NUM*` 与 `Ctrl+NUM*` 占不同槽位、共存无冲突 → v1.2.1 的整套键位（含 4 个 Ctrl 变体）原样搬成默认值。⚠️ **修饰键要 OR 进 `addCommand` 的「键」参数，传 `masks` 参数是错的**（会注册到裸键上、跟裸键那条抢槽位、输的那条整行空白）。
+- **启动时序**（草案 §334 标为「唯一持久化风险」）：`InputHandler::loadConfig` 的 hook 对**我们**永不触发——RidingPlugin 是 post-load 插件，装 hook 时开机那次 `loadConfig` 早跑完了（freecam 能用这个 hook 是因为 RE_Kenshi 是 preload）。解法＝在 `startPlugin()` 里直接注册完**自己补调一次 `key->loadConfig()`**（草案猜的候选解法是对的），且**必须在插件加载时就注册**，不能等到控制页构建时——那一次构建的行会画成空白。
+- **派发不能用 `isKeyState(name)`**：对插件加的命令恒 false（详见 CLAUDE.md 关键机制）。我们不像先例那样再包一层 `OIS::KeyListener`（RE_Kenshi 已经包了一层），改成每 15 帧扫 `key->map` 反查每条命令**当前**的复合键码，再 OIS 轮询物理键 + 校验修饰位。
+
+仍未做：caption 只有英文（原版 `gettext` 不含我们的串，这也是先例那行 freecam 不翻译的原因），多语言＝自带 9 语言表（同 `kMountLabels[]`）为增强项。

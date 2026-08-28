@@ -11,6 +11,13 @@
 #include <kenshi/Animation/AnimationClassHuman.h>
 #include <kenshi/Building/Building.h>
 #include <kenshi/Enums.h>
+// Vanilla rebindable-keybinding support: DatapanelGUI::addCustomLine lets us inject
+// a DataPanelLine_KeyConfig row into the Settings->Controls page, and
+// InputHandler::loadConfig is where we register our commands so their bindings
+// persist to controls.cfg.  Both are copied from RE_Kenshi/MiscHooks.cpp (the loader
+// itself does exactly this for its "Toggle Free Camera mode" row).
+#include <kenshi/gui/DatapanelGUI.h>
+#include <kenshi/gui/DataPanelLine.h>
 
 #include <ois/OISKeyboard.h>
 
@@ -42,7 +49,9 @@ static std::string IntToStr(int v)
 // Riding plugin for Kenshi
 //
 // Mounting is done from the context menu ("Ride", the renamed bodyguard order).
-// Numpad2: dismount the rider
+// Dismount is via the right-click "put down" order (no dedicated hotkey).
+// Seat tuning uses rebindable vanilla commands registered in ridingLoadConfig_hook
+// (see Settings->Controls); defaults are the numpad layout in HotkeyPass.
 //
 // While mounted, the rider's position is synced to the mount's back once per
 // frame from GameWorld::mainLoop_GPUSensitiveStuff (a stable per-frame hook).
@@ -3075,6 +3084,228 @@ static void CombatAndForceDismountPass()
     }
 }
 
+// ---- vanilla-rebindable riding hotkeys ------------------------------------
+// Each seat-tuning action is registered as a real Kenshi input command so it
+// shows up in Settings->Controls as a rebindable row and its binding persists
+// to controls.cfg.  This replaces the old scheme of polling fixed OIS keycodes
+// (which could never be rebound and fired even while typing in a text box).
+//
+// The engine-written state bool lives inside the table (stable static storage),
+// so addCommand's bool& has something real to point at.  Defaults preserve the
+// 2026-08-27 muscle memory; the player can rebind any of them.  Ctrl variants get
+// CTRL_MASK so the vanilla input layer discriminates them from the bare key.
+enum RidingCmdId
+{
+    RCMD_UP, RCMD_DOWN, RCMD_FORWARD, RCMD_BACK,
+    RCMD_LEFT, RCMD_RIGHT, RCMD_FORCESIT, RCMD_HOME,
+    RCMD_SETHOME, RCMD_DEBUG, RCMD_COUNT
+};
+
+struct RidingCommand
+{
+    const char*         name;        // command id stored in controls.cfg
+    const char*         caption;     // English label shown in the controls page (v1)
+    int                 defaultKey;  // OIS keycode default binding
+    InputHandler::Masks mask;        // modifier the default binding wants
+    bool                state;       // engine writes key state here (unused, but a real target)
+};
+
+static RidingCommand gRidingCommands[RCMD_COUNT] =
+{
+    // Modifier defaults go in the KEY argument as a composite int (keycode | mask),
+    // NOT in the masks argument - that one registers the command on the BARE key and
+    // collides with whoever else owns it (proven 2026-08-28: passing CTRL_MASK as the
+    // masks arg made the controls page show "*", not "Ctrl+*", and blanked the bare-key
+    // command that lost the slot).  A composite is a DIFFERENT map slot, so Ctrl+NUM*
+    // and NUM* coexist - vanilla stores editor_toggle=Shift+F12 the same way.
+    // CONFIRMED in-game 2026-08-28: bindings resolved [.. 693 567 .. 585 595] = the four
+    // Ctrl variants live, with bare NUM9/NUM. still driving home/force-sit.  This
+    // reproduces the whole v1.2.1 numpad layout as the out-of-the-box default, and the
+    // vanilla rebind UI captures Ctrl combos too, so players can move any of them.
+    // (NUM+/NUM- still collide with vanilla build_tilt_inc/dec, build-mode-only, rebindable.)
+    { "riding_seat_up",       "Riding: seat up",           OIS::KC_ADD,        InputHandler::NONE_MASK, false },
+    { "riding_seat_down",     "Riding: seat down",         OIS::KC_SUBTRACT,   InputHandler::NONE_MASK, false },
+    { "riding_seat_forward",  "Riding: seat forward",      OIS::KC_MULTIPLY,   InputHandler::NONE_MASK, false },
+    { "riding_seat_back",     "Riding: seat back",         OIS::KC_DIVIDE,     InputHandler::NONE_MASK, false },
+    { "riding_seat_left",     "Riding: seat left",         OIS::KC_MULTIPLY | InputHandler::CTRL_MASK, InputHandler::NONE_MASK, false },
+    { "riding_seat_right",    "Riding: seat right",        OIS::KC_DIVIDE   | InputHandler::CTRL_MASK, InputHandler::NONE_MASK, false },
+    { "riding_force_sit",     "Riding: toggle force-sit",  OIS::KC_DECIMAL,    InputHandler::NONE_MASK, false },
+    { "riding_seat_home",     "Riding: reset seat to zero",OIS::KC_NUMPAD9,    InputHandler::NONE_MASK, false },
+    { "riding_seat_sethome",  "Riding: set seat zero here",OIS::KC_NUMPAD9  | InputHandler::CTRL_MASK, InputHandler::NONE_MASK, false },
+    { "riding_toggle_debug",  "Riding: toggle diagnostics",OIS::KC_DECIMAL  | InputHandler::CTRL_MASK, InputHandler::NONE_MASK, false },
+};
+
+// Set true once our commands are registered, so HotkeyPass never calls
+// isKeyState() on a name the engine has not heard of yet.
+static bool gRidingCommandsRegistered = false;
+
+// Is our first command still in the engine's name list?  Guards against an
+// engine-side initialise() that rebuilds the command map after we registered
+// (possible when we register very early, from startPlugin).  Templated so we never
+// spell out the map's Ogre::STLAllocator type.
+template <class MapT>
+static bool HasRidingCommandIn(MapT& m)
+{
+    return m.find(std::string(gRidingCommands[0].name)) != m.end();
+}
+
+static void ValidateRidingRegistration(InputHandler* h)
+{
+    if (!gRidingCommandsRegistered || !h)
+        return;
+    bool present = true;
+    try { present = HasRidingCommandIn(h->commands); } catch (...) { return; }
+    if (!present)
+    {
+        gRidingCommandsRegistered = false;   // engine wiped them - register again
+        DebugLog("Riding: commands vanished from InputHandler, re-registering");
+    }
+}
+
+// Register all riding commands into the given InputHandler.  Idempotent: the
+// flag stops it running twice, and addCommand on an existing name is a no-op /
+// overwrite anyway.  Shared by the loadConfig hook and the lazy path below.
+//
+// addCommand only adds the command to the name list; the engine wires the
+// keycode->command binding map inside loadConfig().  The freecam precedent
+// registers BEFORE the original loadConfig so that wiring includes it.  We are a
+// post-load plugin and register AFTER the boot-time loadConfig, so on the lazy
+// path we must re-run loadConfig ourselves (applyNow=true) to get our defaults
+// wired and any saved bindings from controls.cfg applied.  On the hook path the
+// original loadConfig runs right after us, so applyNow=false there.
+static void RegisterRidingCommands(InputHandler* h, bool applyNow)
+{
+    if (gRidingCommandsRegistered || !h)
+        return;
+    try
+    {
+        for (int i = 0; i < RCMD_COUNT; ++i)
+            h->addCommand(gRidingCommands[i].name, gRidingCommands[i].state,
+                          gRidingCommands[i].defaultKey, OIS::KC_UNASSIGNED,
+                          gRidingCommands[i].mask, InputHandler::GLOBAL);
+        gRidingCommandsRegistered = true;
+        if (applyNow)
+            h->loadConfig();   // re-runs our hook (no-op now) then rebuilds bindings
+        DebugLog("Riding: registered " + IntToStr(RCMD_COUNT)
+                 + " seat commands (applyNow=" + IntToStr(applyNow ? 1 : 0) + ")");
+    }
+    catch (...) {}
+}
+
+// ---- reading the keys back ------------------------------------------------
+// isKeyState(name) is DEAD for plugin-added commands (2026-08-28 in-game proof:
+// all 10 commands wired, isBound=1111111111, six default bindings visible and
+// correct in Settings->Controls, a manual rebind of seat-left to G accepted --
+// and not one press ever produced a fire).  Either the engine's own
+// clearMessages() zeroes the state bool before our mainLoop pass reads it, or the
+// bool is simply never written for commands the engine did not declare itself.
+// The freecam precedent does not use isKeyState either: RE_Kenshi dispatches by
+// reading key->map[keycode]->name from its own KeyListener.  That is the tell.
+//
+// So we resolve each command's CURRENT binding out of the engine's live keycode
+// map and poll the physical key with OIS ourselves.  Everything the vanilla
+// registration bought us is kept (a rebindable row, persistence in controls.cfg,
+// a rebind taking effect the moment the player makes it -- because we re-read the
+// map, never a compiled-in keycode), while the actual read is the same OIS
+// polling that shipped working in v1.2.1.
+//
+// Map keys are COMPOSITE ints: low byte = OIS keycode (every keycode is <= 0xED),
+// high bits = Masks (SHIFT 0x100 / CTRL 0x200 / ALT 0x400).  That is how vanilla
+// keeps "Shift+F12" for editor_toggle in a std::map<int, Command*>.
+static int gRidingBound[RCMD_COUNT];
+
+// Templated so we never have to spell out the map's Ogre::STLAllocator type.
+template <class MapT>
+static void ScanRidingBindings(MapT& m)
+{
+    for (typename MapT::iterator it = m.begin(); it != m.end(); ++it)
+    {
+        InputHandler::Command* c = it->second;
+        if (!c)
+            continue;
+        for (int i = 0; i < RCMD_COUNT; ++i)
+            if (c->name == gRidingCommands[i].name)
+            {
+                gRidingBound[i] = it->first;
+                break;
+            }
+    }
+}
+
+static void RefreshRidingBindings(InputHandler* h)
+{
+    for (int i = 0; i < RCMD_COUNT; ++i)
+        gRidingBound[i] = 0;                       // 0 == unbound (KC_UNASSIGNED)
+    if (!h)
+        return;
+    try { ScanRidingBindings(h->map); } catch (...) {}
+}
+
+// True while the command's bound key is held with exactly its modifier set.
+// Unbound commands (blank row) simply never fire.
+static bool RidingCmdDown(int id)
+{
+    if (id < 0 || id >= RCMD_COUNT || !(key && key->keyboard))
+        return false;
+    int b  = gRidingBound[id];
+    int kc = b & 0xFF;
+    if (kc == 0)
+        return false;
+    if (!key->keyboard->isKeyDown((OIS::KeyCode)kc))
+        return false;
+    int mk = b & InputHandler::ALL_MASK;
+    bool ctrlNow  = key->keyboard->isKeyDown(OIS::KC_LCONTROL) || key->keyboard->isKeyDown(OIS::KC_RCONTROL);
+    bool shiftNow = key->keyboard->isKeyDown(OIS::KC_LSHIFT)   || key->keyboard->isKeyDown(OIS::KC_RSHIFT);
+    bool altNow   = key->keyboard->isKeyDown(OIS::KC_LMENU)    || key->keyboard->isKeyDown(OIS::KC_RMENU);
+    return ctrlNow  == ((mk & InputHandler::CTRL_MASK)  != 0)
+        && shiftNow == ((mk & InputHandler::SHIFT_MASK) != 0)
+        && altNow   == ((mk & InputHandler::ALT_MASK)   != 0);
+}
+// InputHandler::loadConfig only loads bindings for commands that already exist,
+// so we register ours BEFORE the original runs (same ordering as the freecam
+// precedent).  From then on the bindings ride along with controls.cfg for free.
+// CAVEAT: we are a POST-LOAD plugin, so if the game's boot-time loadConfig runs
+// before this hook installs, the hook never fires - HotkeyPass registers lazily
+// as a fallback (see there), which re-runs loadConfig to wire the bindings.
+void (*ridingLoadConfig_orig)(InputHandler* thisptr) = NULL;
+void ridingLoadConfig_hook(InputHandler* thisptr)
+{
+    RegisterRidingCommands(thisptr, false);
+    ridingLoadConfig_orig(thisptr);
+}
+
+// Inject our rebindable rows into the Settings->Controls page.  addCommand alone
+// does NOT make a row appear - the panel is built from DataPanelLine_KeyConfig
+// objects fed through addCustomLine.  We anchor on the vanilla "editor_toggle"
+// row (stable, always present) and append our rows right after it.  RE_Kenshi
+// also hooks addCustomLine and anchors on the same row; the hooks chain, so both
+// its freecam row and our rows appear.  Appended rows re-enter this hook but
+// their command != "editor_toggle", so they pass straight through - no recursion.
+void (*ridingAddCustomLine_orig)(DatapanelGUI* thisptr, DataPanelLine* line) = NULL;
+void ridingAddCustomLine_hook(DatapanelGUI* thisptr, DataPanelLine* line)
+{
+    try
+    {
+        DataPanelLine_KeyConfig* keyConf = dynamic_cast<DataPanelLine_KeyConfig*>(line);
+        // The controls page is the earliest hook we get at MAIN MENU time, where no
+        // mainLoop/HotkeyPass runs yet - without this the main-menu page shows all ten
+        // rows blank (reported 2026-08-28) because nothing had registered the commands.
+        if (keyConf)
+        {
+            ValidateRidingRegistration(key);
+            RegisterRidingCommands(key, true);
+        }
+        ridingAddCustomLine_orig(thisptr, line);
+        if (keyConf && keyConf->command == "editor_toggle")
+        {
+            for (int i = 0; i < RCMD_COUNT; ++i)
+                thisptr->addCustomLine(new DataPanelLine_KeyConfig(
+                    gRidingCommands[i].name, gRidingCommands[i].caption, 25));
+        }
+    }
+    catch (...) {}
+}
+
 // 2) mount/dismount/tune keys (numpad, physical key detection via OIS) and
 // 3) live seat tuning (applies to the currently mounted animal).  The prev-state
 //    flags are function locals on purpose: one edge consumer each, persist across
@@ -3084,32 +3315,91 @@ static void HotkeyPass()
     if (!(key && key->keyboard && ou->player))
         return;
 
+    // Lazy registration fallback: our loadConfig hook installs at post-load time
+    // and may miss the game's boot-time loadConfig, in which case the commands
+    // were never wired.  Register on the first frame we have a valid input
+    // handler and re-run loadConfig to wire the bindings.  (Idempotent.)
+    ValidateRidingRegistration(key);
+    RegisterRidingCommands(key, true);
+
+    // Resolve the live bindings out of the engine's keycode map.  Cheap (~80 map
+    // entries) and re-run every few frames on purpose: that is what makes a rebind
+    // in Settings->Controls take effect immediately, with no compiled-in keycode
+    // anywhere in the dispatch path.
     {
-        static bool prevAdd = false;
-        static bool prevSub = false;
-        static bool prevMul = false;
-        static bool prevDiv = false;
-        static bool prevNP9 = false;
-        static bool prevDecimal = false;
+        static int bindTick = 0;
+        if ((bindTick++ % 15) == 0)
+        {
+            int before[RCMD_COUNT];
+            for (int i = 0; i < RCMD_COUNT; ++i)
+                before[i] = gRidingBound[i];
+            RefreshRidingBindings(key);
+            bool changed = false;
+            for (int i = 0; i < RCMD_COUNT; ++i)
+                if (before[i] != gRidingBound[i])
+                    changed = true;
+            if (changed)
+            {
+                std::string s;
+                for (int i = 0; i < RCMD_COUNT; ++i)
+                {
+                    if (i) s += " ";
+                    s += IntToStr(gRidingBound[i]);
+                }
+                DebugLog("Riding: bindings resolved [" + s + "]");
+            }
+        }
+    }
 
-        // Ctrl held is read once here because two keys are now shared between a bare and a
-        // Ctrl variant (Numpad9 = home/set-home, Numpad. = force-sit/diagnostics), and the
-        // key EDGE may only be sampled once per frame - a second KeyEdge() call on the same
-        // static would see the already-updated prev state and never fire.
-        bool ctrlD = key->keyboard->isKeyDown(OIS::KC_LCONTROL) || key->keyboard->isKeyDown(OIS::KC_RCONTROL);
-        bool decE  = KeyEdge(key->keyboard->isKeyDown(OIS::KC_DECIMAL), prevDecimal);
+    // One-shot diagnostic: prints the guard states, so a "keys are dead" report says
+    // straight away WHICH layer failed (registration vs the UI keyboard guard).
+    static bool hotkeyProbed = false;
+    if (!hotkeyProbed)
+    {
+        hotkeyProbed = true;
+        DebugLog("Riding: HotkeyPass first-entry controlEnabled="
+                 + IntToStr(key->controlEnabled ? 1 : 0)
+                 + " registered=" + IntToStr(gRidingCommandsRegistered ? 1 : 0));
+    }
 
-        // Debug: Ctrl+Numpad decimal (.) toggles continuous ride diagnostics.  Every ~10
-        // frames we log the mount's root/back bone position+orientation, our computed
-        // target seat position, and the rider's actual render node, so we can see
-        // whether the "fling while running" comes from position or orientation.
-        // (Bare Numpad. is force-sit since the 2026-08-27 remap; this one moved under Ctrl
-        // because it is a developer key and force-sit is the one a player might reach for.)
-        if (decE && ctrlD)
+    // Don't act while a UI owns the keyboard (typing in a rename/search box).
+    // controlEnabled (InputHandler+0xD0) is the vanilla "gameplay input is live"
+    // flag; the old OIS-polling scheme ignored it and fired mid-typing.
+    if (!key->controlEnabled)
+        return;
+
+    // Nothing to read until our commands are registered.
+    if (!gRidingCommandsRegistered)
+        return;
+
+    {
+        // Seat-tuning keys are vanilla rebindable commands now (Settings->Controls),
+        // but the READ is our own: RidingCmdDown polls the physical key the engine
+        // map currently holds for that command (isKeyState never fires for
+        // plugin-added commands - see the note above RidingCmdDown).  A rebind still
+        // takes effect at once, and each command owning its own binding killed the
+        // old shared-key KeyEdge-once-per-frame hack (ctrlD/decE).
+        static bool prevEdge[RCMD_COUNT] = { false };
+        bool edge[RCMD_COUNT];
+        for (int i = 0; i < RCMD_COUNT; ++i)
+        {
+            bool down = false;
+            try { down = RidingCmdDown(i); } catch (...) { down = false; }
+            edge[i] = KeyEdge(down, prevEdge[i]);
+            // Per-press trace, diagnostics only: says WHICH command a key resolved to,
+            // which is the one thing a "wrong action fired" report cannot tell us.
+            if (edge[i] && debugContinuous)
+                DebugLog(std::string("Riding: input '") + gRidingCommands[i].name + "' fired");
+        }
+
+        // Debug: toggles continuous ride diagnostics (default Ctrl+Numpad.).  Every
+        // ~10 frames we log the mount bones, our target seat, and the rider node.
+        if (edge[RCMD_DEBUG])
         {
             debugContinuous = !debugContinuous;
             DebugLog(std::string("Riding: debug continuous ") + (debugContinuous ? "ON" : "OFF"));
         }
+
 
         // Dismount has NO hotkey of its own (2026-08-27, user call): the right-click
         // "put down" order is the real dismount entry point, and Numpad2 collided with
@@ -3129,54 +3419,28 @@ static void HotkeyPass()
 
         // 3) Live seat tuning (applies to the currently mounted animal).
         //    Rider FACING is not tunable - it always follows the mount's travel direction.
-        //    Numpad +/- : up/down 0.1    Numpad */ : forward/back 0.1
-        //    Numpad .   : toggle force-sit on/off
-        //    (Numpad 7 posture cycling was removed 2026-08-27 - user call: the mod only
-        //     needs the one seated posture, and NUM7 is the vanilla "medic" command, so
-        //     every posture switch also silently toggled the rider's medic job.  The
-        //     stand posture itself still exists and is still honoured from the cfg's
-        //     posture column, exactly like the seat mode - there is simply no runtime
-        //     switch for it, and all 30 built-in defaults are seated.)
-        //    Ctrl+*/ /   : move the seat left/right (lateral)
-        //    Numpad 9   : return to this species' declared zero (see Ctrl+Numpad9)
-        //    Ctrl+Numpad 9 : declare the CURRENT seat as this species' zero (2026-08-26).
-        //                 Before this, the reset key cleared the tune to the bare geometric
-        //                 base AND overwrote the cfg with zeros, so it destroyed a dialled-in
-        //                 seat rather than returning to it.  The zero is now a separate
-        //                 persisted slot (cfg cols 15-17) that the +/- keys never touch;
-        //                 cfg files predating it migrate with zero = the tune already in
-        //                 the file, so an existing good seat is the reset target already.
-        //
-        //    ** 2026-08-27 remap: every key we use has to be one the base game does NOT
-        //    ** bind, because a collision is SILENT - Kenshi's numpad commands are squad
-        //    ** state toggles (block/hold/passive/ranged/sneak/taunt/run-speed/medic/rescue
-        //    ** on NUM0..NUM8), so the old bindings quietly flipped the rider's stance or
-        //    ** job every time the seat was nudged and nothing on screen said so.  Reading
-        //    ** the live controls.cfg, the only unbound numpad keys are * / . NUM9 and
-        //    ** NumEnter.  Hence: home moved NUM0 -> NUM9, force-sit moved NUM6 -> NUM.,
-        //    ** and the diagnostics toggle moved to Ctrl+NUM. .  Still colliding, knowingly:
-        //    ** NUM+/NUM- are build_tilt_increase/decrease, which only do anything while
-        //    ** the build placement mode is up.  (Dismount on NUM2 and posture on NUM7 were
-        //    ** deleted outright the same day rather than remapped - neither key was needed.)
-        //    (The old Numpad 3/9 ±0.02 fine step was removed 2026-08-24 - redundant with
-        //     +/- now that per-species presets cover the common animals; user call.  NUM9 is
-        //     therefore free to become the home key.)
+        //    Every action is a rebindable vanilla command (Settings->Controls); the
+        //    defaults reproduce the 2026-08-27 numpad layout:
+        //      up NUM+   down NUM-   forward NUM*   back NUM/
+        //      left Ctrl+NUM*   right Ctrl+NUM/   force-sit NUM.
+        //      reset-to-zero NUM9   set-zero-here Ctrl+NUM9   diagnostics Ctrl+NUM.
+        //    Home returns to the species' declared zero (a separate persisted slot,
+        //    cfg cols 15-17, that +/- never touch); set-home declares the current seat
+        //    as that zero.  Bindings persist in controls.cfg and are fully rebindable,
+        //    so the old "avoid the vanilla numpad commands" hazard no longer applies -
+        //    a collision just means two commands share a key, and the player can move
+        //    ours.  (Numpad2 dismount and Numpad7 posture were deleted 2026-08-27.)
         {
-            bool addE = KeyEdge(key->keyboard->isKeyDown(OIS::KC_ADD),      prevAdd);
-            bool subE = KeyEdge(key->keyboard->isKeyDown(OIS::KC_SUBTRACT), prevSub);
-            bool mulE = KeyEdge(key->keyboard->isKeyDown(OIS::KC_MULTIPLY), prevMul);
-            bool divE = KeyEdge(key->keyboard->isKeyDown(OIS::KC_DIVIDE),   prevDiv);
-            bool np9E = KeyEdge(key->keyboard->isKeyDown(OIS::KC_NUMPAD9),  prevNP9);
+            bool stepUp      = edge[RCMD_UP];
+            bool stepDn      = edge[RCMD_DOWN];
+            bool stepFw      = edge[RCMD_FORWARD];
+            bool stepBk      = edge[RCMD_BACK];
+            bool stepLatR    = edge[RCMD_RIGHT];
+            bool stepLatL    = edge[RCMD_LEFT];
+            bool stepRst     = edge[RCMD_HOME];
+            bool stepSetHome = edge[RCMD_SETHOME];
+            bool stepSit     = edge[RCMD_FORCESIT];
 
-            bool stepUp = addE && !ctrlD;
-            bool stepDn = subE && !ctrlD;
-            bool stepFw = mulE && !ctrlD;
-            bool stepBk = divE && !ctrlD;
-            bool stepLatR = mulE && ctrlD;
-            bool stepLatL = divE && ctrlD;
-            bool stepRst = np9E && !ctrlD;
-            bool stepSetHome = np9E && ctrlD;
-            bool stepSit = decE && !ctrlD;
 
             if (stepUp || stepDn || stepFw || stepBk || stepLatR || stepLatL || stepRst || stepSetHome || stepSit)
             {
@@ -3254,7 +3518,7 @@ static void HotkeyPass()
                 }
                 else
                 {
-                    DebugLog("Riding: select the rider, then tune with Numpad +/- * / 0");
+                    DebugLog("Riding: select the rider first, then use the seat-tuning keys (see Settings->Controls)");
                 }
             }
         }
@@ -3547,5 +3811,31 @@ __declspec(dllexport) void startPlugin()
     if (KenshiLib::SUCCESS != KenshiLib::AddHook(KenshiLib::GetRealAddress(&ContextMenuGUI::show), (void*)&contextMenu_show_hook, (void**)&contextMenu_show_orig))
         ErrorLog("RidingPlugin: Could not hook ContextMenuGUI::show!");
 
+    // Register our seat-tuning commands before the config loads, and inject their
+    // rebindable rows into the Settings->Controls page.  Both mirror the freecam
+    // precedent in RE_Kenshi/MiscHooks.cpp; the hooks chain with RE_Kenshi's own.
+    if (KenshiLib::SUCCESS != KenshiLib::AddHook(KenshiLib::GetRealAddress(&InputHandler::loadConfig), (void*)&ridingLoadConfig_hook, (void**)&ridingLoadConfig_orig))
+        ErrorLog("RidingPlugin: Could not hook InputHandler::loadConfig!");
+
+    if (KenshiLib::SUCCESS != KenshiLib::AddHook(KenshiLib::GetRealAddress(&DatapanelGUI::addCustomLine), (void*)&ridingAddCustomLine_hook, (void**)&ridingAddCustomLine_orig))
+        ErrorLog("RidingPlugin: Could not hook DatapanelGUI::addCustomLine!");
+
     DebugLog("RidingPlugin: hooks installed");
+
+    // Register the seat commands RIGHT NOW if the input handler already exists.
+    // Post-load plugins arrive after the engine's boot-time loadConfig, so the hook
+    // above will not fire for it; the lazy paths (controls page / first in-game
+    // frame) do catch up, but the FIRST controls page built in the same call that
+    // triggers a lazy registration draws our rows blank (reported 2026-08-28 for the
+    // main-menu page).  Registering here beats every panel build.  If the engine has
+    // not constructed `key` yet, or wipes our commands in a later initialise(), the
+    // lazy paths self-heal (see HasRidingCommand).
+    if (key)
+    {
+        RegisterRidingCommands(key, true);
+        DebugLog("RidingPlugin: early command registration "
+                 + std::string(gRidingCommandsRegistered ? "done" : "failed"));
+    }
+    else
+        DebugLog("RidingPlugin: no InputHandler yet, deferring command registration");
 }
