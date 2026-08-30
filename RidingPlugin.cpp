@@ -2063,6 +2063,11 @@ static bool RearBoneReadSane(Character* mount, const SeatInfo& seat, const Ogre:
     return (rear - backP).length() <= maxSpan;
 }
 
+// Existence-checked animation lookup, defined further down next to the P1 table dump (it
+// needs the EngineAnimMap typedef).  Forward-declared here because BuildSeatInfo is the
+// earliest caller: getAnimationData() must never be handed a name that may be absent.
+static AnimationData* FindAnimData(AnimationClass* rAnim, const char* name);
+
 // Build the seat setup for a mount:
 //   - seat mode comes from riding.cfg per species (default MIDPOINT)
 //   - EXACT:    anchor = back bone, lift from root/pelvis fallbacks
@@ -2150,24 +2155,29 @@ SeatInfo BuildSeatInfo(Character* mount)
     // tuneKey rather than species - otherwise the first anchor capture on a race-served mount
     // silently forks a name row for it and the race layer stops covering it.
     //
-    // ⚠️ THE ONE CASE THAT DOES FORK A NAME ROW (found 2026-08-29, not fixed): tuneKey DEFAULTS
-    // to species and is only replaced by the race key when speciesTuning ALREADY HOLDS a row for
-    // that race.  So an animal whose race is not among the 21 shipped rows - a modded species, or
-    // any mount where getRaceKey() came back empty - keeps a name-keyed tuneKey, and its first
-    // anchor capture writes a row keyed on the LOCALIZED NAME.  That is exactly the fragility the
-    // race layer exists to avoid (a different language install, or the player renaming the animal,
-    // and the row stops matching).  The live example in this machine's riding.cfg is `Brooke`
-    // (home columns all 0 = never seeded from the table, refScale 1.033 = adopted on first tune).
-    // Fix when someone touches this: fall back to `if (!info.raceKey.empty()) info.tuneKey =
-    // info.raceKey;` when NEITHER layer has a row, so the new capture lands as a race row.  A
-    // hand-written name override is unaffected - it is found by the first lookup.
+    // ⚠️ THE ONE CASE THAT USED TO FORK A NAME ROW (found 2026-08-29, FIXED 2026-08-30, TASK.md
+    // X-2): tuneKey defaults to species and was only replaced by the race key when speciesTuning
+    // ALREADY HELD a row for that race.  So an animal whose race is not among the 21 shipped rows -
+    // a modded species, or any mount where getRaceKey() came back empty - kept a name-keyed tuneKey,
+    // and its first anchor capture wrote a row keyed on the LOCALIZED NAME.  That is exactly the
+    // fragility the race layer exists to avoid (a different language install, or the player renaming
+    // the animal, and the row stops matching).  The live example found in this machine's riding.cfg
+    // was `Brooke` (home columns all 0 = never seeded from the table, refScale 1.033 = adopted on
+    // first tune).  Now: when NEITHER layer has a row, tuneKey falls back to the race key so the new
+    // capture lands as a RACE row, which is the covering layer for every other member of that race.
+    // Two things deliberately unchanged:
+    //   * a hand-written name override still wins - it is found by the FIRST lookup, before this.
+    //   * an empty raceKey still leaves tuneKey on the name.  There is nothing better to key on, and
+    //     a row is still better than losing the capture; that path is also the one to suspect if a
+    //     name row ever appears again (check the mount log's `race=` field for `()`).
     info.tuneKey = info.species;
     boost::unordered_map<std::string, SpeciesTuning>::iterator tit = speciesTuning.find(info.species);
     if (tit == speciesTuning.end() && !info.raceKey.empty())
     {
         tit = speciesTuning.find(info.raceKey);
-        if (tit != speciesTuning.end())
-            info.tuneKey = info.raceKey;
+        // Race key whether or not the row exists yet: if it does, it is serving us; if it does
+        // not, it is where this mount's first capture belongs.
+        info.tuneKey = info.raceKey;
     }
     if (tit != speciesTuning.end())
     {
@@ -2184,7 +2194,15 @@ SeatInfo BuildSeatInfo(Character* mount)
     // pack_beast family (Garru / Pack Beast / Dead Pack Beast) share the "beast walk"
     // animation, which the carry system suppresses.  Detect it from the animation
     // data so we can force the walk back on while ridden.
-    if (mountAnim && mountAnim->getAnimationData("beast walk"))
+    //
+    // ⚠️ MUST go through FindAnimData(), never getAnimationData() (TASK.md X-1, fixed
+    // 2026-08-30).  getAnimationData() is operator[]: on a miss it INSERTS a NULL value
+    // under that key into the engine's own allAnims - and here the miss is the common
+    // case, since every non-pack-beast species reaches this line.  So the old direct call
+    // dropped one permanent null pointer into the animal list per ride of any other
+    // animal, in a container the ENGINE iterates.  find() first, resolve only what is
+    // already there; the boolean result is identical for the pack beasts themselves.
+    if (FindAnimData(mountAnim, "beast walk"))
         info.forceWalk = true;
 
     // Fling skeletons: their back bone is rigid / the root bone is thrown up and down
@@ -3753,7 +3771,11 @@ static int            gP41kBudget   = 0;      // weight-sample lines per ride
 // Existence-checked lookup.  getAnimationData() has operator[] semantics and inserts a NULL
 // into the engine's own allAnims on a miss, so a name that might be absent must never reach it
 // - find() decides first, and only a name the map already holds is ever resolved.
-static AnimationData* P41kFind(AnimationClass* rAnim, const char* name)
+//
+// Works for animals as well as humans: getAnimationDatasList() is the list THAT character
+// resolves against (the character list for humans, the per-race list for animals), so the
+// same helper answers "does this mount know 'beast walk'" without poisoning the animal list.
+static AnimationData* FindAnimData(AnimationClass* rAnim, const char* name)
 {
     if (!rAnim || !name) return NULL;
     AnimsListsManager::AnimList* lst = rAnim->getAnimationDatasList();
@@ -3766,6 +3788,27 @@ static AnimationData* P41kFind(AnimationClass* rAnim, const char* name)
     EngineAnimMap::const_iterator mi = lst->allAnims.find(std::string(name));
     if (mi == lst->allAnims.end()) return NULL;
     return mi->second;
+}
+
+// P4-2: how many ATTACK rows the animal's own animation list holds.  The mount's list is a
+// per-race one (getAnimationDatasList()), NOT the character list P1 enumerated - P1 found the
+// HUMAN list's `attacks` empty, which says nothing about animals.  "Does the small tier have
+// attack material at all" is a precondition for 「坐骑也出手」: if this reads 0 the mount cannot
+// swing no matter what we order it to do, and the both-sides ruling collapses to rider-only.
+// Returns -1 for "could not read" so a failed read never looks like a real zero.
+static int AnimListAttackCount(AnimationClass* anim)
+{
+    if (!anim) return -1;
+    AnimsListsManager::AnimList* lst = anim->getAnimationDatasList();
+    if (!lst) return -1;
+    // Same layout self-check FindAnimData does: a boost size mismatch would make every
+    // member after actionAnims land on the wrong offset.
+    long actOff = (long)((char*)&lst->actionAnims - (char*)lst);
+    long allOff = (long)((char*)&lst->allAnims    - (char*)lst);
+    if (allOff != 0xB8 || actOff != 0x78) return -1;
+    if (!lst->attacks.valid()) return -1;
+    unsigned int n = lst->attacks.size();
+    return (n > 4096u) ? -1 : (int)n;   // absurd count = we are not reading a lektor
 }
 
 static void DumpHumanAnimTableImpl(Character* rider)
@@ -4950,6 +4993,10 @@ void Mount(Character* rider, Character* mount)
              + " rad=" + IntToStr((int)(radDbg * 10.0f))
              + " size=" + IntToStr((int)(sizeDbg * 10.0f))
              + " elig=" + IntToStr(MountCombatEligible(mount, seat) ? 1 : 0)
+             // P4-2: mAtk= the number of ATTACK rows in THIS ANIMAL's own list (-1 = unreadable).
+             // 0 on a small-tier mount would mean the mount physically cannot swing and the
+             // both-sides ruling has to fall back to rider-only for that species.
+             + " mAtk=" + IntToStr(AnimListAttackCount(mAnimDbg))
              + " h=" + IntToStr((int)(hDbg * 10.0f)));
 
     // P1 (TASK.md): one-shot enumeration of the engine's real human animation table.
@@ -5305,9 +5352,13 @@ void newPlayerTask_hook(PlayerInterface* thisptr, TaskType t, const hand& target
         return; // swallow the original order
     }
 
-    // Attack order while riding a NECK (large) mount: the mount fights instead.
-    // The per-frame controller below keeps the rider passive, so we just tell the
-    // mount to engage the target with its vanilla animal combat.
+    // Attack order while riding: the mount engages the ordered target too.
+    //
+    // ⚠️ P4-2 (2026-08-30) dropped the IsBigMount() condition that used to sit here.  On the
+    // big tier the per-frame controller keeps the rider passive, so the mount is the only one
+    // that can act on the order; on the small tier 已定决策「骑手与坐骑都出手」 wants BOTH, and
+    // this hook does not swallow the order (it falls through to newPlayerTask_orig below), so
+    // the rider's own attack order still reaches the engine either way.
     if (target && IsAttackTask(t))
     {
         ogre_unordered_set<hand>::type::iterator sit = thisptr->selectedCharacters.begin();
@@ -5317,12 +5368,11 @@ void newPlayerTask_hook(PlayerInterface* thisptr, TaskType t, const hand& target
             if (!c) continue;
             Character* mount = GetMount(c);
             if (!mount) continue;
-            boost::unordered_map<Character*, SeatInfo>::iterator mit = mountSeat.find(mount);
-            if (mit != mountSeat.end() && IsBigMount(mit->second))
-            {
-                if (mount->getAttackTarget().getCharacter() != target)
-                    mount->attackTarget(target);
-            }
+            // Only that the mount is one we are tracking - no seat/size condition.  A mount
+            // with no seat entry is skipped because we would be ordering a stranger around.
+            if (mountSeat.find(mount) == mountSeat.end()) continue;
+            if (mount->getAttackTarget().getCharacter() != target)
+                mount->attackTarget(target);
         }
     }
 
@@ -6100,8 +6150,8 @@ static void HaltAndForceSitPass()
                             if (!gP41kResolved)
                             {
                                 gP41kResolved = true;
-                                gP41kGuard  = P41kFind(rAnim, kP41kGuardAnim);
-                                gP41kBlow   = P41kFind(rAnim, kP41kBlowAnim);
+                                gP41kGuard  = FindAnimData(rAnim, kP41kGuardAnim);
+                                gP41kBlow   = FindAnimData(rAnim, kP41kBlowAnim);
                                 gP41kBudget = 60;
                                 char rl[224];
                                 _snprintf_s(rl, 224, _TRUNCATE,
@@ -7130,9 +7180,20 @@ static void RiderCombatLever(Character* rider, Character* mount)
 
 // 1c) Mount combat + forced dismount.
 //     - Any mount that is down (KO'd) or dead force-dismounts its rider.
-//     - On NECK-mode (large) mounts the rider stays passive: their combat is
-//       suppressed every frame and the mount fights back with its native
-//       animal combat, defending the rider against the rider's attackers.
+//     - Outside the P4-0 SIZE gate (big tier) the rider stays passive: their combat is
+//       suppressed every frame and the mount fights back with its native animal combat,
+//       defending the rider against the rider's attackers.
+//     - Inside the size gate (small tier) BOTH fight (已定决策「骑手与坐骑都出手」): nothing
+//       of ours touches the rider's combat, and the mount is still pointed at the rider's
+//       attackers.
+//
+// ⚠️ P4-2 (2026-08-30) split the gate here.  Both branches used to key off IsBigMount()
+// (seat mode 2||3), which is a DIFFERENT question - "where does the seat sit", not "how big is
+// the animal" - and the two disagree on real species: the garru is mode 2 yet size 9.5, well
+// inside kCombatSizeMax=15.5, so the old code force-ended its rider's combat mode every frame
+// on an animal the P4-0 ruling calls small.  Never merge the two predicates back together
+// (same warning as at kCombatSizeMax); IsBigMount is still what steers the SEAT, and
+// MountCombatEligible is what steers COMBAT.
 static void CombatAndForceDismountPass()
 {
     if (!riderToMount.empty())
@@ -7151,38 +7212,31 @@ static void CombatAndForceDismountPass()
                 continue;
             }
 
-            bool neckMount = false;
+            // No seat entry means we know nothing about this mount, so riderFights stays
+            // false = default-deny, the same direction MountCombatEligible takes on a
+            // failed size read.  bigMount is diagnostic only from here on.
+            bool bigMount    = false;
+            bool riderFights = false;
             boost::unordered_map<Character*, SeatInfo>::iterator sit = mountSeat.find(mount);
-            if (sit != mountSeat.end() && IsBigMount(sit->second))
-                neckMount = true;
-
-            // Read the combat state BEFORE the neck branch below suppresses it, or the probe
-            // would only ever see our own endCombatMode().
-            if (debugContinuous && gCmbBudget > 0)
-                CombatProbe(rider, mount, neckMount);
-
-            if (neckMount)
+            if (sit != mountSeat.end())
             {
-                // rider stays passive - never swings its tiny weapon from the back
+                bigMount    = IsBigMount(sit->second);
+                riderFights = MountCombatEligible(mount, sit->second);
+            }
+
+            // Read the combat state BEFORE the suppression below runs, or the probe would
+            // only ever see our own endCombatMode().  neck= keeps its original meaning
+            // (seat mode 2||3) so old and new logs stay comparable.
+            if (debugContinuous && gCmbBudget > 0)
+                CombatProbe(rider, mount, bigMount);
+
+            if (!riderFights)
+            {
+                // big tier: rider stays passive - never swings its tiny weapon from up there
                 if (rider->isInCombatMode(true, true) || rider->getAttackTarget().getCharacter())
                     rider->endCombatMode();
                 if (rider->getMovement())
                     rider->getMovement()->halt();
-
-                // the mount defends the rider with vanilla animal combat
-                lektor<hand> attackers;
-                rider->getAllAttackers(attackers);
-                if (attackers.size())
-                {
-                    Character* current = mount->getAttackTarget().getCharacter();
-                    for (lektor<hand>::iterator ait = attackers.begin(); ait != attackers.end(); ++ait)
-                    {
-                        Character* attacker = ait->getCharacter();
-                        if (!attacker) continue;
-                        if (current != attacker)
-                            mount->attackTarget(attacker);
-                    }
-                }
             }
             else if (debugContinuous)
             {
@@ -7195,6 +7249,24 @@ static void CombatAndForceDismountPass()
                 // the engine's own combat bookkeeping about it, then walk the lever ladder.
                 if (gAtkTries > 0 || gAtkReads > 0)
                     RiderCombatLever(rider, mount);
+            }
+
+            // The mount defends its rider in BOTH tiers (P4-2).  On the big tier this is the
+            // only combat happening; on the small tier it is the mount's half of 「双方都出手」.
+            // Only ever re-issued when the target actually differs, so a fight the player
+            // ordered themselves is not cancelled and re-ordered every frame.
+            lektor<hand> attackers;
+            rider->getAllAttackers(attackers);
+            if (attackers.size())
+            {
+                Character* current = mount->getAttackTarget().getCharacter();
+                for (lektor<hand>::iterator ait = attackers.begin(); ait != attackers.end(); ++ait)
+                {
+                    Character* attacker = ait->getCharacter();
+                    if (!attacker) continue;
+                    if (current != attacker)
+                        mount->attackTarget(attacker);
+                }
             }
             ++it;
         }
