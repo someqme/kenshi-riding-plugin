@@ -437,6 +437,9 @@ CLAUDE.md 只留指针，需要 hook 新函数 / 直调新方法时查本节。
 | `AnimationClass::runCombatAnimation(tech, w, "")` | `0x5B6E80` | public，**不用 shim** |
 | `AnimationClass::endCombatAnimation` | `0x5B34E0` | public；`Dismount()` 里无条件调 |
 | `CombatClass::go(float)` | `0x60C4D0` | **不需要**，见 17.4 |
+| `CharacterHuman::sheatheWeapon`（虚 override）/ `_NV_sheatheWeapon` | `0x5CC0A0` | `CharacterHuman.h:22-23`；**基类 `Character::sheatheWeapon` 是 `0x640D80` / vtable `0x2D0`，是另一个地址** —— P4-3 的收鞘写手候选，⚠️ **未验，见 17.4** |
+| `CharacterHuman::dropWeaponInHands` / `dropWeaponInHandsFake` | `0x5CBFE0` / `0x5C8EE0` | `CharacterHuman.h:49-50`，头里写 protected（shim 要声明成 public，见 17.1 最后一条） |
+| `CharacterHuman::leaveSheathEquipped(section, ypos)` | `0x5D1D30` | `CharacterHuman.h:55`，头里写 protected；「把武器留在鞘里」那一路 |
 | ⛔ `CombatClass::calculateTargetsInAttackZone` | `0x608020` | **会 AV，永远不要调**，见 17.5 |
 - **两个虚表槽**（`Character` 自己的 vtable，按槽位偏移手取函数指针、不进 shim）：`drawWeapon(Item*, const std::string&)` = **`0x3D8`**（人类实现体 `CharacterHuman` @`0x5DB800`），`getThePreferredWeapon()` = **`0x3C8`**（⚠️ 被骑状态下读 NULL，见 17.4）。
 - **`Weapon*` 传给 `drawWeapon` 前要 `reinterpret_cast` 成 `Item*`**（理由见 17.1 最后一条）。
@@ -464,6 +467,10 @@ CLAUDE.md 只留指针，需要 hook 新函数 / 直调新方法时查本节。
 - **骑手手里没有武器**：`wpn=0`（4/4，`getCurrentWeapon()` 是**已拔出**测试）、`aCW=5`（＝`SKILL_UNARMED`）而敌人 `eWpn=1`。⇒ P4-1d 的第 0 级是 `drawWeapon`。⚠️ **取「拔哪把」的来源后来被改过一次**：`getThePreferredWeapon()`（vtable `0x3C8`）**在被骑状态下读 NULL**（上马那一刻武器已收到背上），所以主体改成 `Inventory::getPrimaryWeapon()` → 退 `getSecondaryWeapon()` —— 它们问的是**装备槽**，拔没拔都答得出。`Inventory.h` **能干净 include**（邻居是 `Enums.h`/`util/lektor.h`/`Item.h`，都在 `kenshi/` 里），**不需要 shim**。
 - **`drawWeapon` 不被「被骑」拒绝**（P4-1e-2，2026-08-30：**12/12 `post=1`**）⇒ 「骑着拔不出刀」不是权限问题，而是**约 14 帧之后有人把它收回背上**，且 `cma=1` 全程为 1 ⇒ **那个第二写手绑的是「被骑/被携」状态、不是战斗状态**（第一次收鞘可以用「战斗结束自动收」解释，重复收不行）。P4-3 的第一步就是给这个写手点名。⚠️ **别先写「每帧重新拔」**：那正是 HISTORY §B 那三轮伺服的形状（对每帧覆写做写入端补偿）。现有探针已按这个纪律写好——`drawWeapon` 门控在 `getCurrentWeapon()==NULL`、限 `kDrawTryBudget=12` 次、间隔 `kDrawTryGap=10` 帧，**计数器本身就是用来判「一次性状态转换 vs 每帧覆写」的**。
 - ⚠️ **「骑着看不到别的动作」不是武器侧的证据**：`kRidePose` 带 `wholeBodyAllLayer` 且 `PoseLayerPin` 把它钉在 1.0，P2-1b-1 实测这会把**任何**其他 clip 压在 `w=0.000`。⇒ **看不见是设计使然**，判读武器/攻击时必须从 `wpn=`/`post=`/读回值上判，不能从「屏幕上有没有动作」上判。
+- **收鞘 API 清单（2026-08-30 纯头文件检索，给 P4-3 第一步用；⚠️ 全部未验，一个都还没被调过或 hook 过）**：`CharacterHuman::sheatheWeapon()`@`0x5CC0A0`（**带 `_NV_` 桩** ⇒ 想**主动**收鞘可以直调，与 `_NV_ragdollModeUT` 同一机制）、`dropWeaponInHands`@`0x5CBFE0`、`dropWeaponInHandsFake`@`0x5C8EE0`、`leaveSheathEquipped`@`0x5D1D30`，配 17.3 的 `weaponInHands`(0x6D8) / `weaponInHandsSheathLocation`(0x6E0)。
+  - **它能答的问题只有一个**：hook `sheatheWeapon` 打调用方返回地址 ⇒ **给那第二个写手点名**（P4-3 第一道门）。⚠️ **两条前提都还没验**：①**头里的 RVA 不可靠**（§13 / §0：carry 与骨骼系是系统性错的）—— 直调不受影响（导出桩解析），但**hook 必须先把 `GetRealAddress(0x5CC0A0)` 那里的序言看一眼**；②**`KenshiLib::AddHook` 无跳板**，只搬 5 字节不校验指令边界 ⇒ 序言必须是纯 `push`/`sub` 那种（§13），**纯 push 序列被跳过同样栈崩**。⇒ **在看过序言之前，别把它当成「可以 hook 的入口」写进任何计划。**
+  - ⚠️ **也不许拿它当修法**：主动 `sheatheWeapon` 是收鞘、不是拔刀；而「每帧重新 `drawWeapon`」正是上一条禁的那个形状（HISTORY §B 的写入端补偿）。**这一条的用途止于「点名」。**
+  - ⚠️ **别把基类那个当成同一个函数**：`Character::sheatheWeapon()`@`0x640D80`（vtable `0x2D0`，`Character.h:354`）与人类 override `0x5CC0A0` 是**两个地址**；hook 错那个 ＝ 骑手这条路上一次都不触发，看起来像「没有第二个写手」。（同样的坑在 `_NV_ragdollModeUT` 上已经踩过一次，见 §12。）
 - **`ch=0`（`chooseAttack` 43/43 不给招式）已从谜团降级为后果**：无武器角色没有武器招式可挑。⇒ 修的顺序是**先把武器放回手里**，再回来问战斗层。
 - **`weaponReach()` 是唯一与距离无关的那个事实**：P4-1c 的四次读发生在 `d=39.92/19.38/15.61/19.27`，所以 `inZ=0` 同样可以用「太远」解释；最终由 P4-1d 的 `reach=10.50` 对 `d=8.32-9.10` 排除距离。⚠️ **`chooseAttack` 的 reach 是入参**，不是它自己去问 —— 所以这条链上 `weaponReach()` 的值必须先对，否则挑出来的招式跟着错。
 - **`chAnim` ＝ `CombatTechniqueData::animation`(0x0) ＝ 人类挥砍 clip 的「记录名」**，正好答掉 P4-3 的前提①（人形表里没有 attack ⇒ 它挂在 per-technique 数据上）。⚠️ **解析只许走 `FindAnimData()`（`allAnims.find()`），永远不许 `getAnimationData()`** —— 后者是 `operator[]` 语义，查不到就往引擎表里插一条永久 NULL（见 §15 与 CLAUDE.md 那条硬约束）。
