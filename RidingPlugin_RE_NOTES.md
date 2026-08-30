@@ -306,7 +306,9 @@ KenshiLib 标 0x5CF810 严重错误（0x5CF810 在另一函数[0x5CF78E..]（身
 
 CLAUDE.md 只留指针，需要 hook 新函数 / 直调新方法时查本节。
 
-- carry：`pickupObject` 0x5CFF90、`getPickedUp` 0x5CED90、**`getDropped(bool ragdollHim, bool hull)` 0x5CC420（被携方放下 handler，下马核心）**、`dropCarriedObject` 0x5CDA60、`_carryMode` 0x5CE1E0、`setCarryMode` 0x51C8D0、`beingCarriedUpdate` 0x5B5980（死副本，勿 hook）；CharMovement `destroy`/`restore` 0x65F6C0/0x661810（pickupObject 对被携方 destroy movement，getDropped 经 restore 复活——rev4/6 根因链）
+⚠️ **本表里的数字全部是 KenshiLib 头文件里的 RVA，不是安装的 exe 里的 RVA**（除了少数标注了「真实」的）。**直调**用不着它们（导出桩解析）；只有**离线看序言判能不能 hook**时才要换算成真实地址 —— 换算与验证走 **§18**（`tools\hook_probe.py 0x<头RVA>`）。
+
+- carry：`pickupObject` 0x5CFF90、`getPickedUp` 0x5CED90、**`getDropped(bool ragdollHim, bool hull)` 0x5CC420（被携方放下 handler，下马核心）**、`dropCarriedObject` 0x5CDA60、`_carryMode` 0x5CE1E0、`setCarryMode` 0x51C8D0、`beingCarriedUpdate` 0x5B5980（⛔ 勿 hook；⚠️ 「死副本」这个说法已存疑，见 §18.5——它其实是 `0x5B5200+0x780` 的精确入口，但**禁令不变**）；CharMovement `destroy`/`restore` 0x65F6C0/0x661810（pickupObject 对被携方 destroy movement，getDropped 经 restore 复活——rev4/6 根因链）
 - ragdoll：`Character::ragdollMode` 0x5CB5E0（**排队**+恢复回调，骑乘勿用）、`CharacterHuman::postRagdollCallback` 0x5CBAB0、`AnimationClass::ragdollModeUT` 0x5B9290（虚，vtable +0x50）/ **`AnimationClassHuman::_NV_ragdollModeUT` 0x5B98D0（人类 override，骑手用这个）**；`Character::isRagdoll` 0x7D01E0、`Character::isDown` 0x28D910（疑为「只出放倒」菜单的门）；`RagdollPart`(Enums.h:1001) `NONE/WHOLE/RIGHT_ARM/LEFT_ARM=4/HEAD=8/RIGHT_LEG=0x10/LEFT_LEG=0x20/CARRY_MODE=0x800/ARMS=6/LEGS=0x30/ALL=0xFFFF8000`
 - **人类骑手要调 override 版、且走 `_NV_` 导出桩**：`AnimationClassHuman` 覆写了 `ragdollModeUT`（0x5B98D0 ≠ 基类 0x5B9290），虚分派语义正确但依赖 KenshiLib 头**复现 vtable 顺序**——而头里 RVA/offset 注释已知不可靠（人类头把该 override 的 vtable offset 写成 0x0）。故 `static_cast<AnimationClassHuman*>(pAnim)->_NV_ragdollModeUT(...)`：导出桩加载时解析真实地址（= `_NV_update` hook 同一机制），单继承 offset 0x0 指针无需调整。人类判定沿用插件既有的 `!isAnimal()`（`AnimationClass::isHuman()` 是纯虚、无 `_NV_` 桩，不可直调）。
 - Character：`_isBeingCarried` 0x3D4、`isCarryingSomething` 0x348、`carryingObject` 0x380、`animation` 0x448、`ai` 0x650；`getAI` 0x268220、`setDestination(Vec3,bool)` 0x5C8E30、`getPosition`(virt) 0x5CDF00、`getRadius` 0x5C7C30（非虚，导出桩直调）
@@ -317,7 +319,8 @@ CLAUDE.md 只留指针，需要 hook 新函数 / 直调新方法时查本节。
 
 ## 13. RE 工具经验（2026-08-27 从 `CLAUDE.md` 迁入）
 
-- **inline hook 崩溃**：hook 引擎只搬 5 字节不校验指令边界。安全目标=纯 push/sub 序言，或补 replay 跳板（KenshiLib::AddHook 无）。纯 push 序列被跳过同样栈崩。
+- **inline hook 崩溃**：hook 引擎只搬 5 字节不校验指令边界。⚠️ **「安全目标＝纯 push/sub 序言」这个说法要按 §18.2 修正**：两个在产 hook 的 5 字节切点**都落在指令中间**，实战容忍；判序言别追求边界对齐，**拿在产 hook 比形状**（KenshiLib::AddHook 无 replay 跳板）。
+- **KenshiLib 头文件 RVA 注释不可靠 —— 现在有了可执行的判定流程，见 §18**：`tools\hook_probe.py` 用 exe 自己的 `.pdata`（77108 条）回答「这个 RVA 到底是不是函数入口」并给出 `SizeOfProlog`；`header RVA + 0x780` 是**启发式**（7/14 命中，另一族要 +0x790，5 个头值落在别的函数里）。⚠️ **但 hook 装不装得上跟这些无关**——7 个 `AddHook` 全走 `GetRealAddress(&Symbol)`，源码里没有字面 RVA。
 - **cdb**：`-y C:\symbols_local -s`；`q` 杀进程、`qd` 才安全分离；`~*e ba` 每线程硬件断点；`bp` 高频函数崩。
 - **半套复刻状态下直调游戏 teardown = UB**；用 KenshiLib 直调完整原生函数才安全。
 - 源文件是 **UTF-8**；MSVC v100 无 `/utf-8`，中文字面量能否匹配游戏运行时字符串需按具体 API 编码验证（菜单 caption 与物种名都用显式 `\xNN` UTF-8 转义字节最稳）。
@@ -437,7 +440,7 @@ CLAUDE.md 只留指针，需要 hook 新函数 / 直调新方法时查本节。
 | `AnimationClass::runCombatAnimation(tech, w, "")` | `0x5B6E80` | public，**不用 shim** |
 | `AnimationClass::endCombatAnimation` | `0x5B34E0` | public；`Dismount()` 里无条件调 |
 | `CombatClass::go(float)` | `0x60C4D0` | **不需要**，见 17.4 |
-| `CharacterHuman::sheatheWeapon`（虚 override）/ `_NV_sheatheWeapon` | `0x5CC0A0` | `CharacterHuman.h:22-23`；**基类 `Character::sheatheWeapon` 是 `0x640D80` / vtable `0x2D0`，是另一个地址** —— P4-3 的收鞘写手候选，⚠️ **未验，见 17.4** |
+| `CharacterHuman::sheatheWeapon`（虚 override）/ `_NV_sheatheWeapon` | 头 `0x5CC0A0` → **真实 `0x5CC820`** | `CharacterHuman.h:22-23`；真实入口经 RTTI 虚表槽 `0x2D0` ＋ `+0x780` ＋ 语义三重确认，`.pdata` 精确入口 `prolog=30`，**序言那道门已过（§18.2）**；**基类 `Character::sheatheWeapon` 头 `0x640D80` → 真实 `0x641510`，是另一个函数** |
 | `CharacterHuman::dropWeaponInHands` / `dropWeaponInHandsFake` | `0x5CBFE0` / `0x5C8EE0` | `CharacterHuman.h:49-50`，头里写 protected（shim 要声明成 public，见 17.1 最后一条） |
 | `CharacterHuman::leaveSheathEquipped(section, ypos)` | `0x5D1D30` | `CharacterHuman.h:55`，头里写 protected；「把武器留在鞘里」那一路 |
 | ⛔ `CombatClass::calculateTargetsInAttackZone` | `0x608020` | **会 AV，永远不要调**，见 17.5 |
@@ -468,7 +471,10 @@ CLAUDE.md 只留指针，需要 hook 新函数 / 直调新方法时查本节。
 - **`drawWeapon` 不被「被骑」拒绝**（P4-1e-2，2026-08-30：**12/12 `post=1`**）⇒ 「骑着拔不出刀」不是权限问题，而是**约 14 帧之后有人把它收回背上**，且 `cma=1` 全程为 1 ⇒ **那个第二写手绑的是「被骑/被携」状态、不是战斗状态**（第一次收鞘可以用「战斗结束自动收」解释，重复收不行）。P4-3 的第一步就是给这个写手点名。⚠️ **别先写「每帧重新拔」**：那正是 HISTORY §B 那三轮伺服的形状（对每帧覆写做写入端补偿）。现有探针已按这个纪律写好——`drawWeapon` 门控在 `getCurrentWeapon()==NULL`、限 `kDrawTryBudget=12` 次、间隔 `kDrawTryGap=10` 帧，**计数器本身就是用来判「一次性状态转换 vs 每帧覆写」的**。
 - ⚠️ **「骑着看不到别的动作」不是武器侧的证据**：`kRidePose` 带 `wholeBodyAllLayer` 且 `PoseLayerPin` 把它钉在 1.0，P2-1b-1 实测这会把**任何**其他 clip 压在 `w=0.000`。⇒ **看不见是设计使然**，判读武器/攻击时必须从 `wpn=`/`post=`/读回值上判，不能从「屏幕上有没有动作」上判。
 - **收鞘 API 清单（2026-08-30 纯头文件检索，给 P4-3 第一步用；⚠️ 全部未验，一个都还没被调过或 hook 过）**：`CharacterHuman::sheatheWeapon()`@`0x5CC0A0`（**带 `_NV_` 桩** ⇒ 想**主动**收鞘可以直调，与 `_NV_ragdollModeUT` 同一机制）、`dropWeaponInHands`@`0x5CBFE0`、`dropWeaponInHandsFake`@`0x5C8EE0`、`leaveSheathEquipped`@`0x5D1D30`，配 17.3 的 `weaponInHands`(0x6D8) / `weaponInHandsSheathLocation`(0x6E0)。
-  - **它能答的问题只有一个**：hook `sheatheWeapon` 打调用方返回地址 ⇒ **给那第二个写手点名**（P4-3 第一道门）。⚠️ **两条前提都还没验**：①**头里的 RVA 不可靠**（§13 / §0：carry 与骨骼系是系统性错的）—— 直调不受影响（导出桩解析），但**hook 必须先把 `GetRealAddress(0x5CC0A0)` 那里的序言看一眼**；②**`KenshiLib::AddHook` 无跳板**，只搬 5 字节不校验指令边界 ⇒ 序言必须是纯 `push`/`sub` 那种（§13），**纯 push 序列被跳过同样栈崩**。⇒ **在看过序言之前，别把它当成「可以 hook 的入口」写进任何计划。**
+  - **它能答的问题只有一个**：hook `sheatheWeapon` 打调用方返回地址 ⇒ **给那第二个写手点名**（P4-3 第一道门）。**两条前提已于 2026-08-30 静态查清（§18）**：
+    - ~~①头里的 RVA 不可靠 ⇒ hook 前先看 `GetRealAddress(0x5CC0A0)` 那里的序言~~ —— **前半句与 hook 无关，我当初写重了**：`startPlugin()` 的 7 个 `AddHook` 全部走 `GetRealAddress(&Symbol)`，源码里没有任何字面 RVA ⇒ 头注释错不错影响不到 hook 装得上装不上。真实风险只有序言那一个。
+    - ②**`AddHook` 无跳板、搬 5 字节不校验指令边界** —— 这条**仍然成立，而且已经查过并通过**：真实入口 **`0x5CC820`**（＝`0x5CC0A0 + 0x780`，RTTI 虚表槽 `0x2D0` 与语义双重确认），是 `.pdata` **精确入口**、`prolog=30`、头字节 `40 53 48 83 EC 60` —— **与在产 hook `AnimationClassHuman::_NV_update`@`0x5C5750`（`40 53 48 83 EC 20`）逐字节同形**，只差 `sub rsp` 的立即数。⚠️ 顺带纠正 §13 那条「安全目标＝纯 push/sub 序言」的读法：**两个在产 hook 的 5 字节都切在指令中间**（`4C 8B DC|57|48 81 EC…` 与 `40 53|48 83 EC 20`）⇒ **mid-instruction 不构成否决**，AddHook 实战容忍它。
+    - ⇒ **序言这道门已开**；还没验的只剩「骑手这条路是不是真的走人类 override」，那要进游戏。
   - ⚠️ **也不许拿它当修法**：主动 `sheatheWeapon` 是收鞘、不是拔刀；而「每帧重新 `drawWeapon`」正是上一条禁的那个形状（HISTORY §B 的写入端补偿）。**这一条的用途止于「点名」。**
   - ⚠️ **别把基类那个当成同一个函数**：`Character::sheatheWeapon()`@`0x640D80`（vtable `0x2D0`，`Character.h:354`）与人类 override `0x5CC0A0` 是**两个地址**；hook 错那个 ＝ 骑手这条路上一次都不触发，看起来像「没有第二个写手」。（同样的坑在 `_NV_ragdollModeUT` 上已经踩过一次，见 §12。）
 - **`ch=0`（`chooseAttack` 43/43 不给招式）已从谜团降级为后果**：无武器角色没有武器招式可挑。⇒ 修的顺序是**先把武器放回手里**，再回来问战斗层。
@@ -486,6 +492,60 @@ CLAUDE.md 只留指针，需要 hook 新函数 / 直调新方法时查本节。
 - ⚠️ **「读到 0」经常有两个解释，要先找到那个与距离无关的字段**：P4-1c 的 `inZ=0` 既可以是「不在攻击区」也可以是「距离太远」，只有 `reach` 是不含距离的。**每加一个新探针字段，先问它会不会被距离/时机解释掉。**
 - **shim 只能直调非虚方法**（§13 那条：虚函数要复现 vtable 布局，空壳做不到）。⇒ 本节两条路各走各的：**非虚的**（`_NV_initCombatMode` 等整张表）直接声明 + 链接器从导出桩解析；**虚的**（`drawWeapon` / `getThePreferredWeapon`）**按槽位偏移手动从 vtable 里取函数指针**（`0x3D8` / `0x3C8`），不进 shim。⚠️ 所以 17.1 那条「`CombatClass*` 横向 cast 成 `CombatClassAI*` 不加偏移」是**必需前提**——我们调的是派生类的函数体本身，不是让引擎替我们派发。
 - **`hand`（`GameObjectHandle`）能进编译树、可以直接用**（`_getAttackTarget()` 返回它，`.getCharacter()` 取回指针）；⚠️ **它取回的指针照样可能悬空**（会话中读档），所以战斗侧拿到的每个 `Character*` 仍要过 `CharacterLooksLive`。
+
+---
+
+## 18. 静态 PE 定址：header RVA → 真实 RVA / `.pdata` 入口判定 / RTTI 取虚表（2026-08-30）
+
+**这一节把 §13「KenshiLib 头文件 RVA 注释不可靠」从一句警告变成可执行的判定流程。** 全部是**纯文件检查**——不进游戏、不构建、不注入，所以任何时候都能跑。工具进仓库：`tools\ke_pe.py`（库）＋ `tools\hook_probe.py`（驱动，`--delta` / `--vslot` / 直接给 RVA）。
+
+**先记住这条**：`startPlugin()` 里 7 个 `AddHook` **全部**传 `KenshiLib::GetRealAddress(&Symbol)`，源码里一个字面 RVA 都没有 ⇒ **头里的 RVA 注释错不错，跟 hook 能不能装上无关**。RVA 只在**离线判断「这个入口能不能 hook」**时才需要（＝看序言），以及做静态语义确认时。
+
+### 18.1 `header RVA + 0x780` = 真实 RVA —— 只对一族符号成立
+`Kenshi_x64.exe`（1.0.65，36718592 B，imagebase `0x140000000`）实测（`hook_probe.py`，14 个符号）：
+- **+0x780 精确命中 `.pdata` 入口 7 个**：`AnimationClass::_NV_update`→`0x5B68C0`、`AnimationClassHuman::_NV_update`→`0x5C5750`、`beingCarriedUpdate`→`0x5B5980`、`AnimationClassHuman::_NV_ragdollModeUT`→`0x5BA050`、`CharacterHuman::sheatheWeapon`→`0x5CC820`、`dropWeaponInHands`→`0x5CC760`、`leaveSheathEquipped`→`0x5D24B0`。
+- **另一族要 +0x790**：`updateAnimationTransforms`→`0x5B15C0`、`Character::sheatheWeapon`→`0x641510`、`getFacingDirection`→`0x2AE320`、`dropWeaponInHandsFake`。**特征很好认**：+0x780 处是 `C2 00 00 CC CC…` 或纯 `CC` 填充 ⇒ 看到这个就往后找 0x10。
+- ⚠️ **5 个符号 +0x780 落在别的函数中部（MID+224 / 944 / 2368 / 720 / 416），真实地址未知**：`GameWorld::_NV_mainLoop_GPUSensitiveStuff`、`PlayerInterface::newPlayerTaskSelectedCharacters`、`ContextMenuGUI::show`、`InputHandler::loadConfig`、`DatapanelGUI::addCustomLine`。**这五个恰好都是生产环境里 hook 得好好的**（走 `GetRealAddress`）⇒ **「delta 对不上」不等于「hook 有问题」**，别去为它们找地址。
+- `--delta` 的投票（±0x4000 全域暴搜）里 `+0x780` 拿 **7/14**，第二名 5/14 ⇒ **它是启发式，不是定律**。**硬规则：候选地址必须自己落在 `.pdata` 的精确入口上**，delta 只用来生成候选。换 exe 版本就重跑 `hook_probe.py --delta` 重新推。
+
+四条独立证据（当初怎么定下 0x780）：①±0x4000 暴搜投票；②RTTI 取 `CharacterHuman` 虚表槽 `0x2D0` → `0x5CC820` = `0x5CC0A0 + 0x780`；③它把 `beingCarriedUpdate` 的头值 `0x5B5200` 映到 `0x5B5980`——**那正是早年靠实测找到的地址**；④语义确认（见 18.3）。
+
+### 18.2 `.pdata` 是唯一权威的「这是不是函数入口」神谕
+exe 的异常目录（data directory #3）里有 **77108 条 `RUNTIME_FUNCTION`**（`begin/end/unwind` 三个 dword）。排序后二分即可回答：**`entry`（精确入口）/ `mid+N`（在别的函数里面 N 字节）/ `leaf`（不在表里——小叶子函数不需要 unwind 数据）/ `padding`（`CC`）**。`UNWIND_INFO` 还白送 **`SizeOfProlog`**、flags（`0x4`=CHAININFO）、frame register。
+- ⚠️ **`leaf` 不等于「地址错了」**，`padding` 才是强信号（往后 0x10 找）。`getFacingDirection`@`0x2AE320` 就是真·leaf（`8B 42 08 …` 一个小 getter，全程直调、从没出问题）。
+- **这套解析器的正确性由 `0x5B5980` 反过来证明**：第一遍扫 15 个头 RVA 全部 MID，唯一报 `ENTRY` 的就是那个**早已实测可用**的地址。
+
+**序言＝hook 的唯一真实风险**（`KenshiLib::AddHook` 搬 5 字节、**无跳板**，§13）。判定手法 ＝ **拿生产环境的正对照比形状**，别去追求「5 字节正好是指令边界」：
+| 目标 | 真实 RVA | prolog | 头 16 字节 | 5 字节切在 |
+|---|---|---|---|---|
+| ✅ `AnimationClass::_NV_update`（在产） | `0x5B68C0` | 56 | `4C 8B DC 57 48 81 EC D0 00 00 00 …` | **指令中间**（边界 3/4/11） |
+| ✅ `AnimationClassHuman::_NV_update`（在产） | `0x5C5750` | 6 | `40 53 48 83 EC 20 48 8B D9 …` | **指令中间**（边界 2/6） |
+| `CharacterHuman::sheatheWeapon` | `0x5CC820` | 30 | `40 53 48 83 EC 60 48 C7 44 24 20 …` | 同上（边界 2/6） |
+⇒ **两个在产 hook 都是 mid-instruction 切的，所以 mid-instruction 本身不构成否决**。`sheatheWeapon` 与其中一个**逐字节同形**（只差 `sub rsp` 的立即数）⇒ **§17.4 那条「hook 前先看序言」的门已经过了**（见 18.4）。
+
+### 18.3 虚函数：RTTI → COL → 虚表 → ILT 跳板
+`hook_probe.py --vslot <Class> <slot>`。手法：找 `.?AV<Class>@@` 字符串 → TypeDescriptor = 串 RVA − 16 → 在 `.rdata` 找 `_RTTICompleteObjectLocator`（`sig==1` 且 `pTypeDescriptor==td` 且 `pSelf==col`）→ 找**指向该 COL 的 8 字节指针** → **虚表 = 该位置 + 8**。实测：`CharacterHuman` 虚表 `0x16F2848`（COL `0x183E498`，thisOffset=0，~134 槽）、`Character` 虚表 `0x16F9EB8`。
+- ⚠️ **槽里装的是 /INCREMENTAL 链接跳板**（`E9 rel32`），必须跟一跳：`CharacterHuman` 槽 `0x2D0` → `0x302B5` `E9 66 C5 59 00` → **`0x5CC820`**。
+- ⚠️ 同一次走查里 `Character` 槽 `0x2D0` 解出 `0x641500`＝`C2 00 00`＋填充，真入口在 `0x641510`（＝ 18.1 的 +0x790 那一族）。**没有深究，也不需要**——基类那个地址在本项目里只用来提醒「别把它当成人类 override」（§17.4 末条）。
+
+**语义确认（不看反编译也能给函数「验明正身」）**：扫函数体里的 `lea rip-rel` → 落在 `.rdata`/`.data` 的可打印串，再数成员位移常量。实测 `0x5CC820` 体内两次读 `[this+0x6D8]`（`weaponInHands`）、两次读 `[this+0x6E0]`（`weaponInHandsSheathLocation`）、引用串 `"hands"`；`leaveSheathEquipped`@`0x5D24B0` 引用 `"hip"/"back"/"back2"/"sheath"`；`dropWeaponInHands`@`0x5CC760` 只有 28 字节、读一次 `[this+0x6D8]`。⇒ 三个地址与 §17.3 那两个裸偏移**互相印证**。
+
+### 18.4 `KenshiLib::GetRealAddress`@`0x2510` 已完全解码 —— 但它拿不到任何地址
+（走过一次的死路，留档免得再走。）`KenshiLib.dll` 里 `GetRealAddress` 把传进来的桩指针与窗口 **[0x156D6, 0x2344C]** 比较，`sub` 后除以 **stride 6**（`.rdata` `0x256E0` 那个 dword），再 `mov rax,[rcx+rax*8+0xD2000]`（rcx＝image base）读一张 **8 字节槽数组**：
+```
+0x255D lea rax,[rip+0x13172] -> 0x156D6      ; 桩窗口起点
+0x2564 lea rcx,[rip+0x1DEE1] -> 0x2344C      ; 桩窗口终点
+0x2578 mov ecx,[rip+0x23162] -> 0x256E0 = 6  ; stride
+0x258D mov rax,[rcx+rax*8+0xD2000]           ; 槽数组（.data）
+```
+**共 9449 个桩**（窗口跨度 `0xDD76` 能被 6 整除，三个探针符号余数都是 0）。⚠️ **数组在文件里全 0，且 `.text` 里对 `0xD2000` 只有这一处引用（读）** ⇒ 它由 RE_Kenshi 加载时填，**静态文件里不存在任何已烘进去的真实地址**。这条路作废，改用 exe 自己的 `.pdata`（18.2），后者反而更强——它还顺带给序言长度。
+
+### 18.5 关于 `beingCarriedUpdate` 的两条**存疑**记录（⛔ 禁 hook 不变）
+新证据与旧记录对不上，**但一个字都不构成解禁**（那条禁令来自实测崩溃，仍然有效；§17.5 / CLAUDE.md）：
+- 旧记录：「RVA `0x5B5200` 落在无关构造函数中部；真实 `0x5B5980` 是 /LTCG 死副本」。**新证据**：`0x5B5980` = `0x5B5200 + 0x780`，与 7 个符号同一个 delta，且是 `.pdata` 精确入口（prolog=51）⇒ 它更像**就是那个函数本体**，而 `0x5B5200` 只是没加 delta 的头值。
+- 旧记录：「序言 5 个 1 字节 push → 搬 5 字节致栈不平衡」。**新证据**：`0x5B5980` 的字节是 `40 55 | 53 | 56 | 57 | 41 54 …`（`push rbp` 是 2 字节，因为带 REX）⇒ **5 字节处正好是指令边界**，这个解释与字节对不上。真正的崩因未知。
+⇒ **处置：当成「原因待查的实测禁令」**。要重新审它必须有新的实测，不能靠这两条静态观察。
+
 
 
 

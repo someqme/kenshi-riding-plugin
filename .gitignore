@@ -25,6 +25,8 @@ snapshots/_superseded/
 *.pdb
 *.ilk
 *.exp
+__pycache__/
+*.pyc
 
 # OS cruft
 Thumbs.db
