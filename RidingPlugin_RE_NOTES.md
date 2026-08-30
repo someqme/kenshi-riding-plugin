@@ -635,3 +635,65 @@ callers.py --ptr 0x302B5 0x4B8D0        ->  各 1 个，都在 .rdata：0x16F2B1
 3. **`beingCarriedUpdate`@`0x5B5980` 的 6 个直调被调方里 3 个已认出是库函数**：`0x69D10` ＝ `std::string::assign`（`sheatheWeapon`/`dropWeaponInHands` 都在用）、`0xED64F8`/`0xED6C80` ＝ CRT（`sheatheWeapon` 收尾也在用）。真正属于引擎的只有 `0x51D510` / `0x5B1A30` / `0x5B26E0` 三个。⇒ §18.6 记的「深度 3 前向可达集与写手集交集为空」**比原来说的更弱**：那棵子树几乎全是库代码，有意思的边都走虚表、静态看不见。
 
 ⚠️ **`--vcall 0x2D0` 定不了案，而且比 §18.6 估的更糟：实测 38 个站点、33 个不同宿主函数**。静态没办法给接收者定类型，所以「谁在 `drawWeapon` 之后 ~14 帧调收刀」仍然只能进游戏（探针/断点）。**本节结的是「这条流水线长什么样、候选集有多大」，不是「第二个写手已点名」**；用途仍止于点名，⚠️ **不许每帧重新拔刀**（HISTORY §B 写入端补偿的老坑）。
+
+## 19. 离线读 FCS 数据文件 + Ogre `.skeleton`（2026-08-31，全程没进游戏）
+
+**为什么**：TASK.md 把 P4-3 前提②「挥砍 clip 的层与 `whole` 位」标成必须进游戏。可这两个字段是 **FCS `ANIMATION`(24) 记录的字段**，记录就存在 `data\*.base` / `*.mod` 里 ⇒ **静态可读**。工具 `tools\gamedata.py`（数据文件）与 `tools\skelanims.py`（骨架资产），两个都离线、都进仓库。
+
+### 19.1 容器格式 —— **一种格式，四个文件**（没有「v16 记录格式 vs v17 记录格式」这回事）
+```
+header  [u32 fileVer][...][str depFiles]  BE 67 4C 00  [u32 recordCount]  <record>*
+record  [u32 size][u32 itemType][u32 id][str name][str stringID][u32 flag] <body>
+<body>  [u32 n](key,u8)* bools   [u32 n](key,f32)* floats  [u32 n](key,i32)* ints
+        [u32 n](key,3f)* vec3    [u32 n](key,4f)*  vec4    [u32 n](key,str)* strings
+        [u32 n](key,str)* filenames
+        [u32 nRefCat]   ([str category][u32 n]([str targetSID][i32 v0][i32 v1][i32 v2])*)*
+        [u32 nInstance] ([str name][str targetSID][3f pos][4f rot][u32 0])*
+str = [u32 len][bytes]（utf-8）
+```
+- `BE 67 4C 00` 是**锚**：`recordCount` 紧跟其后，记录 0 再紧跟其后。
+- ⚠️ **`size` 只有 `rebirth.mod` 填了**（含自身那 4 字节），另三个文件恒 0 ⇒ **走不了 `size` 步进**。能走的是 `<body>` 自定界：`off = bodyEnd` 对四个文件的每一条记录都正好落在下一条的 `size` 字段上。`rebirth.mod` 8571/8571 条 `bodyEnd == p + size`，等于白送一次交叉验证。
+- **refcat 在 instance 前面，尾部没有多余的 u32**。
+- `flag` 的**低半字节**才是 add/modify（0 或 2 ＝ 本文件引入这个 stringID，1 或 3 ＝ 修改一条已有的），高位是**按文件分族**的：`.base`/`Newwworld` 带 `0x80000000`，`rebirth`/`Dialogue` 是 `0x10/0x11/0x13` 外加 `0x40/0x60/0x70/0x80/0x90` 几族 ⇒ 拿整个 u32 去比会全军覆没。⚠️ **就算只看半字节它也不权威**：`rebirth.mod` 有 1375 条半字节 1/3 的记录，其 stringID 在更早的文件里根本不存在；`Dialogue.mod` 有 1005 条半字节 0 的记录反而确实盖着别人。⇒ **合并只能靠「这个 stringID 我见过没有」，绝不能靠 flag**（`union()` 就是这么做的）。
+- ⚠️ **删除不是一个 flag 值**，是 body 里的 bool `REMOVED = 1`（104 rebirth / 26 Newwworld / 88 Dialogue）。
+- 记录 `name` **可以是空的**（四个文件里 3 条）；`stringID` **不一定是 `<数字>-<文件名>`**（`PLAYER_WEAPONS` 这种手写的合法）⇒ 校验只能校到「可打印」，别写更紧的正则。
+- 自检（`python tools\gamedata.py --verify`，改过格式代码就跑它）：四个文件全部 **header 数目相符、错 0、`size` 不符 0、终点正好落在 EOF**（9399 / 8571 / 2511 / 39077 条）。
+
+### 19.2 两条必须的格式事实 —— 缺任一条，读出来的表就是错的
+1. **覆盖记录的 body 是「部分」的**：`walk upper` 在 `gamedata.base` 里 61 个字段，在 `rebirth.mod` 的覆盖里只有 **4** 个。所以 `out[sid] = r` 会把没被重申的字段全部丢掉 —— 实测就是这么让 **124 条 `ANIMATION` 里 68 条完全没有 `layer`** 的。⇒ **必须按 key 合并**（`_merge()`：值/文件名/refcat 三块分别 update，refcat 以「类别」为粒度整表替换）。
+2. **引擎跳过带 `disabled = 1` 的记录**：union 里 type-24 共 **124** 条，其中 **7** 条 `disabled`，扣掉这 7 条 ＝ **117 ＝ UPPER 79 / OVERLAY 21 / LOWER 17、`whole` 49**，与 §15 的游戏内 `allAnims` **逐个数字相同**。⇒ 这条既是必要的过滤，也是**整套离线解码可信的判据**：一个纯静态解析器精确复现了一次运行时枚举。那 7 条留档：`guard katana high` / `guard 1` / `guard 3`（upper）、`sidestep--`（lower）、`stand 1 sword noarms`（all）、`MA idle2 lower skill`（upper）、`aimwalk`（upper）。
+- `layer` 是**字符串**：`all` / `upper` / `overlay` / `lower` / `tail`，其中 **`all` ⇔ 运行时 `lay=UPPER` ＋ `whole`**（拿 §15 的实测表对过）。`category` 是 int：0 NORMAL / 3 CARRIED / 4 SWIM。
+- 载入顺序 ＝ `gamedata.base` → `rebirth.mod` → `Newwworld.mod` → `Dialogue.mod`，后者按 stringID 赢。⚠️ **单文件扫描既是下限、又会读错**：`gamedata.base` 只有 124 条 type-24 里的 75 条（117 条可达记录里的 69 条），`rebirth.mod` 另加 51 条**并且覆盖了 base 那 75 条里的 71 条** —— 和 `race_id.py` 同一个坑。
+
+### 19.3 前提②的答案 ＝ **负面结论：那两个字段对 43 of 44 根本不存在**
+`COMBAT TECHNIQUE`(17) 与动画的连接 ＝ 它的**字符串字段 `anim name`**（没有 reference category，技能唯一的 refcat 是 `events` ＝ 音效）。两条实测（`python tools\gamedata.py --tech` ＋ `python tools\skelanims.py --tech`）：
+- **44 条技能里 43 条的 `anim name` 查不到任何记录** —— 既不是 `ANIMATION`(24) 的记录名、也不是 `ANIMAL ANIM`(5) 的记录名、也不是任何别的记录的 `anim name` 字段值（三种方式各查过一遍才认的）。那些名字是**裸 clip 名**：`chop left` / `blk right` / `attack1` / `dodgeback` / `ma chudan`…
+- **同一批 clip 全部真实存在，作为 `.skeleton` 里的裸轨道**：44 条技能指向 **30 个不同的 clip 名**，**30/30 都找得到轨道**。27 个是人形 clip（`male_skeleton` 与 `female_skeleton` 各一份），另 3 个是动物用的 `attack1`/`attack2`/`attack3`（分别出现在 23 / 13 / 3 个动物骨架里）。`male_skeleton.skeleton` 自己有 **30 根骨、174 条轨道**（骨数与 §16 那份 30 根清单相符 ＝ 解析器对得上）。
+- ⇒ **`layer` 与 `wholeBodyAllLayer` 是 RECORD 字段，不是轨道属性**。clip 有轨道而没有记录 ⇒ **这两个字段在 `data\` 里压根没被作者填过**，不是「我没找到」。**前提②在离线侧有答案，答案是「无从可读」。**
+- **唯一的例外**：`Downward cut static` → `chop down static` **有**记录 ＝ **UPPER、不带 `whole`**（`loop, is action, uses right arm, uses left arm, delete tail, big stumble`）。一条孤例，别拿它推广到另外 43 条。
+
+### 19.4 对 P4-3 的直接后果（TASK.md 步骤 3 按原样走不通）
+TASK.md 写的是「让 `chooseAttack` 交出技能 → 读 `tech->animation`(0x0) 的**记录名** → 用 `FindAnimData()` 查它的层与 `whole` 位」。⚠️ **那个字段里装的是 clip 名，对 43/44 而言 `allAnims.find()` 必然 miss** ⇒ 这一步查不出层、也查不出 `whole`，**因为没有东西可查**。
+- ✅ **`FindAnimData()` 这道守卫必须留着，而且现在更要紧**：miss 时返回 NULL 是**正确行为**；同一个名字直接送进 `getAnimationData()`（`operator[]` 语义）就会往引擎的 `allAnims` 里永久插一条空指针（§15 / CLAUDE.md 硬约束）。**攻击 clip 名是「一定 miss」的那一类，绝不许绕过它。**
+- **推论（与 §15 的游戏内结果一致）**：人形表里 `attacks=0`、`ANIM_ATTACKS`/`ANIM_COMBAT` 各 0 条，而 `guard 1h` 那类**架势**在表里 —— 现在知道为什么了：**架势有记录，挥砍没有**。攻击的播放路径不经过记录表，所以它也不可能携带 `wholeBodyAllLayer`。
+- ⚠️ **剩下的是纯运行时问题，静态答不了、别在文档里假装答了**：①一条**没有记录**的 clip 被请求时落在哪个层、走的是哪个 API；②我们钉着 `w=1.0` 的 `kRidePose`（UPPER＋`whole`）会不会像 P2-1b-1 那样把它压在 `w=0.000`。⇒ P4-3 的路线判断**不变**：手控骨 + blend mask 仍是唯一已证可用的杠杆（clip 压不动手控骨）。
+
+### 19.5 Ogre `.skeleton`（`[Serializer_v1.80]`）—— 长度字段**不可信**
+```
+[u16 0x1000][str version]                  str 以 '\n' 结尾、没有长度字段
+chunk = [u16 id][u32 recordedLength] <payload>
+0x1010 BLENDMODE  [u16]
+0x2000 BONE       [str name][u16 handle][3f pos][4f rot] (+[3f scale] 仅当非单位)
+0x3000 BONE_PARENT[u16 handle][u16 parent]
+0x4000 ANIMATION  [str name][f32 秒]  然后嵌套 0x4010 / 0x4100 / 0x4110
+0x4100 TRACK      [u16 boneHandle]    然后嵌套 0x4110
+0x4110 KEYFRAME   [f32 t][4f rot][3f xlat] (+[3f scale])
+0x5000 ANIMATION_LINK [str skeletonName][f32 scale]
+```
+⚠️ **`o += recordedLength` 的平铺步进会当场脱轨**：Ogre 自己的 `calcBoneSize()` **漏算了名字字符串**，所以每条 BONE 恰好少报 `nameLen+1`（`male_skeleton` 骨 0 报 36、实占 42）。实测第一版就是这样只读出 1 根骨、0 条动画，然后在骨名中间把 `id=0x3304 len=1060439305` 当成 chunk 头。⇒ **按上面的布局结构化步进**，长度只在可信处使用：BONE 的 `36 vs 48` 用来判断有没有那个可选的 scale 三元组，KEYFRAME（计算式里没有字符串）可以直接按长度跳。
+
+### 19.6 边界与用法
+⚠️ **本节全部是「授权侧 / 资产侧」静态事实，不是运行时状态。** P1 早就证明两者会分叉（`crawl idle down` 表里写 `spd 0/0/0 play=0.00`，活体上 `t01` 每帧照推）。静态可以用来**挑候选**、读**静态属性**（层、flags、技能指名哪条 clip、clip 存不存在、时长）；**绝不能用来预测运行时权重、时序或混合结果**。
+- `python tools\gamedata.py` ＝ itemType 直方图 ／ `--verify` 自检 ／ `--anim [子串]` ANIMATION 表 ／ `--tech` 技能→记录 ／ `--rec <子串>` 整条记录 ／ `--refs <子串>` 引用类别 ／ `--type <N>`。
+- `python tools\skelanims.py` ＝ 人形骨架的骨数＋全部轨道 ／ `--find <子串>` 过滤 ／ `--skel <文件名子串>` 换骨架 ／ `--list` 全部 `.skeleton` 的轨道数 ／ `--tech` 上面那张交叉核对表（它 `import gamedata`）。
+- 附带结论：type-112 `base animations`（`1533847-gamedata.base`）**不靠引用枚举任何东西**（0 个 refcat，只有两个 `.skeleton` 文件名字段）；所有名为 `animations` 的 refcat 都挂在 **itemType 76** 记录上。
