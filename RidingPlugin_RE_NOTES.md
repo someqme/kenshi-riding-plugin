@@ -592,3 +592,46 @@ callers.py --ptr 0x302B5 0x4B8D0        ->  各 1 个，都在 .rdata：0x16F2B1
 
 
 
+
+### 18.7 成员偏移扫描：收刀/拔刀那条流水线的静态全图（2026-08-30）
+
+工具 `callers.py --field <成员偏移>`（谁碰这个成员）与 `--calls <rva> [depth]`（这个函数直调了谁）。**手法**：mod=10 disp32 + 白名单 opcode，区分读/写。⚠️ **成员偏移不是类专属的** —— `0x6D8` 的 54 个站点里有一批落在 7000-24000 字节的巨型函数中，那些几乎肯定是别的类恰好也有个 `0x6D8` 字段。⚠️ **`reg=='sib'` 且 modrm 后紧跟 `24` ＝ `[rsp+disp]` 栈帧，不是成员**（54 → 36 个真站点）。**校准**：先拿 §18.3 已记的三处事实对表（`0x5CC820` 读+写 `0x6D8`、`dropWeaponInHands`@`0x5CC760` 单次读、`leaveSheathEquipped`@`0x5D24B0` 三次读），三处全部逐一命中，扫描器可信。
+
+**结构事实（新，全部静态可复现）**
+- `Character` 成员：`0x6D0` `naturalWeapon`（`Sword*`，KenshiLib 头文件里有名字）、`0x6D8` `weaponInHands`、**`0x6E0` 是一个 `std::string`**（MSVC SSO 布局：buf/ptr@+0、size@+0x10、cap@+0x18；两个写手清它都是「size=0 ＋ `*buf=0`」的手法，不是指针赋值）、`0x6F0` 一个指针 ＝ 重挂那一步的门。
+- **`Character` 虚表 `+0x198` → `0x5DBD80`（495 B，两个类同一个实现、人类没 override）＝「按位置串把武器挂回去」那一手**：串字面量 `"back"` / `"back2"` / `"backpack_attach"`，随后调 `0x535D50`（Appearance 挂载族；头文件把 `Appearance::attachItem(Item*, const std::string&)` 记成 `0x5355D0`，同一邻域）。**它自己一次都不碰 `0x6D8`/`0x6E0`**，位置串是参数传进来的。
+- `+0x1A8` → 人类 `0x5CA740`（264 B）/ 基类 `0xD2040`；`+0x2D0` → 人类 `0x5CC820` / 基类 `0x641500`（`ret 0`，§18.6）。
+
+**`CharacterHuman::sheatheWeapon`@`0x5CC820` 全解码**（274 B，`this`=rbx）：
+1. 栈上建一个 `std::string("hands")`（`0x69D10` ＝ `std::string::assign`）
+2. `animation(+0x448)->appearance(+0xE8)->detachItem(&"hands")`（`0x52E0F0`）—— **从「手」这个挂点上摘下来**
+3. `animation->isHuman()`（虚表 `+0x20`，头文件确认）→ `0x51C9C0(human,0,0,0)`
+4. `stats(+0x450)` 重算（`0x897F30`）
+5. **`if (weaponInHands && weaponInHands != naturalWeapon && [this+0x6F0]) this->virt_0x198(&weaponInHandsSheathLocation)`** ← 真正「挂回背上」的那一步
+6. `weaponInHands = NULL`；`weaponInHandsSheathLocation = ""`
+
+⇒ **收刀不是一个动作，是三件事**：摘 `hands` 挂点 ＋ 按串挂回鞍位 ＋ 清两个字段；且对 `naturalWeapon`（拳/爪）直接跳过第 5 步。**对 P4-3 步骤② 的直接收益：挂载不用猜 `ATTACH_WEAPON` 那类枚举 —— 挂点是字符串**（`"hands"` 在手上、`"back"`/`"back2"` 在背上），**入口是 `Character` 虚表 `+0x198`**。
+
+**`dropWeaponInHands`@`0x5CC760`（含尾巴 chunk `0x5CC77C`，合计 168 B）同族但挂点不同**：`if(!weaponInHands) return;` → `this->virt_0x1A8(weaponInHands)` → `appearance->detachItem(&weaponInHandsSheathLocation)`（⚠️ 摘的是**鞍位**不是 `hands`）→ 位置串赋空（`lea rdx,<空串 0x167C3C0>` + `0x69D10`）→ stats 重算 → `weaponInHands=NULL` → `isHuman()` → `0x51C9C0`。
+
+**候选集（P4-3 步骤①「第二个收刀写手」）** —— `0x6D8` 的 36 个非栈站点里 12 个是写，落在 Character 邻域（`0x5C0000`-`0x5E0000`）的小函数只有这几条：
+
+| 函数 | 长度 | 对 `0x6D8` | 对 `0x6E0` | 直调者 |
+|---|---|---|---|---|
+| `0x5C8150` | 78 | 写（byte imm） | 写 | 只有 `0x581770` |
+| `0x5CBA10` | 66 | 写（存寄存器 ＝ **setter**） | 写 | 只有 `0x581770` |
+| `0x5CBA60` | 83 | — | 读+写 | |
+| `0x5CC760`(+`0x5CC77C`) | 168 | 读 + 写 NULL | 两次 lea | 已知 `dropWeaponInHands` |
+| `0x5CC820` | 274 | 读 + 写 NULL | lea | 已知 `sheatheWeapon`（纯虚调，§18.6） |
+| `0x5D0BFC` | 278 | — | 写 | |
+| `0x5DC560` | 233 | 读 + 写 imm | — | |
+| `0x5E6AB0` | 113 | — | 读+写 | |
+
+剩下的写手全在 7000-24000 B 的巨型函数里（`0x77090` / `0x3CBFA0` / `0x816D90` / `0x841A50` / `0x8AB950` / `0xE876F0`），偏移撞车的可能性远大于「真是 Character 方法」。
+
+**三条负面结果（记下来省重复劳动）**
+1. **`0x5CC77C` 不是函数**：它是 `0x5CC760` 的第二条 `.pdata` 记录（0 直调者 ＋ 0 指针引用，且 `0x5CC760` 的代码直接流进去）。⇒ `--field` 打的 `in 0x…` 是 **chunk**，候选集必须按**逻辑函数**去重。
+2. **KenshiLib 头文件给 `Character::sheatheWeapon` 的 `0x640D80` 同样是错的**：那个地址落在指令中部、不在 `.pdata`、0 直调者、0 指针引用；而且**整个 `0x630000`-`0x650000` 区间没有任何一处访问 `0x6D8`**。⇒ 这是「基类实现就是 `0x641500` 那个 `ret 0`」的第三条独立证据（前两条见 §18.6）。
+3. **`beingCarriedUpdate`@`0x5B5980` 的 6 个直调被调方里 3 个已认出是库函数**：`0x69D10` ＝ `std::string::assign`（`sheatheWeapon`/`dropWeaponInHands` 都在用）、`0xED64F8`/`0xED6C80` ＝ CRT（`sheatheWeapon` 收尾也在用）。真正属于引擎的只有 `0x51D510` / `0x5B1A30` / `0x5B26E0` 三个。⇒ §18.6 记的「深度 3 前向可达集与写手集交集为空」**比原来说的更弱**：那棵子树几乎全是库代码，有意思的边都走虚表、静态看不见。
+
+⚠️ **`--vcall 0x2D0` 定不了案，而且比 §18.6 估的更糟：实测 38 个站点、33 个不同宿主函数**。静态没办法给接收者定类型，所以「谁在 `drawWeapon` 之后 ~14 帧调收刀」仍然只能进游戏（探针/断点）。**本节结的是「这条流水线长什么样、候选集有多大」，不是「第二个写手已点名」**；用途仍止于点名，⚠️ **不许每帧重新拔刀**（HISTORY §B 写入端补偿的老坑）。
