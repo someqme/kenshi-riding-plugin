@@ -440,7 +440,7 @@ CLAUDE.md 只留指针，需要 hook 新函数 / 直调新方法时查本节。
 | `AnimationClass::runCombatAnimation(tech, w, "")` | `0x5B6E80` | public，**不用 shim** |
 | `AnimationClass::endCombatAnimation` | `0x5B34E0` | public；`Dismount()` 里无条件调 |
 | `CombatClass::go(float)` | `0x60C4D0` | **不需要**，见 17.4 |
-| `CharacterHuman::sheatheWeapon`（虚 override）/ `_NV_sheatheWeapon` | 头 `0x5CC0A0` → **真实 `0x5CC820`** | `CharacterHuman.h:22-23`；真实入口经 RTTI 虚表槽 `0x2D0` ＋ `+0x780` ＋ 语义三重确认，`.pdata` 精确入口 `prolog=30`，**序言那道门已过（§18.2）**；**基类 `Character::sheatheWeapon` 头 `0x640D80` → 真实 `0x641510`，是另一个函数** |
+| `CharacterHuman::sheatheWeapon`（虚 override）/ `_NV_sheatheWeapon` | 头 `0x5CC0A0` → **真实 `0x5CC820`** | `CharacterHuman.h:22-23`；真实入口经 RTTI 虚表槽 `0x2D0` ＋ `+0x780` ＋ 语义三重确认，`.pdata` 精确入口 `prolog=30`，**序言那道门已过（§18.2）**；**派发是纯虚调 ⇒ 骑手必落这个地址、没有基类旁路（§18.6 实锤）**；基类 `Character` 的槽 `0x2D0` 指向 `0x641500`＝`ret 0` **空实现**（旧记的「真实 `0x641510`」是错的，那是隔壁一个无关函数，§18.6） |
 | `CharacterHuman::dropWeaponInHands` / `dropWeaponInHandsFake` | `0x5CBFE0` / `0x5C8EE0` | `CharacterHuman.h:49-50`，头里写 protected（shim 要声明成 public，见 17.1 最后一条） |
 | `CharacterHuman::leaveSheathEquipped(section, ypos)` | `0x5D1D30` | `CharacterHuman.h:55`，头里写 protected；「把武器留在鞘里」那一路 |
 | ⛔ `CombatClass::calculateTargetsInAttackZone` | `0x608020` | **会 AV，永远不要调**，见 17.5 |
@@ -504,7 +504,7 @@ CLAUDE.md 只留指针，需要 hook 新函数 / 直调新方法时查本节。
 ### 18.1 `header RVA + 0x780` = 真实 RVA —— 只对一族符号成立
 `Kenshi_x64.exe`（1.0.65，36718592 B，imagebase `0x140000000`）实测（`hook_probe.py`，14 个符号）：
 - **+0x780 精确命中 `.pdata` 入口 7 个**：`AnimationClass::_NV_update`→`0x5B68C0`、`AnimationClassHuman::_NV_update`→`0x5C5750`、`beingCarriedUpdate`→`0x5B5980`、`AnimationClassHuman::_NV_ragdollModeUT`→`0x5BA050`、`CharacterHuman::sheatheWeapon`→`0x5CC820`、`dropWeaponInHands`→`0x5CC760`、`leaveSheathEquipped`→`0x5D24B0`。
-- **另一族要 +0x790**：`updateAnimationTransforms`→`0x5B15C0`、`Character::sheatheWeapon`→`0x641510`、`getFacingDirection`→`0x2AE320`、`dropWeaponInHandsFake`。**特征很好认**：+0x780 处是 `C2 00 00 CC CC…` 或纯 `CC` 填充 ⇒ 看到这个就往后找 0x10。
+- **另一族要 +0x790**：`getFacingDirection`→`0x2AE320`（+0x780 处是**纯 `CC`**，这一条站得住）、`dropWeaponInHandsFake`；⚠️ **另两条已被 18.6 推翻**：~~`Character::sheatheWeapon`→`0x641510`~~、~~`updateAnimationTransforms`→`0x5B15C0`~~ —— 它们 +0x780 处是 `C2 00 00`，而**那不是填充，那是个 3 字节 `ret 0` 的叶子函数**（＝空虚函数体）。基类 `sheatheWeapon` 的虚表槽实测就指向 `0x641500` 那个空桩，往后挪 0x10 挪到的 `0x641510` 是个跟武器无关的转发函数。**修正后的判据**：+0x780 处**纯 `CC`** ⇒ 才往后找 0x10；+0x780 处 `C2 00 00`（`classify` 报 `leaf` 而不是 `padding`）⇒ **它本身就是函数，别挪**。
 - ⚠️ **5 个符号 +0x780 落在别的函数中部（MID+224 / 944 / 2368 / 720 / 416），真实地址未知**：`GameWorld::_NV_mainLoop_GPUSensitiveStuff`、`PlayerInterface::newPlayerTaskSelectedCharacters`、`ContextMenuGUI::show`、`InputHandler::loadConfig`、`DatapanelGUI::addCustomLine`。**这五个恰好都是生产环境里 hook 得好好的**（走 `GetRealAddress`）⇒ **「delta 对不上」不等于「hook 有问题」**，别去为它们找地址。
 - `--delta` 的投票（±0x4000 全域暴搜）里 `+0x780` 拿 **7/14**，第二名 5/14 ⇒ **它是启发式，不是定律**。**硬规则：候选地址必须自己落在 `.pdata` 的精确入口上**，delta 只用来生成候选。换 exe 版本就重跑 `hook_probe.py --delta` 重新推。
 
@@ -526,7 +526,7 @@ exe 的异常目录（data directory #3）里有 **77108 条 `RUNTIME_FUNCTION`*
 ### 18.3 虚函数：RTTI → COL → 虚表 → ILT 跳板
 `hook_probe.py --vslot <Class> <slot>`。手法：找 `.?AV<Class>@@` 字符串 → TypeDescriptor = 串 RVA − 16 → 在 `.rdata` 找 `_RTTICompleteObjectLocator`（`sig==1` 且 `pTypeDescriptor==td` 且 `pSelf==col`）→ 找**指向该 COL 的 8 字节指针** → **虚表 = 该位置 + 8**。实测：`CharacterHuman` 虚表 `0x16F2848`（COL `0x183E498`，thisOffset=0，~134 槽）、`Character` 虚表 `0x16F9EB8`。
 - ⚠️ **槽里装的是 /INCREMENTAL 链接跳板**（`E9 rel32`），必须跟一跳：`CharacterHuman` 槽 `0x2D0` → `0x302B5` `E9 66 C5 59 00` → **`0x5CC820`**。
-- ⚠️ 同一次走查里 `Character` 槽 `0x2D0` 解出 `0x641500`＝`C2 00 00`＋填充，真入口在 `0x641510`（＝ 18.1 的 +0x790 那一族）。**没有深究，也不需要**——基类那个地址在本项目里只用来提醒「别把它当成人类 override」（§17.4 末条）。
+- ⚠️ 同一次走查里 `Character` 槽 `0x2D0` 解出 `0x641500`＝`C2 00 00`＋填充。当时记的「真入口在 `0x641510`」**是错的、已由 18.6 推翻**：`0x641500` 就是基类那个虚函数的**全部函数体**（`ret 0`，空实现），`0x641510` 是隔壁一个无关函数。
 
 **语义确认（不看反编译也能给函数「验明正身」）**：扫函数体里的 `lea rip-rel` → 落在 `.rdata`/`.data` 的可打印串，再数成员位移常量。实测 `0x5CC820` 体内两次读 `[this+0x6D8]`（`weaponInHands`）、两次读 `[this+0x6E0]`（`weaponInHandsSheathLocation`）、引用串 `"hands"`；`leaveSheathEquipped`@`0x5D24B0` 引用 `"hip"/"back"/"back2"/"sheath"`；`dropWeaponInHands`@`0x5CC760` 只有 28 字节、读一次 `[this+0x6D8]`。⇒ 三个地址与 §17.3 那两个裸偏移**互相印证**。
 
@@ -545,6 +545,49 @@ exe 的异常目录（data directory #3）里有 **77108 条 `RUNTIME_FUNCTION`*
 - 旧记录：「RVA `0x5B5200` 落在无关构造函数中部；真实 `0x5B5980` 是 /LTCG 死副本」。**新证据**：`0x5B5980` = `0x5B5200 + 0x780`，与 7 个符号同一个 delta，且是 `.pdata` 精确入口（prolog=51）⇒ 它更像**就是那个函数本体**，而 `0x5B5200` 只是没加 delta 的头值。
 - 旧记录：「序言 5 个 1 字节 push → 搬 5 字节致栈不平衡」。**新证据**：`0x5B5980` 的字节是 `40 55 | 53 | 56 | 57 | 41 54 …`（`push rbp` 是 2 字节，因为带 REX）⇒ **5 字节处正好是指令边界**，这个解释与字节对不上。真正的崩因未知。
 ⇒ **处置：当成「原因待查的实测禁令」**。要重新审它必须有新的实测，不能靠这两条静态观察。
+
+### 18.6 调用图方向：直调还是虚调 —— 决定 hook 该坐在哪个地址（2026-08-30）
+**18.2 回答「这是不是真入口」，回答不了「引擎是怎么走到它的」**，而后者才决定 hook 装哪儿：
+- 只有 `call/jmp [reg+槽]` 这类**间接**站点 ⇒ 调用是虚的 ⇒ 一个 `CharacterHuman` 接收者**必然**落在人类 override 上，hook override 就够。
+- 有 `E8 rel32` **直调基类函数体**的站点 ⇒ 某处调用是非虚/限定调用、**绕过** override ⇒ 只 hook override 那条路一次都不会触发。
+
+工具 `tools\callers.py`（纯离线，扫 exe）三种模式：
+| 模式 | 找什么 | 编码 |
+|---|---|---|
+| `callers.py 0x<rva> [...]` | 直调站点 | `.text` 里每个 `E8`/`E9` + rel32，算 `site+5+rel` 是否命中目标 |
+| `callers.py --vcall 0x<槽偏移>` | 间接站点 | `[REX] FF /2`(call) `/4`(jmp) 且 `mod=10` ⇒ modrm 后跟 disp32（`rm==100` 时先跳 SIB） |
+| `callers.py --ptr 0x<rva> [...]` | **8 字节 VA 引用** | 直接搜 `<Q` 打包的 `base+rva`；⚠️ `findall()` 给的是**文件偏移**，要过 `pe.rva()` 换回来 |
+
+**`--ptr` 是决定性的那一条腿**：光有「0 个直调站点」不够——调用完全可以走一个存在数据里的函数指针。「0 直调 ＋ 唯一的指针引用就是它自己那个 ILT 跳板、各一次、都在 `.rdata`」才等于**虚表是唯一入口**。
+
+**实测：`sheatheWeapon` 是纯虚调，hook `0x5CC820` 就是对的**（TASK.md 原先记「必须进游戏才能验」，这条把它离线结掉了）：
+```
+callers.py 0x5CC820 0x641500 0x641510   ->  各 1 个直调站点，全部是 jmp 且 "NOT in any .pdata function"
+                                             0x302B5 / 0x4B8D0 / 0x3535A  = 它们各自的 ILT 跳板
+callers.py 0x302B5 0x3535A 0x4B8D0      ->  0 个直调站点（＝没人 E8 调跳板）
+callers.py --ptr 0x5CC820 0x641500 0x641510 -> 0 / 0 / 0 个指针引用（函数体本身没被任何数据引用）
+callers.py --ptr 0x302B5 0x4B8D0        ->  各 1 个，都在 .rdata：0x16F2B18 / 0x16FA188
+```
+- **`--ptr` 的两个 `.rdata` 命中独立复现了 18.3 的虚表算术**：`0x16F2848`(CharacterHuman 虚表)`+0x2D0 = 0x16F2B18`、`0x16F9EB8`(Character)`+0x2D0 = 0x16FA188`。两条完全不同的推导（RTTI 走查 vs 全镜像搜指针）落在同一对地址上 ⇒ **槽号 `0x2D0` 与两张虚表都是对的**。
+- ⇒ 派发路径只有 `虚表槽 → ILT 跳板 → 函数体`。骑手动态类型是 `CharacterHuman` ⇒ 永远落 `0x5CC820`。**没有「基类旁路」这回事，不用怕 hook 错地址。**
+- **顺带实锤：基类那个 override 是个空实现。** `Character` 槽 `0x2D0` → 跳板 `0x4B8D0` → **`0x641500` = `C2 00 00`（`ret 0`）**，前后都是 `CC`，16 字节对齐，不在 `.pdata`（叶子，合法）。而 18.1/18.3/§17.4 记的「基类真入口 `0x641510`」是**另一个函数**，31 字节、`prolog=6`：
+  ```
+  40 53              push rbx
+  48 83 EC 20        sub  rsp,0x20
+  48 8B 89 F8 02 00 00   mov rcx,[rcx+0x2F8]
+  48 8B DA           mov  rbx,rdx
+  48 8B 01 FF 50 40  call [[rcx]+0x40]        ; 对 +0x2F8 那个子对象发虚调
+  48 8B C3 … C3      mov  rax,rbx / ret       ; 返回第二个参数
+  ```
+  两个参数、返回第二个参数、读 `[this+0x2F8]`——**跟武器一个字都不沾**（对比 18.3 的语义确认：真的 `sheatheWeapon`@`0x5CC820` 读 `[this+0x6D8]`/`[this+0x6E0]` 并引用串 `"hands"`）。⇒ 它只是**恰好**落在 `.pdata` 入口上的启发式假阳性，见 18.1 修正后的判据。
+- ⚠️ **别去 hook `0x641500`**：只有 3 字节，`AddHook` 要搬 5 字节（无跳板，§13）；而且 hook 一个空实现本来就毫无意义。
+
+**两条硬限制（结论只能写到这个份上）：**
+- ⚠️ **这是静态扫描**，只看得见**编码在本镜像里**的调用站点：看不见存在数据里的函数指针（`--ptr` 只补了「有没有人存它的地址」这一半，存了之后怎么调看不见）、也看不见别的模块（KenshiLib / RE_Kenshi / 其它插件）发起的调用。**「0 个直调」＝「`.text` 里没有直调」，不等于「没人直调」。**
+- ⚠️ **逐字节扫描会有假站点**：一段更长指令（或 `.text` 里嵌的数据）中间凑出 `E8 rel32` 的形状也会被报出来。**判据是 `in <function>`**——真站点必落在某个 `.pdata` 函数内部；`NOT in any .pdata function` 的命中要么是 ILT 跳板（本例就是），要么是噪声。
+- ⚠️ **`--vcall 0x2D0` 那 ~20 个间接站点不能单独当证据**：disp `0x2D0` 不是类专属的，任何类的第 0x5A 个槽都是这个位移。它只能说明「有人在按这个槽做虚调」。
+
+⚠️ **这一节结的是「hook 哪个地址」，不是「第二个收刀写手是谁」**。后者仍然要进游戏（那本来就是 P4-3 那个探针的用途），也仍然守 §17.4 的「用途止于点名」——**不许每帧重新拔刀**（HISTORY §B 写入端补偿的老坑）。
 
 
 
