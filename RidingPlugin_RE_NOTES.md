@@ -403,3 +403,82 @@ CLAUDE.md 只留指针，需要 hook 新函数 / 直调新方法时查本节。
 - **复原的三个触发点**（缺一个就有腿被落下）：闸门掉下去、`Dismount()`、SEH 捕到 AV。实测 8 次上马 / 8 次 `restored on dismount` / 0 次中途 released / 0 次 AV。
 - **副作用仍然为零**（第三趟确认）：`wn` 4128 帧全 `(0,0,0)`、姿势权重 4074/4128 恒 1.00、`rel.y` 恒 6.35/6.36 ⇒ 屏蔽两根骨没有动摇 v1.6 的钉权重、逐帧杀 ragdoll，也没有动 `boneLocal`（＝座位表不用搬）。
 - ⚠️ **`Character::getRadius()` 不是体宽**：狗族 9.8/9.9（`torsoLen` 8.4/8.5）＞ 野牛 6.7（`torsoLen` 10.3）。当「越大越张腿」的单调代理够用，**当体型闸门会判反**（见 TASK.md P4-0）。
+
+## 17. 骑乘战斗：够到战斗系统的手法与地址（TASK.md P4，2026-08-29 → 08-30，五趟游戏内实测）
+
+**这一节只记「怎么从插件里够到战斗系统」**——手法、地址、偏移、判读陷阱。设计决策与出货形态在 `CLAUDE.md`「骑乘战斗」，被否掉的方案与逐趟原始数字在 `HISTORY.md`。shim 与裸偏移辅助函数全在 `RidingPlugin.cpp:61-195`（那段注释是本节的一等来源，改代码前先读）。
+
+### 17.1 手法：给「进不了编译树」的类写空壳 shim
+`kenshi/combat/CombatClass.h` **不能 `#include`**：它把邻居写成 `"Enums.h"` / `"util/hand.h"` / `"util/lektor.h"` / `"util/OgreUnordered.h"`，而它们实际在 `kenshi/` 与 `kenshi/util/` 下 ⇒ 只有往构建脚本再加一条 `/I…\Include\kenshi` 才解析得开（**没加，走 shim**）。`CharStats.h` / `Gear.h` 同样没进树。手法 ＝ 自己声明一个**同名的空 class**（只有非虚成员函数声明，**零数据成员、零虚函数**），调用 mangle 成 KenshiLib.lib 导出的同一个符号、由 RE_Kenshi 在加载时补成真实地址 —— **「链接通过」本身就是签名匹配的证明**，与 §13 的 `AI` 最小 shim 同一招，也同样**不需要逆向 RVA**（RVA 只用于 hook）。四条前提逐条验过：
+- **表里每个成员都是非虚的**——对着 lib 自己的 mangled name 核过：**`QEAA`/`QEBA` ＝ public 非虚，虚的会出 `UEAA`**。⇒ 没有 vtable 布局要复现、没有 this 调整。
+- **`this` 不需要调整**：`CombatClass` 的唯一基类 `Ogre::GeneralAllocatedObject` 是个空分配器策略（无数据成员、无自己的 vtable）⇒ 类自己的 vptr 落在偏移 0；`CharStats` 同理。`CombatClassAI` 单继承自 `CombatClass`（`CombatClass.h:273`）且 `CombatClass` 是**唯一且第一个**基类 ⇒ AI 子对象从偏移 0 开始，**`CombatClass*` 可以横向 cast 成 `CombatClassAI*`，不加减任何偏移**。对象永远是 `Character::getCombatClass()` 返回的指针**原样当 `this` 传**，我们从不构造/复制/取 sizeof。
+- **撞不了名**：`class CombatClass;` 全树只被前向声明（`kenshi/Character.h:33`、`kenshi/CharBody.h:13`），`CombatClass.h` **零处被 include**；`class CombatClassAI` 在整个树里一次都没出现；`CharStats` 只被前向声明（`AI/AI.h:46`、`Character.h:34`、`CharBody.h:14`、`CharMovement.h:221`、`combat/CombatClass.h:19`、`Dialogue.h:273`、`MedicalSystem.h:90`），`Weapon` 同理（`Character.h:39`、`CharStats.h:18`、`Inventory.h:115`、`Item.h:105`、`Animation/AnimationClassHuman.h:5`）⇒ 不会 C2011。
+- ⚠️ **头文件标着 `protected` / `private` 的方法，shim 里必须声明成 `public`**：那些注释描述的是**原始游戏源码**，KenshiLib 把它们**全部按 public 修饰**导出。写成 protected 会 mangle 成 `IEAA…` 直接链不上。⇒ `weaponReach` / `isInAttackZone` / `getNearestEnemyInAttackZone` / `setAttackTarget` / `changeState` 都是 public 声明，**别为了跟头文件一致去「修正」它**。
+- **`Weapon` 的上行转换要用 `reinterpret_cast`**：`Weapon : Gear`（`Gear.h:41`）、`Gear : Item`（`Gear.h:5`）两级都标注 `offset = 0x0`，但两个类型在本插件里都是**不完整类型**，语言级 upcast 编不过。
+
+### 17.2 RVA 表（`GetRealAddress` 不需要——这些全是直调）
+| 符号 | RVA | 备注 |
+|---|---|---|
+| `CombatClass::_isInCombatMode` | `0x43FCD0` | 与 `combatModeActive`(0x130) 互为对照 |
+| `CombatClass::getNumOpponents` / `getNumWaitingAttackers` | `0x2B2B90` / `0x2B2670` | |
+| `CombatClass::isInAttackerListH` / `addAttackerH` | `0x664FD0` / `0x6666A0` | |
+| `CombatClass::_getAttackTarget` | `0x339E30` | 返回 `hand` |
+| `CombatClass::isAttacking` | `0x664CA0` | |
+| `CombatClass::weaponReach` | `0x607BA0` | 头里写 protected |
+| `CombatClass::isInAttackZone` / `getNearestEnemyInAttackZone` | `0x607CE0` / `0x6090B0` | 头里写 protected |
+| `CombatClass::setAttackTarget` / `setAttackTargetHandle` | `0x664E00` / `0x664ED0` | 头里写 protected |
+| `CombatClass::getCombatState` / `getBlockStateEnum` | `0x333D30` / `0x664BD0` | |
+| `CombatClass::changeState(state, minTime)` | `0x2B25F0` | 头里写 protected |
+| **`CombatClassAI::_NV_initCombatMode`** | **`0x667A60`** | `CombatClass.h:286-287`；**真正的派发目标** |
+| `CombatClass::initCombatMode`（基类体） | `0x665230` | ⚠️ **不是**派发目标，见 17.4 |
+| `CharStats::chooseAttack(range, reach, last, stationary)` | `0x886880` | **reach 是入参**，见 17.4 |
+| `CharStats::getBashAnimation(range)` | `0x885C70` | |
+| `Weapon::getCategory` | `0x5C71D0` | `Gear.h:49` |
+| `AnimationClass::runCombatAnimation(tech, w, "")` | `0x5B6E80` | public，**不用 shim** |
+| `AnimationClass::endCombatAnimation` | `0x5B34E0` | public；`Dismount()` 里无条件调 |
+| `CombatClass::go(float)` | `0x60C4D0` | **不需要**，见 17.4 |
+| ⛔ `CombatClass::calculateTargetsInAttackZone` | `0x608020` | **会 AV，永远不要调**，见 17.5 |
+- **两个虚表槽**（`Character` 自己的 vtable，按槽位偏移手取函数指针、不进 shim）：`drawWeapon(Item*, const std::string&)` = **`0x3D8`**（人类实现体 `CharacterHuman` @`0x5DB800`），`getThePreferredWeapon()` = **`0x3C8`**（⚠️ 被骑状态下读 NULL，见 17.4）。
+- **`Weapon*` 传给 `drawWeapon` 前要 `reinterpret_cast` 成 `Item*`**（理由见 17.1 最后一条）。
+### 17.3 裸偏移表（`CombatClass.h` 的数据成员进不了编译树，只能按 `this` 加偏移读）
+辅助函数 `CcBool` / `CcInt` / `CcFloat` / `CcPtrSet` / `CcVptrLo` / `CcSetPtr(cc, off, v)`（源码 `:170-195`）。⚠️ **每个裸读都配一个必须与它一致的 API 调用**，偏移一漂就表现为「两者不一致」而不是静默给假数据 —— 这是这张表唯一的自检手段，**加新偏移时照做**。
+| 结构 | 偏移 | 字段 | 实测判读 |
+|---|---|---|---|
+| `CombatClass` | `0x130` | `combatModeActive` | 与 `_isInCombatMode()` **4/4 一致**，可信 |
+| `CombatClass` | `0x150` | `currentTechnique` | 战斗前 4/4 读 NULL；**唯一一处 WRITE**（`CcSetPtr`，P4-1d 第 2 级） |
+| `CombatClass` | `0x1F0` | `combatState` | 与 `getCombatState()` **4/4 一致**（「不一致」计数 0/4），可信 |
+| `CombatClass` | `0x1F4` | `nextMove` | ⛔ **不可用**：战斗模式前读 `1818135763`（＝ASCII 垃圾/未初始化），之后读 8。已从探针里删掉，**别再加回去** |
+| `AnimationRequirement` | `0x118` | `_currentCombatTechnique` | 基址是 `rAnim->animationRequirements`，**不是** `AnimationClass*`；与 `CombatClass::currentTechnique(0x150)` 互为对照 |
+| `CharacterHuman` | `0x6D8` / `0x6E0` | `weaponInHands` / `weaponInHandsSheathLocation` | 「逻辑上在手里」的槽 ＋ 它离开的那个鞘；P4-3 收鞘写手的下一级把手（`ATTACH_WEAPON`=0） |
+| `AnimationClass` slave 子块 | `0xB8` / `0xC0` / `0x110` | `isActionSlave` / `attachRootToMastersBone` / `forcedSlaveLoop` | `forcedSlaveLoop` 是我们自己每帧写的；⚠️ `isActionSlave` **由引擎维护**，见 17.4 |
+| `AnimsList`（`getCharacterList()`） | `0xB8` / `0x78` | `allAnims` / `actionAnims` | **boost 布局自检**：不等于这两个值就**拒绝读**（源码 4 处：`:3787` `:3808` `:3841` `:7034`） |
+| `CombatTechniqueData` | `0x0` / `0x38` / `0x3C` | `animation` / `initialDistance` / `minDistanceVsStatic` | `animation` 是 `std::string`，与 `AnimationData::dataName` 同一个 ABI 赌注；它自己的头会拖进 `MedicalSystem.h`，所以三个字段全走裸读 |
+| `CharMovement` | `0x3B0` / `0x330` | `clickHull` / `dontEverRecreateMe` | P3；`nrc` 全程 0 ⇒ `restore()` 不需要 |
+| `AbstractMovementBase` | `+0xC4` | `pos` | public，是 `getPosition()` 背后的字段；P3 剩下那一半的候选写点 |
+
+### 17.4 实测语义：谁是把手、谁是从动
+- **`vpR = vpM = vpE = 41DB5688`（4/4，`CcVptrLo`）** ⇒ **玩家骑手不是 `CombatClassPlayer`**，它与坐骑、与敌人共用同一个 `CombatClass` 派生类型。⇒ 对 `initCombatMode` 做虚派发落在 **`CombatClassAI::initCombatMode`@0x667A60**，不是基类体 `0x665230`。⚠️ **P4-1c 非虚地调基类体也是「有效的」**（`cma` 0→1、`rTgt` 0→1、`cst` 3→4 一直保持到日志末尾），换成 AI 那个是**按语义取正确**，不是修 bug —— 别把它当成「原来那样是错的」。
+- **`initCombatMode` 就是那个把手**（P4-1c 273 行 P3CMB：`cm`/`cmM`/`rTgt` 三个字段都是 `{0:62, 1:211}`，切换点逐帧对齐）。
+- ⚠️ **`aCM`（`AnimationClass` 侧的战斗模式）是从动，不是把手**：引擎自己每帧在推骑手的战斗状态机 ⇒ 旧的第 0 级 `rAnim->setCombatMode` 已删，`go(float)@0x60C4D0` 也**不需要**。
+- ⚠️ **`isActionSlave`(0xB8) 由引擎维护** ⇒ 想从插件侧改它，另一把钥匙是 `restore()` 那个被 `pickupObject` destroy 掉的 `CharMovement` —— 而这**与 P3 剩下那一半是同一个岔口、同一笔代价**（交出「骑手不被坐骑碰撞体推挤」）。**要开就两件事一起衡量，别为其中一件单独开**（TASK.md P3 / P4-1j）。
+- **骑手手里没有武器**：`wpn=0`（4/4，`getCurrentWeapon()` 是**已拔出**测试）、`aCW=5`（＝`SKILL_UNARMED`）而敌人 `eWpn=1`。⇒ P4-1d 的第 0 级是 `drawWeapon`。⚠️ **取「拔哪把」的来源后来被改过一次**：`getThePreferredWeapon()`（vtable `0x3C8`）**在被骑状态下读 NULL**（上马那一刻武器已收到背上），所以主体改成 `Inventory::getPrimaryWeapon()` → 退 `getSecondaryWeapon()` —— 它们问的是**装备槽**，拔没拔都答得出。`Inventory.h` **能干净 include**（邻居是 `Enums.h`/`util/lektor.h`/`Item.h`，都在 `kenshi/` 里），**不需要 shim**。
+- **`drawWeapon` 不被「被骑」拒绝**（P4-1e-2，2026-08-30：**12/12 `post=1`**）⇒ 「骑着拔不出刀」不是权限问题，而是**约 14 帧之后有人把它收回背上**，且 `cma=1` 全程为 1 ⇒ **那个第二写手绑的是「被骑/被携」状态、不是战斗状态**（第一次收鞘可以用「战斗结束自动收」解释，重复收不行）。P4-3 的第一步就是给这个写手点名。⚠️ **别先写「每帧重新拔」**：那正是 HISTORY §B 那三轮伺服的形状（对每帧覆写做写入端补偿）。现有探针已按这个纪律写好——`drawWeapon` 门控在 `getCurrentWeapon()==NULL`、限 `kDrawTryBudget=12` 次、间隔 `kDrawTryGap=10` 帧，**计数器本身就是用来判「一次性状态转换 vs 每帧覆写」的**。
+- ⚠️ **「骑着看不到别的动作」不是武器侧的证据**：`kRidePose` 带 `wholeBodyAllLayer` 且 `PoseLayerPin` 把它钉在 1.0，P2-1b-1 实测这会把**任何**其他 clip 压在 `w=0.000`。⇒ **看不见是设计使然**，判读武器/攻击时必须从 `wpn=`/`post=`/读回值上判，不能从「屏幕上有没有动作」上判。
+- **`ch=0`（`chooseAttack` 43/43 不给招式）已从谜团降级为后果**：无武器角色没有武器招式可挑。⇒ 修的顺序是**先把武器放回手里**，再回来问战斗层。
+- **`weaponReach()` 是唯一与距离无关的那个事实**：P4-1c 的四次读发生在 `d=39.92/19.38/15.61/19.27`，所以 `inZ=0` 同样可以用「太远」解释；最终由 P4-1d 的 `reach=10.50` 对 `d=8.32-9.10` 排除距离。⚠️ **`chooseAttack` 的 reach 是入参**，不是它自己去问 —— 所以这条链上 `weaponReach()` 的值必须先对，否则挑出来的招式跟着错。
+- **`chAnim` ＝ `CombatTechniqueData::animation`(0x0) ＝ 人类挥砍 clip 的「记录名」**，正好答掉 P4-3 的前提①（人形表里没有 attack ⇒ 它挂在 per-technique 数据上）。⚠️ **解析只许走 `FindAnimData()`（`allAnims.find()`），永远不许 `getAnimationData()`** —— 后者是 `operator[]` 语义，查不到就往引擎表里插一条永久 NULL（见 §15 与 CLAUDE.md 那条硬约束）。
+
+### 17.5 ⛔ 禁止调用 / 禁止 hook（都已实测，别再试）
+- **`CombatClass::calculateTargetsInAttackZone`@0x608020 ——「调用即 AV」**（P4-1c 那趟：第 0/1/2 级全部跑完并打出正常数据，加上这一句就在它里面炸）。**最可能的原因是它解引用 `currentTechnique`(0x150)，而战斗前那里 4/4 读到 NULL**。函数声明已从 shim 里**整条删掉**（源码 `:168` 留了一行墓碑注释），⚠️ **别为了「拿攻击区目标列表」把它加回来** —— 那份信息走 `getNearestEnemyInAttackZone()@0x6090B0` + `isInAttackZone()@0x607CE0`，两个都实测安全。
+- 另外两个**禁止 hook 的地址**（§0 与 CLAUDE.md 都有，这里只提醒它们与 P3/P4 撞在一起）：`beingCarriedUpdate` RVA `0x5B5200`、`updateAnimationTransforms` RVA `0x5B0E30`。**「谁在把 `rMove` 拖回 carry 槽」的头号嫌疑正是前者**，而它恰好禁止 hook ⇒ P3 剩下那一半只能从**写入侧**解决（每帧 `teleportCollisionHull` 或直写 `pos`+0xC4），不能从拖回侧拦。
+
+### 17.6 判读与编译陷阱
+- **SEH 纪律**：所有探针都在 `__try/__except` 里（/EHsc 下 C++ `catch` **接不住** SEH AV）。⚠️ `__try` 不能与需要展开的对象共处一帧（C2712）⇒ 全部写成 `XxxImpl()` ＋ 外层 `Xxx()` 包壳这一对；`CombatProbe` / `gCmbBudget` 就是这个形状，**仍在源码里，下一轮 P4-3 直接复用**。
+- **探针预算是必须的，不是礼貌**：`gCmbBudget` 限次 + `debugContinuous` 门控。战斗探针一行要打十几个字段，无预算会在一次交战里把 6.7MB 级日志刷满，而**判读那份日志只能靠脚本**（记忆规则：大文件绝不整读）。
+- **判读顺序：先看「两个来源是否一致」，再看数值**。这一节所有裸偏移都成对配了 API（`0x130` 配 `_isInCombatMode()`、`0x1F0` 配 `getCombatState()`、`0x150` 配 `_currentCombatTechnique`(0x118)）。**不一致 ⇒ 偏移漂了，先修偏移，别去解释数值。**
+- ⚠️ **「读到 0」经常有两个解释，要先找到那个与距离无关的字段**：P4-1c 的 `inZ=0` 既可以是「不在攻击区」也可以是「距离太远」，只有 `reach` 是不含距离的。**每加一个新探针字段，先问它会不会被距离/时机解释掉。**
+- **shim 只能直调非虚方法**（§13 那条：虚函数要复现 vtable 布局，空壳做不到）。⇒ 本节两条路各走各的：**非虚的**（`_NV_initCombatMode` 等整张表）直接声明 + 链接器从导出桩解析；**虚的**（`drawWeapon` / `getThePreferredWeapon`）**按槽位偏移手动从 vtable 里取函数指针**（`0x3D8` / `0x3C8`），不进 shim。⚠️ 所以 17.1 那条「`CombatClass*` 横向 cast 成 `CombatClassAI*` 不加偏移」是**必需前提**——我们调的是派生类的函数体本身，不是让引擎替我们派发。
+- **`hand`（`GameObjectHandle`）能进编译树、可以直接用**（`_getAttackTarget()` 返回它，`.getCharacter()` 取回指针）；⚠️ **它取回的指针照样可能悬空**（会话中读档），所以战斗侧拿到的每个 `Character*` 仍要过 `CharacterLooksLive`。
+
+
+
