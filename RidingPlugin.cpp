@@ -11,8 +11,17 @@
 #include <kenshi/InputHandler.h>
 #include <kenshi/Animation/AnimationClass.h>
 #include <kenshi/Animation/AnimationClassHuman.h>
+#include <kenshi/CharacterHuman.h>   // P4-1h: weaponInHands 0x6D8 / sheath location 0x6E0
 #include <kenshi/Building/Building.h>
 #include <kenshi/Enums.h>
+// Inventory.h is load-bearing for P4-1e: mounting sheathes the rider's weapon, so the
+// subject for drawWeapon() has to come out of the equipment slots rather than from
+// getThePreferredWeapon() (which reads NULL in that state).  getPrimaryWeapon() /
+// getSecondaryWeapon() / getEquippedWeapons() live on Inventory and Character.h only
+// forward-declares the class.  Unlike combat/CombatClass.h this one #includes cleanly:
+// its neighbours are spelled "Enums.h" / "util/lektor.h" / "Item.h" and it sits in
+// kenshi/ itself, so every one of those resolves relative to its own directory.
+#include <kenshi/Inventory.h>
 // Vanilla rebindable-keybinding support: DatapanelGUI::addCustomLine lets us inject
 // a DataPanelLine_KeyConfig row into the Settings->Controls page, and
 // InputHandler::loadConfig is where we register our commands so their bindings
@@ -29,6 +38,16 @@
 // OgreSceneNode.h is load-bearing: AnimationClass::node is an Ogre::SceneNode* and
 // no other included header pulls the complete type in transitively.
 #include <ogre/OgreSceneNode.h>
+// OgreAnimationState.h is load-bearing for the pose-weight pin (v1.6):
+// SingleAnimation::mainState is an Ogre::AnimationState* and setWeight() is the
+// value Ogre actually blends from at render time.  Nothing else pulls it in.
+#include <ogre/OgreAnimationState.h>
+// OgreOldBone.h / OgreOldSkeletonInstance.h are load-bearing for the P2-1b leg pose:
+// AnimationClass::_getBone returns Ogre::OldBone* (setManuallyControlled / reset live
+// there) and AnimationClass::skeleton is an Ogre::OldSkeletonInstance* whose base
+// Skeleton gives getNumBones/getBone for the bone-name inventory.
+#include <ogre/OgreOldBone.h>
+#include <ogre/OgreOldSkeletonInstance.h>
 
 #include <mygui/MyGUI_Window.h>
 
@@ -38,6 +57,141 @@
 
 #include <windows.h>
 #include <stdio.h>
+
+// ---- minimal CombatClass shim (RE_NOTES §13 technique, second use) -------------------
+// P4-1b needs the engine's OWN combat bookkeeping to EXPLAIN why a mounted rider is not a
+// combat participant, instead of only observing that it isn't.  That lives in
+// kenshi/combat/CombatClass.h, which cannot be #included: it pulls its neighbours in as
+// "Enums.h" / "util/hand.h" / "util/lektor.h" / "util/OgreUnordered.h" while those actually
+// sit at kenshi/Enums.h and kenshi/util/, so it only resolves with /I...\Include\kenshi
+// added to the committed build script.
+//   Instead declare exactly the members we call.  The call mangles to the same symbol
+// KenshiLib.lib exports and RE_Kenshi patches that stub to the real address at load, so a
+// successful LINK is itself the proof that the signature matches.  This is safe because
+//   - every member below is NON-virtual (verified against the lib's own mangled names:
+//     QEAA/QEBA = public non-virtual; the virtual ones come out UEAA), so there is no vtable
+//     layout to reproduce and no this-adjustment;
+//   - the shim declares no data members and we never construct, copy or size one - the
+//     object always arrives as a Character::getCombatClass() pointer passed through
+//     verbatim as `this`;
+//   - no header in the tree includes CombatClass.h (zero hits) and `class CombatClass;` is
+//     only ever forward-declared (kenshi/Character.h:33, kenshi/CharBody.h:13), so this
+//     definition cannot collide (C2011).
+// ⚠ MEASURED, and it overturns what this comment used to claim: the rider is NOT a
+// CombatClassPlayer.  P41C logged the vtable pointer of the rider's, the mount's and the
+// enemy's CombatClass and got vpR = vpM = vpE = 41DB5688 in 4/4 reads - the same class for
+// all three, and the mount and the enemy are plainly AI.  So virtual dispatch on
+// initCombatMode() reaches CombatClassAI::initCombatMode (CombatClass.h:286, RVA 0x667A60),
+// not the base body at 0x665230.  The old reasoning ("CombatClassPlayer overrides nothing,
+// so the base body IS the player body") was sound but applied to the wrong class.
+//   ⚠ This is NOT a bug fix.  Calling 0x665230 non-virtually DID work in P4-1c: rungs 1/2
+// flipped combatModeActive and rTgt to 1 and they stayed up to end of log.  Swapping to the
+// AI twin below (also exported as a non-virtual _NV_ stub, so it costs one declaration)
+// replaces "happens to work" with "correct by semantics".
+// (gotMoreImportantThingsToDoThanFightingYou() and hasFocusedTarget() are still absent -
+// they are overridden in the AI class and we have never needed them.)
+// ⚠ KenshiLib's "// protected" / "// private" annotations in that header describe the
+// ORIGINAL game source, not the exported symbol: the lib mangles ALL of these with public
+// access, which is why weaponReach / getNearestEnemyInAttackZone / isInAttackZone /
+// setAttackTarget link fine from a public shim.  Do not "fix" the access to match the
+// comments - that would mangle to IEAA and fail to link.
+class CombatClass
+{
+public:
+    bool       _isInCombatMode() const;              // RVA 0x43FCD0
+    int        getNumOpponents() const;              // RVA 0x2B2B90
+    int        getNumWaitingAttackers() const;       // RVA 0x2B2670
+    bool       isInAttackerListH(Character* c);      // RVA 0x664FD0
+    bool       addAttackerH(Character* c);           // RVA 0x6666A0
+    hand       _getAttackTarget() const;             // RVA 0x339E30
+    float      isAttacking(Character* who);          // RVA 0x664CA0
+    float      weaponReach();                        // RVA 0x607BA0  ("protected" in header)
+    bool       isInAttackZone(Character* who);       // RVA 0x607CE0  ("protected" in header)
+    Character* getNearestEnemyInAttackZone();        // RVA 0x6090B0  ("protected" in header)
+    void       setAttackTarget(Character* c);        // RVA 0x664E00  ("protected" in header)
+    void       setAttackTargetHandle(Character* c);  // RVA 0x664ED0  ("protected" in header)
+    // P4-1c additions.  Everything above only READS or moves a target pointer; these are the
+    // first members here that can change what the engine does with a rider on its own.
+    swordStateEnum getCombatState() const;           // RVA 0x333D30
+    swordStateEnum getBlockStateEnum();              // RVA 0x664BD0
+    void           changeState(swordStateEnum newState, float minTime);
+                                                     // RVA 0x2B25F0  ("protected" in header)
+    // P4-1c had calculateTargetsInAttackZone() (RVA 0x608020) here as rung 3.  REMOVED: the
+    // offset-ordered timeline puts the run's access violation immediately after rung 2, i.e.
+    // in this call, and the likeliest reason is that it dereferences currentTechnique(0x150)
+    // which was NULL in 4/4 reads.  P4-1d supplies a technique instead of asking the engine
+    // to recompute a zone without one, so there is nothing left to call it for.
+};
+
+// CombatClassAI - the rider's ACTUAL class (measured; see the ⚠ above).  One method, same
+// shim technique, same safety argument: non-virtual _NV_ twin, no data members, and
+// `class CombatClassAI` appears nowhere in the include tree (CombatClass.h is never included
+// and nothing forward-declares it), so this cannot collide.  Single inheritance from
+// CombatClass (CombatClass.h:273) with CombatClass as the first and only base means the AI
+// subobject starts at offset 0, so a CombatClass* may be cast across without adjustment.
+class CombatClassAI
+{
+public:
+    bool _NV_initCombatMode(const hand& subject, int end, bool focusedTargetMode);
+                                                     // RVA 0x667A60 (CombatClass.h:287)
+};
+
+// CharStats - the technique chooser.  Collision-free: nothing in the tree includes
+// CharStats.h, and `class CharStats;` is only ever forward-declared (AI/AI.h:46,
+// Character.h:34, CharBody.h:14, CharMovement.h:221, combat/CombatClass.h:19, Dialogue.h:273,
+// MedicalSystem.h:90).  Its only base is the empty Ogre::GeneralAllocatedObject, as with
+// CombatClass, so `this` needs no adjustment.
+//   ⚠ chooseAttack takes weaponReach as an ARGUMENT.  That is the whole reason this shim
+// exists: P4-1c measured the rider's own reach at 0.00 in 4/4 reads, so asking the engine
+// "which attack would you pick" with a synthetic reach breaks the no-reach/no-technique/
+// no-reach circle instead of being trapped by it.
+class CharStats
+{
+public:
+    CombatTechniqueData* getBashAnimation(float range);              // RVA 0x885C70
+    CombatTechniqueData* chooseAttack(float range, float weaponReach,
+                                      CombatTechniqueData* lastAttack,
+                                      bool opponentIsStationary);    // RVA 0x886880
+};
+
+// Weapon - only to name the category of whatever getThePreferredWeapon() hands back, so that
+// "the rider is unarmed" and "the rider has a weapon it never drew" are distinguishable in
+// the log.  There is no Weapon.h in KenshiLib; Weapon lives in Gear.h:41 as
+// `class Weapon : public Gear` and Gear.h:5 as `class Gear : public Item`, both annotated
+// "offset = 0x0".  Collision-free: nothing includes Gear.h except Gear.h's own consumers of
+// Item.h, and `class Weapon;` is only forward-declared elsewhere (Character.h:39,
+// CharStats.h:18, Inventory.h:115, Item.h:105, Animation/AnimationClassHuman.h:5).
+class Weapon
+{
+public:
+    WeaponCategory getCategory() const;              // RVA 0x5C71D0 (Gear.h:49)
+};
+
+// P4-1c raw-field reads.  The shim above deliberately declares no data members, so
+// KenshiLib's documented offsets are applied to the raw pointer instead.  They ARE offsets
+// from `this`: CombatClass's only base, Ogre::GeneralAllocatedObject, is an empty allocator
+// policy with neither data nor a vtable of its own, so the class's own vptr sits at 0.
+// Every read is paired with an API call that must agree with it - an offset that has drifted
+// between game versions shows up as a disagreement instead of as a plausible wrong number.
+static inline int CcBool(const void* cc, int off)
+{ return cc ? (int)*(const unsigned char*)((const char*)cc + off) : -1; }
+static inline int CcInt(const void* cc, int off)
+{ return cc ? *(const int*)((const char*)cc + off) : -1; }
+static inline float CcFloat(const void* cc, int off)
+{ return cc ? *(const float*)((const char*)cc + off) : -1.0f; }
+static inline int CcPtrSet(const void* cc, int off)
+{ return cc ? (*(void* const*)((const char*)cc + off) ? 1 : 0) : -1; }
+// Low 32 bits only: the vtable pointer is just an identity token here ("same class or not"),
+// and a full 64-bit address makes the log line unreadable for no gain.
+static inline unsigned int CcVptrLo(const void* cc)
+{ return cc ? (unsigned int)((unsigned __int64)*(void* const*)cc & 0xFFFFFFFFu) : 0u; }
+// P4-1d: the one WRITE into the raw layout.  currentTechnique(0x150) is what P4-1c measured
+// as NULL in 4/4 reads while combatModeActive was already 1 - i.e. the state machine is
+// turning but has nothing to swing with.  There is no setter in the header, so rung 2 pokes
+// the field and lets the running machine pick it up.  Only ever called with a pointer that
+// CharStats::chooseAttack just returned, never with a fabricated one.
+static inline void CcSetPtr(void* cc, int off, void* v)
+{ if (cc) *(void**)((char*)cc + off) = v; }
 
 // v100-safe int->string helper (std::to_string is ambiguous in old MSVC)
 static std::string IntToStr(int v)
@@ -124,14 +278,24 @@ enum SeatMode
     SEAT_REAR     = 3
 };
 
-// Rider upper-body posture while mounted.
-//   0 = SIT   - "sitting chair" (the toilet-sitting pose the player confirmed)
-//   1 = STAND - "idle_stand_normal" (arms/upper body exactly like standing on the ground)
-enum RiderPosture
-{
-    POSTURE_SIT   = 0,
-    POSTURE_STAND = 1
-};
+// The ride pose.  ONE record name, no alternatives (TASK.md P2-0, 2026-08-29).
+//
+// This used to be a two-valued RiderPosture (0 = "sitting chair", 1 = the standing
+// idle "idle_stand_normal", selectable per species via riding.cfg column 9).  The
+// standing branch is gone: every one of the 21 shipped seat rows was posture 0, the
+// standing path was reachable only by hand-editing a cfg, and it cost a permanent
+// tax everywhere - two poses to assert, two to stop, two to end on dismount, plus
+// the "stop the OTHER pose" machinery that existed purely because Mount() always
+// started the sitting pose while the cfg might ask for the other one.  cfg column 9
+// is now a dead field (parsed into a dummy, written as literal 0) exactly like
+// column 4 and columns 6-8.
+//
+// ⚠️ This name is a RECORD name (the key in AnimsListsManager's allAnims), not a
+// clip name - clip names carry a numeric suffix the engine reassigns every load.
+// It is verified present in the vanilla human table (P1: lay=UPPER cat=NORMAL
+// flags=whole,loop,action,Rarm), which is what makes the per-frame
+// getAnimationData(kRidePose) safe - that call INSERTS a NULL on a miss.
+static const char* const kRidePose = "sitting chair";
 
 // Per-mount seat setup (computed at mount time).
 struct SeatInfo
@@ -160,7 +324,6 @@ struct SeatInfo
                                  // bind-pose constant glues the rider to one end of the flex while
                                  // the other sweeps under them; the mean cancels anti-phase swing
     bool          forceSit;      // rider: re-assert the sitting pose every frame (overrides carried prone)
-    int           posture;       // RiderPosture (0=sit, 1=stand)
     float         lateral;       // side offset (right/left), world units
     float         torsoLen;      // front<->rear bone distance at mount time (world units)
     Ogre::Vector3 lift;          // base seat offset (mostly +Y, auto-sized)
@@ -272,6 +435,679 @@ boost::unordered_map<Character*, Ogre::Vector3> dbgNodeWritten;
 // node-style drift meter above cannot separate them.  This one is sampled in the same
 // breath as the write, so a nonzero value means the call itself did not take.
 boost::unordered_map<Character*, Ogre::Vector3> dbgMoveWritten;
+
+// ---- P3-0 probe (2026-08-29): WHEN in the frame is the logical position dragged
+//      back to the carry park slot, and does the click hull still exist? ----------
+// mvW above already settled "does the write land": ZERO on all 19511 frames of the
+// v1.6 log, while rMove stayed 5..12u off the seat and down at ground level.  So the
+// write is fine and something later puts it back - but the existing DBG line samples
+// rMove BEFORE this frame's own write (DebugLogRideFrame runs ahead of it inside
+// SyncMountedRiders), so no existing log can say WHERE in the frame that happens.
+// Four samples of (movement position - seat) bracket the two writers we own:
+//     aPre / aPost = animUpdate resync (fires INSIDE the engine's update phase)
+//     mPre / mPost = main-loop SyncMountedRiders (after the whole update, pre-render)
+// Frame order is: engine update (animation updates happen inside it) -> our main-loop
+// passes -> render.  So the sample order is aPre, aPost, mPre, mPost, then next
+// frame's aPre.  Read the gaps:
+//     mPre big, aPre ~0  => dragged AFTER the animation updates, same frame
+//     aPre big, mPre ~0  => dragged EARLY in the update phase, before animation
+//     both big           => dragged twice per frame
+//     hits == 0          => the resync never fired for this rider, so aPre/aPost are
+//                           stale and mPre covers the whole frame by itself
+// A resync that is throttled or never firing is itself a candidate root cause, hence
+// the per-frame fire count rather than a bare "did it run" flag.
+// ANSWERED 2026-08-29 (P3-0, 105 lines / 2 rides, no exceptions): aPre=ZERO always,
+// mPre=7.6..13.5u, mPost=ZERO always, hits=2 always => the drag-back runs after the
+// rider's animUpdate and before our main-loop pass, once per frame, and the seat write
+// then holds all the way through render into the next frame's animUpdate.  Kept as the
+// regression check for any future change to where/when we write the position.
+struct P3Sample
+{
+    Ogre::Vector3 aPre, aPost, mPre, mPost;
+    int  animHits;   // resync fires since the last main-loop pass
+    bool sawAnim;    // has the resync EVER fired for this rider
+    P3Sample() : aPre(Ogre::Vector3::ZERO), aPost(Ogre::Vector3::ZERO),
+                 mPre(Ogre::Vector3::ZERO), mPost(Ogre::Vector3::ZERO),
+                 animHits(0), sawAnim(false) {}
+};
+boost::unordered_map<Character*, P3Sample> p3Probe;
+static const unsigned int kP3LogGap    = 60;   // frames between P3 lines
+static const int          kP3LogBudget = 80;   // lines per ride, debug only
+static int          gP3Budget = 0;
+static unsigned int gP3Frames = 0;
+// refreshClickHull() calls the rider needed this ride.  ANSWERED 2026-08-29 (P3-2): it is
+// NOT 1 - it climbs by about one per 30 frames, i.e. something destroys the mounted rider's
+// click hull periodically.  has0=0 on 5 of 41 sampled frames, p0 != p2 on those 5, and 26
+// distinct p0 values across the ride (one of them NULL) - while the mount's own hull pointer
+// stayed single-valued all session.  So the create-on-demand shape is load-bearing AND cheap:
+// it rebuilds ~2x/second instead of P3-1's unconditional 60-130x/second, and the destruction
+// happens inside the engine update phase that we return from, so the hull is present again
+// before render/input.  Clicking is stable (user-confirmed twice).  Prime suspect for the
+// destroyer is the same carried-character update tail that drags the position back to the
+// ground carry slot - beingCarriedUpdate, whose address is FORBIDDEN to hook.
+static int          gP3HullCreates = 0;
+
+// ---- P3-3 / P4-1 probe: what the combat system sees of a mounted rider -------------
+// Read-only.  TASK.md's P3 plan proposes writing a combat position at 鞍座 XZ + 贴地 Y
+// on the theory that a rider 6-10u up is out of 3D melee reach ⇒ 「骑手无敌」.  That is a
+// hypothesis about a mechanism we have never measured, and the cheaper measurement comes
+// first: getAllAttackers() is the engine's OWN record of who is swinging at the rider, so
+// one fight answers whether the lever is needed at all.
+//   Pre-registered readings:
+//     rAtk>0 and the rider visibly takes damage  ⇒ reach already works, SKIP the ground-Y
+//                                                  lever entirely and go to P4-1.
+//     rAtk=0 while mAtk>0                        ⇒ the mount is a valid target and the rider
+//                                                  is not.  Then compare dR3/dRxz: if the
+//                                                  horizontal distance is small and only the
+//                                                  3D one is large, the lever is the fix; if
+//                                                  both are small, targeting is refusing the
+//                                                  rider for a non-distance reason (bc=1 is
+//                                                  the first suspect) and the lever is useless.
+//     rAtk=0 and mAtk=0                          ⇒ the test fight never engaged; retest.
+//   rTgt/cm also give P4-1 its first read (can the rider hold an attack target while its
+//   CharMovement is destroyed and we halt() it every frame).  ⚠ The note that used to sit
+//   here - "CombatClass is deliberately NOT dereferenced, cc= is just the pointer's
+//   nullness" - is obsolete since P4-1b: the minimal shim at the top of this file reaches
+//   its non-virtual members without touching the build script.  P3CMB still only reads the
+//   pointer, because its job is a cheap per-frame signature; the deep read is P41B's.
+static const unsigned int kCmbBaseGap = 120;  // baseline line every N frames
+static const int          kCmbBudget  = 400;  // lines per ride, debug only
+static int          gCmbBudget = 0;
+static int          gCmbSig    = -1;   // last logged state signature; -1 = nothing logged yet
+
+// ---- P4-1b: WHY is a carried rider not a combat participant? -----------------------
+// P3-3 and P4-1a both answered the gate question from the outside and both said "not a
+// participant in either direction": over 158 + 61 samples of two independent fights the
+// rider had rAtk=0 / cm=0 / cmM=0 / rTgt=0 while the mount collected up to 16 attackers and
+// held a target of its own.  Not our doing - the suppression in CombatAndForceDismountPass
+// and the redirect in newPlayerTask_hook are both IsBigMount-gated and both rides were
+// mode=1 (neck=0 in every sample).
+//
+// P4-1a tried to drive the rider->enemy direction by hand and came back INCONCLUSIVE, for
+// three reasons that this phase removes one by one:
+//   1. getAllAttackers() registers an attacker the moment it DECIDES to attack, not when it
+//      arrives, so the single order that fired went out at d=971.36.  ⇒ gate on kAtkTryRange.
+//   2. `if (best == gAtkAsked) return;` (one attempt per distinct target) then suppressed
+//      every short-range retry once that same character stayed the nearest.  ⇒ retry on a
+//      frame cooldown instead, and cycle through escalating levers.
+//   3. The player had 被动 (passive) on, so the rider had no counter-attack trigger.
+//      ⇒ the retest instruction is passive OFF.
+//
+// The real upgrade is on the READ side.  P41B asks the engine its own questions instead of
+// inferring from distances, and the two that matter most are new:
+//   reach= CombatClass::weaponReach()  vs  d=  : the actual melee reach number.  TASK.md's
+//          P3 premise 「把骑手抬到 6-10u 高可能让双方都打不到」 has never been checked against
+//          it.  d<reach with nothing happening ⇒ reach is NOT the blocker and the ground-Y
+//          lever stays skipped; d>reach always ⇒ it is, and the fix is positional after all.
+//   inZ= / nearZ= : isInAttackZone() / getNearestEnemyInAttackZone(), i.e. the engine's own
+//          verdict on "can I hit that from here", which is the question the whole phase is
+//          about.  nearZ=1 (it names OUR enemy) with rTgt=0 is the sharpest possible split:
+//          the rider can see a hittable target and still refuses to hold it.
+//   eGet= enemy->areYouGonnaGetMe(rider) : the enemy's own verdict on whether it will come
+//          for the rider.  0 at short range IS the enemy->rider refusal, and _isBeingCarried
+//          is the first suspect.
+//   ordProb= rider->checkPlayerOrderForProblems(FOCUSED_MELEE_ATTACK, enemy) : if the engine
+//          itself rejects a player attack order on that target, attackTarget() doing nothing
+//          needs no further explanation.
+//
+// Write side = an escalating ladder, one rung per cooldown, logged before and after so each
+// rung is attributable.  Rungs 0-1 are AI-path, 2 bypasses the AI, 3-4 inject the trigger
+// the engine never delivered:
+//   0  rider->attackTarget(enemy)                     - the P4-1a order, now at short range
+//   1  the same + rider->reThinkCurrentAIAction()      - in case the order lands but the AI
+//                                                        never re-plans (destroyed movement
+//                                                        makes isDestinationReached() true
+//                                                        forever, so the approach step looks
+//                                                        finished and may be re-planned away)
+//   2  cc->setAttackTarget(enemy)                      - direct field write, no AI involved.
+//                                                        Readback splits "the AI refuses" from
+//                                                        "the target slot itself won't hold".
+//   3  rider->attackingYou(enemy, true, false)         - tell the RIDER it is under attack.
+//                                                        This is the trigger 被动 needs and the
+//                                                        one the engine failed to deliver.
+//   4  enemy->attackingYou(rider, true, false)         - tell the ENEMY the rider is attacking
+//                                                        it, with doAwarenessCheck=false, which
+//                                                        directly tests whether the awareness
+//                                                        path is what hides a carried rider.
+// Pre-registered readings:
+//   any rung makes rTgt stick and act>1 appears  -> a carried rider CAN fight; P4-1 passes on
+//                                                   candidate (2) and the load-bearing carried
+//                                                   state is never touched.  Cheapest rung wins.
+//   rTgt flips then drops back every time        -> something clears it per frame; suspect the
+//                                                   destroyed CharMovement first, our own
+//                                                   halt() second.
+//   rung 2 holds but rungs 0-1 do not            -> the AI layer is the refuser, not the combat
+//                                                   class; drive the attack directly (P4-3).
+//   nothing holds anywhere, ordProb/eGet explain -> only candidate (1) (restore() the movement
+//     it                                            back into the physics world) can move
+//                                                   this, at the cost of 「不被坐骑碰撞体推挤」.
+//   act>1 in the pose DBG line                   -> the rider actually swung.  P3-3 and P4-1a
+//                                                   both had ZERO act>1 frames, so that field
+//                                                   is a clean baseline.
+// Debug-gated on purpose: unlike every other probe in this file this one WRITES real game
+// state, so a normal player never reaches it.
+//
+// ---- P4-1b RESULT (2026-08-29, DLL 258560 B / md5 F959E470F426399008129365D7ED7E1C) ------
+// The gate PASSES on candidate (2).  User report: 「诊断已开，骑手掉血，并且攻击了敌人，只是
+// 没有攻击动作。」  20 rungs all fired in one ride (tries_left 19->0) and the timeline
+// attributes every flip:
+//   rung 2 (cc->setAttackTarget + setAttackTargetHandle) : cTgt 0->1 same frame, held for all
+//          30 later reads to end of ride.
+//   rung 3 (rider->attackingYou(enemy,true,false))       : opp 0->1 same frame, lst 0->1 on
+//          the next read, P3CMB rAtk 0->1 on the very next sample - all held to end of ride.
+//          rAtk was 0/61 in P4-1a and is {0:37, 1:29} here.
+//   rungs 0-1 (Character::attackTarget, ±reThinkCurrentAIAction) : rTgt=0 in 20/20 rung
+//          readbacks and 33/33 reads.  That is verbatim the pre-registered 「rung 2 holds but
+//          rungs 0-1 do not -> the AI layer is the refuser」 reading.
+//   rung 4 (enemy->attackingYou(rider,...)) : no visible change; eLstR 0/33 and eTgt=2 (the
+//          mount) in 33/33 reads - the enemy never retargets onto the rider.
+// ⇒ candidate (1) (restore() the CharMovement back into the physics world, at the cost of
+//   「不被坐骑碰撞体推挤」) stays UNOPENED, and the load-bearing carried state is untouched.
+//
+// The one thing still missing is the swing, and the read line named its mechanism:
+//   reach=0.00 in ALL 33 reads - including the first, before any of our writes - against the
+//   enemy's eReach=9.00.  With reach 0, isInAttackZone() can never be true, and indeed
+//   in=0 / cm=0 / cmM=0 / inZ=0 / nearZ=0 / atkg=0.00 throughout, with ZERO act>1 pose frames.
+// Distance is exonerated, which independently keeps the 「鞍座 XZ + 貼地 Y」 lever skipped:
+//   reads got to d=9.60 / dxz=9.25 and P3CMB to dM3=7.79 / dR3=9.69, i.e. INSIDE the enemy's
+//   own 9.00 reach, while inZ stayed 0.  And nothing refuses: ordProb=0, rGet=0, eGet=0,
+//   noAgg=0 in 33/33.  The rider simply never enters combat mode.
+//
+// ---- P4-1c RESULT (2026-08-29, DLL 262656 B / md5 4B4C230A6535C5FC15F9186DB2389B9D) -------
+// User report: 「配备了武器，骑手发动攻击并掉血，没有攻击动作，忘记下马了。」  Only 3 rungs and
+// 4 reads ran (the budgets are 20/60) because the SEH shell zeroed both on the rung-3 AV.  The
+// timeline below is interleaved BY FILE OFFSET - that ordering is what makes per-rung
+// attribution valid at all:
+//   read  d=39.92 | cma=0 tech=0 reach=0.00 in=0 cst=3/3 | wpn=0 aCW=5 aCM=0 | e cma=1 reach=9
+//   RUNG 0 rAnim->setCombatMode    icm=-1 -> cma=0 tech=0 reach=0.00 cst=3 | rTgt=0 aCM=1
+//   read  d=19.38 | cma=0 tech=0 reach=0.00 in=0 cst=3/3 | aCM=0       <- engine cleared aCM
+//   RUNG 1 initCombatMode(focus)   icm=1  -> cma=1 tech=0 reach=0.00 cst=4 | rTgt=1 aCM=0
+//   read  d=15.61 | cma=1 tech=0 reach=0.00 in=1 cst=3/3 nxt=8 | aCM=1 <- engine set aCM itself
+//   RUNG 2 initCombatMode(nofocus) icm=1  -> cma=1 tech=0 reach=0.00 cst=4 | rTgt=1 aCM=0
+//   read  d=19.27 | cma=1 tech=0 reach=0.00 in=1 cst=4/4 | aCM=1
+//   !! AV - lever abandoned
+// ⇒ initCombatMode IS the lever P4-1b lacked: combatModeActive 0->1 with _isInCombatMode()
+//   agreeing, rTgt 0->1 (it was 0 in 33/33 P4-1b reads), combatState 3->4, and it HOLDS to the
+//   end of the log (P3CMB 273 rows; cm/cmM/rTgt all {0:62, 1:211}).
+// ⇒ the pre-registered branch that fired is 「cma=1 while reach=0.00 ⇒ the missing piece is the
+//   technique」.  currentTechnique(0x150) read NULL in 4/4.
+// The raw fields are trustworthy as a batch, because the enemy is a positive control: eCma=1
+//   4/4, eTech=1 3/4, eReach=9.00 4/4, eCst=0 (CHOP_WEAPON) 3/4, mei=5.60/19.00, blk=1 4/4, and
+//   cst(0x1F0) vs getCombatState() disagreed in 0/4.
+// Four things the run settled for good:
+//   ⚠ nxt(0x1F4, nextMove) is UNUSABLE and is dropped from the probe: 1818135763 in the two
+//     reads before combat mode, 8 in the two after.  Not a wrong offset - uninitialised until
+//     combat mode starts, which turns the engine's own write to it into evidence instead.
+//   ⚠ the engine ticks the rider's combat machine by itself: cst went 4 (DECISION, ours) -> 3
+//     (STARTUP_STATE) between reads, and the aCM we set was cleared and then set AGAIN by the
+//     engine once cma=1.  So aCM is a SLAVE of combatModeActive, not a lever - old rung 0
+//     (rAnim->setCombatMode) is deleted - and hand-ticking go(float)@0x60C4D0 is not needed.
+//   ⚠ the rider holds NO weapon.  wpn=0 in 4/4 (getCurrentWeapon()==NULL) although the player
+//     had equipped one, and the animation side independently reported aCW=5 = SKILL_UNARMED
+//     against the enemy's eWpn=1.  Both sides agree ⇒ sheathed, or never drawn.  That is the
+//     most boring explanation for tech=0/reach=0, and it becomes rung 0 below.
+//   ⚠ the AV was rung 3, calculateTargetsInAttackZone()@0x608020 - the offset-ordered timeline
+//     puts !! AV directly after RUNG 2.  Likeliest cause: it dereferences the NULL
+//     currentTechnique.  The rung is gone and __except now disarms only the faulting rung.
+// Honesty boundary: the four reads sat at d=39.92/19.38/15.61/19.27, so the rider never got
+//   within 9u and inZ=0/nearZ=0 is ALSO explainable by distance.  reach=0 is the one hard,
+//   distance-independent fact; this run does NOT support the stronger claim that the attack
+//   zone failed to open purely because of reach.
+// Still no swing: act>1 in 0 of 24579 pose frames.
+// ---- P4-1d: the boring explanation first, then the direct swing --------------------------
+// Probe repairs carried in from the run above: old rung 0 (rAnim->setCombatMode, a slave) and
+// old rung 3 (calculateTargetsInAttackZone, the AV source) are deleted, nxt= is dropped, every
+// log prefix is P41D so a new log can never be mistaken for a P41C one, and __except now marks
+// gRungDead[gAtkCurRung] instead of zeroing the budget - one faulting rung no longer costs the
+// other four their turn.
+// The two rungs P4-1b proved keep being applied every tick, idempotently (only when the field
+// does not already say what we want), and the precondition now ALSO applies
+// initCombatMode(tgt, 0, false) whenever cma != 1.  So combat mode is up from the first tick
+// and every rung below is tested on top of it rather than racing it.
+// New read-only fields:
+//   pWpn= / pCat=  does getThePreferredWeapon() (vtable 0x3C8) hand back anything, and what
+//        WeaponCategory is it (Gear.h:49, @0x5C71D0).  This is what separates "the rider owns
+//        no weapon" from "the rider owns one and never drew it" - the P4-1c wpn= field only
+//        ever answered the second half, because getCurrentWeapon() is a DRAWN-weapon test.
+//   cTech=  AnimationRequirement::_currentCombatTechnique (0x118 within animationRequirements,
+//        public member) - the animation side's own technique pointer, independent of
+//        CombatClass::currentTechnique(0x150).
+//   chTech= / chAnim= / chInit= / chMinS=  a DRY RUN of
+//        CharStats::chooseAttack(range, syntheticReach, NULL, false).
+//        ⚠ the synthetic reach IS the point.  chooseAttack takes weaponReach as an ARGUMENT, so
+//        asking it "which attack would you pick if reach were R" steps outside the
+//        no-reach -> no-technique -> no-reach circle that P4-1c measured, instead of being
+//        trapped in it.  R = the rider's own weaponReach() if > 0.01, else the enemy's, else
+//        9.0f.  range = the measured distance to the target; lastAttack = NULL;
+//        opponentIsStationary = false.
+//        chAnim is CombatTechniqueData::animation (offset 0x0) = the human swing clip's RECORD
+//        name.  That single field answers TASK.md P4-3 premise 1 (「原料不在 AnimList::attacks」)
+//        outright, and feeding it through allAnims.find() + LogAnimRow prints its layer and
+//        `whole` bit = premise 2.  ⚠ find() ONLY, never getAnimationData(): that one has
+//        operator[] semantics and would insert a permanent NULL into the engine's own table on
+//        a miss (CLAUDE.md「关键机制」).  A miss is logged as ABSENT and is itself a finding.
+// The ladder, most boring first:
+//   0  drawWeapon(getThePreferredWeapon(), "")     - vtable 0x3D8 / 0x3C8.  The Weapon* is
+//                                                    reinterpret_cast to Item* (the whole
+//                                                    Weapon:Gear:Item chain is annotated
+//                                                    offset 0x0; a language upcast will not
+//                                                    compile while both types are incomplete).
+//   1  ((CombatClassAI*)cc)->_NV_initCombatMode(tgt, 0, true)
+//                                                  - the FOCUSED variant, on the corrected
+//                                                    dispatch target 0x667A60.  The unfocused
+//                                                    one already runs every tick above, so this
+//                                                    rung is now only about focusedTargetMode.
+//   2  CcSetPtr(cc, 0x150, chTech)                 - hand the already-turning state machine the
+//                                                    technique it lacks.  Only ever fed a
+//                                                    pointer chooseAttack just returned.
+//   3  rAnim->runCombatAnimation(chTech, 1.0f, "") - @0x5B6E80, public, no shim.  The direct
+//                                                    swing that bypasses combat state, attack
+//                                                    zone, reach and target lists entirely.
+//                                                    Deliberately late: it is the one rung that
+//                                                    proves capability rather than correctness.
+//   4  cc->changeState(CHOP_WEAPON, 0.0f)          - the rung P4-1c never reached (the AV ate
+//                                                    it), now run with a technique present.
+// endCombatAnimation()@0x5B34E0 runs in Dismount(), unconditionally, so rung 3 can never leave
+// a swing hanging on a rider that is no longer mounted.
+// Pre-registered readings:
+//   act>1 right after rung 0                       ⇒ the entire problem was a sheathed weapon;
+//        the AI layer was never broken and P4-2/P4-3 start from a much smaller place.
+//   act>1 after rung 2 (0 did nothing)             ⇒ the state machine only lacked a technique,
+//        and chooseAttack is where techniques come from - that is the production path.
+//   act>1 after rung 3 while 0 and 2 did nothing   ⇒ we CAN swing but have to drive it
+//        ourselves; P4-3 changes from "find the clip" to "call runCombatAnimation on every
+//        attack", and the engine's own combat animation dispatch stays unused.
+//   all four rungs run and act stays 0             ⇒ the swing is being suppressed by the POSE.
+//        If chAnim carries `whole`, it collides with kRidePose by exactly the mechanism P2-1b
+//        measured (a `whole` clip pins everything else at w=0.000), and P4-3 goes straight to
+//        layering / manually-controlled bones instead of clip hunting.
+//   pWpn=0                                         ⇒ not even a PREFERRED weapon exists; the
+//        answer is in the equipment slots, not in the combat layer, and rung 0 is a no-op.
+//   chTech=0                                       ⇒ chooseAttack refuses even with a synthetic
+//        reach; then the blocker is skills/encumbrance/weapon category, not reach at all.
+//   chAnim resolves to ABSENT in allAnims          ⇒ attack clips are not keyed by record name
+//        in the human table, and P4-3's clip lookup needs a different container after all.
+//   cst/gcs disagree, or mei= is absurd            ⇒ an offset is wrong for this build; discard
+//        every raw field in the line and re-derive before believing any of it.
+static const int          kAtkTryBudget = 20;     // hand-issued attempts per ride (4 cycles)
+static const int          kAtkReadBudget = 60;    // read lines per ride; outlives the ladder
+static const unsigned int kAtkTryGap    = 75;     // frames between rungs
+static const float        kAtkTryRange  = 40.0f;  // only ever order a target this close
+static const int          kAtkStages    = 5;
+static int          gAtkTries     = 0;
+static int          gAtkReads     = 0;
+static unsigned int gAtkLastFrame = 0;
+static int          gAtkStage     = 0;   // next rung of the ladder
+// Which rung is executing right now, so __except knows what to blame; -1 = none in flight.
+// gRungDead[] is P4-1c's lesson: that run's single AV on rung 3 zeroed the whole budget and
+// cost rung 4 its turn entirely.  A rung that faults is now disarmed on its own and the ladder
+// keeps going past it.
+static int          gAtkCurRung   = -1;
+static bool         gRungDead[kAtkStages] = { false, false, false, false, false };
+
+// ---- P4-1e: mounting SHEATHES the rider's weapon -------------------------------------
+// MEASURED IN GAME (2026-08-29, user report): the weapon can only be drawn on foot, and
+// the moment the rider boards it goes back onto the back.  That single observation explains
+// the entire weapon column of the P4-1d read line at once - wpn=0 (getCurrentWeapon is a
+// DRAWN-weapon test), pWpn=0 (getThePreferredWeapon reads NULL in that state), aCW=5
+// SKILL_UNARMED - and it demotes "chooseAttack refuses to name a technique" (ch=0 43/43)
+// from a mystery to a consequence: an unarmed character has no weapon technique to choose.
+// ⚠ The other half of the same report - "no other action while mounted" - is NOT evidence
+// about the weapon: kRidePose carries wholeBodyAllLayer and PoseLayerPin holds it at 1.0,
+// which P2-1b-1 measured to hold every other clip at w=0.000.  Invisible is by design.
+//   So this probe stops asking the combat layer anything and puts the weapon back in the
+// hand first: getPrimaryWeapon() asks the equipment slots (drawn or not), drawWeapon()
+// (vtable 0x3D8, CharacterHuman @0x5DB800) is the engine's own draw.
+//   ⚠ Deliberately NOT every frame, and NOT unconditional.  The shape looks like the
+// every-frame ragdoll kill, but drawWeapon moves equipment and animation while clearing a
+// ragdoll bit is nearly free, so it is gated on getCurrentWeapon()==NULL, rationed by
+// budget, and spaced by kDrawTryGap.  Which of the two shapes this actually is - a one-shot
+// state transition at mount, or a per-frame overwrite - is the thing the counter decides:
+// re-drawing against a per-frame writer is exactly the failure HISTORY §B is about, so it
+// has to be settled by data before any repeat-forever version gets written.
+// Pre-registered readings (P41E lines):
+//   sw=0                     ⇒ the equipment slots do not show a weapon either; then the
+//        dump line's per-section [slot:count] pairs say where it actually went.
+//   post=1 on attempt 1, no attempt 2 ⇒ one-shot sheathe, and this prologue IS the fix.
+//   n climbing every ~kDrawTryGap frames ⇒ per-frame re-sheathe; do NOT raise the rate,
+//        find and kill the writer instead (HISTORY §B).
+//   post=0 every attempt but a later P41D read shows wpn=1 ⇒ the draw is deferred through
+//        an animation/queue and works anyway; judge it from the read line, not from post=.
+//   post=0 and wpn=0 forever ⇒ drawWeapon is refused while mounted.  Then the suspects are
+//        the carried state (_isBeingCarried / destroyed CharMovement) and the draw ANIMATION
+//        being suppressed by the whole-body pose pin - i.e. it would be a pose-side problem
+//        wearing an equipment-side mask, and P4-3 swallows it.
+static const int          kDrawTryBudget = 12;   // drawWeapon calls per ride
+static const unsigned int kDrawTryGap    = 10;   // frames between attempts; fine enough to
+                                                 // catch a per-frame re-sheathe, coarse
+                                                 // enough not to spam equipment changes
+static int          gDrawTries     = 0;
+static int          gDrawCalls     = 0;   // attempts so far this ride (the discriminator)
+static int          gDrawNoWpn     = 0;   // "slots are empty" already reported this ride
+static unsigned int gDrawLastFrame = 0;
+static int          gInvDumped     = 0;   // one equipment-slot dump per ride
+
+// P4-1e-2: the whole block above used to live inside RiderCombatLever, i.e. behind "a live
+// attacker is within kAtkTryRange".  MEASURED 2026-08-30 (user report): fighting on foot and
+// THEN mounting drops the existing aggro - the enemies stop treating the pair as a target -
+// so that gate cannot be relied on to fire at all, and the P4-1e build produced zero P41E
+// lines for a second reason on top of diagnostics being off.  "Can a mounted rider draw a
+// weapon" is not a combat question anyway, so the probe now runs every frame while mounted
+// under debugContinuous with no attacker requirement: mount, press Ctrl+NUM., read the log.
+//   The aggro loss itself becomes data here rather than an anecdote - the state line reports
+// both attacker lists alongside the weapon fields, on signature-change + periodic baseline
+// (same shape as P3CMB) so "aggro was never there" and "aggro was there and vanished" are
+// distinguishable, and so is "aggro survives but the weapon does not".
+static const int          kArmBudget  = 60;   // state lines per ride
+static const unsigned int kArmBaseGap = 120;  // baseline line every N frames
+static int          gArmBudget = 0;
+static int          gArmSig    = -1;
+
+// P4-1f: WHICH LAYER puts the weapon back on the back?  P4-1e-2 measured (2026-08-30) that
+// drawWeapon is NOT refused while mounted - 12/12 post=1 - and that the weapon then returns to
+// the back after ~14 frames, with cma=1 for the whole ride.  So "combat ended -> auto-sheathe"
+// explains the FIRST sheathe (cm was already 0 the frame after boarding) but not the repeat:
+// there is a second writer, and it is bound to the mounted/carried state rather than to combat.
+//   The discriminator is ORDERING between the equipment flag (getCurrentWeapon) and the
+// animation requirement (animationRequirements.currentWeapon), and single-frame samples are
+// enough because this probe runs every frame:
+//   an intermediate frame wpn=1 aCW=5 ⇒ the ANIMATION layer let go first.  First suspect is our
+//        own pinned kRidePose - "sitting chair" carries wt=0x1F, narrower than the 0x13F generic
+//        rows - i.e. the engine forcing the weapon away to keep the clip legal, which would make
+//        this a pose-side problem wearing an equipment-side mask (and P4-3 swallows it).
+//   an intermediate frame wpn=0 aCW=0 ⇒ the EQUIPMENT layer went first and the animation only
+//        follows; then the writer is sheatheWeapon and its callers.
+//   a direct (1,0)->(0,5) jump ⇒ one writer does both in the same frame, and the next lever is
+//        timing rather than layering.
+// Logged on CHANGE only - the pair holds for ~14 frames at a time - so a two-step flip shows up
+// as two lines with different f=, which is precisely the reading above.  Sampled at the TOP of
+// the probe, before our own draw attempt, so each line is the state the engine left behind and
+// our own 0->1 edges are attributable by the matching f= on the P41E draw line.
+static const int kEdgeBudget = 60;   // weapon-state edges per ride
+static int gEdgeBudget = 0;
+static int gEdgeWpn    = -1;         // -1/-99 = nothing sampled yet this ride, so the first
+static int gEdgeACW    = -99;        // line always prints and records the entry state
+
+// ---- P4-1g: does a draw animation ever reach the layers? -----------------------------
+// P4-1f answered its own question and killed its own leading suspect: 47/47 edges flipped
+// getCurrentWeapon and animationRequirements.currentWeapon in the SAME frame (disagree=0),
+// so one writer does both and the animation layer is not "letting go first".  Then the user's
+// visual report reframed the whole thing: the weapon is never in the rider's hands ON SCREEN,
+// not even during the ~18 frames each forced drawWeapon holds wpn=1 (12 attempts x 18 frames
+// is ~2 seconds of "drawn" field state that nobody could see).  So the field write succeeds
+// and the visible draw never happens - which puts the cause UPSTREAM of the revert.
+//   The named mechanism for that is P2-1b-1 (measured 2026-08-29): a pose carrying
+// wholeBodyAllLayer presses every other clip to w=0.000 even when the request lands in
+// addList - 'crawl idle down' sat at w=0.000/ms=-1.000 for 900 frames while its t01 advanced
+// normally.  We pin kRidePose ("sitting chair", whole) at weight 1.0 EVERY frame, so that
+// mechanism is armed against anything the draw wants to play.
+//   Readings, pre-registered:
+//   a draw/sheathe/action clip present with w=0.000 (ms=-1.000) ⇒ suppression CONFIRMED, and
+//        the line hands us its RECORD name (dataName), which is what P4-3 needs and what the
+//        allAnims.find() rule requires before that name may ever reach getAnimationData().
+//   no such clip in any layer, ever ⇒ drawing is not animation-driven here; the revert has
+//        another cause and the next lever moves to the attach side (weaponInHands 0x6D8 /
+//        weaponInHandsSheathLocation 0x6E0 / ATTACH_WEAPON=0).
+//   the clip present with w>0 ⇒ it does play, the animation is exonerated, and the missing
+//        visual is purely an attachment problem - same next lever, different reason.
+// The req= header line is the other half: checkWeaponArms/checkModes score every candidate
+// against animationRequirements, so weaponL/weaponR/carried/isCombatMode are the fields that
+// can refuse a draw clip before it is ever added, and _currentAction names it directly if
+// drawWeapon does set one.  ⚠️ YesNoMaybe has BOTH operator bool and operator ynm, so an
+// (int) cast on it is ambiguous - read the .key member.
+// READ-ONLY on purpose: this phase changes no behaviour, so every v1.6/v1.7 result stays
+// valid.  Windowed rather than continuous because one hold is only ~18 frames, so a single
+// window covers a whole draw-to-revert cycle including both endpoints; the budget is sized
+// for the baseline plus two full cycles.
+static const int kArmDumpFrames = 20;   // frames dumped per draw attempt (>= one 18f hold)
+static const int kArmDumpBase   = 3;    // baseline frames at the start of a ride
+static const int kArmDumpBudget = 44;   // total dump frames per ride (~2 full cycles)
+static int gArmDumpLeft   = 0;
+static int gArmDumpBudget = 0;
+
+// ---- P4-1h -------------------------------------------------------------------------------
+// P4-1g answered its pre-registered question in the sharpest of the three forms: no draw clip
+// is ever SUPPRESSED because none is ever REQUESTED.  132 dump frames over 3 rides only ever
+// held 'sitting chair' (ours, pinned at 1.000), 'carry me' (asked for at dw=1.000 every single
+// frame and held at w=0.000/ms=-1.000 with no Ogre::AnimationState at all - the exact P2-1b-1
+// signature, re-proved in the shipping pose) and the pre-mount locomotion fading out.
+// _currentAction was NULL in 132/132 samples INCLUDING all 10 taken in the same frame the
+// forced drawWeapon returned, while the bookkeeping that call does write is correct (aCW 5->0,
+// wR 0->1).  So two independent things are broken and neither one is "the draw clip lost its
+// weight":
+//   (A) the visible draw is an ATTACHMENT matter that the animation path was never going to do;
+//   (B) once the whole-body pose is pinned, no NEW clip can play at all.
+// This phase reads the deciding field for each, and fixes the windowing flaw that put all 132
+// P4-1g frames out of combat (the budget went in the first ~48 frames of every ride,
+// f=14503-33764, while the fight was f=34859-38760 - overlap zero), which is why that run's
+// iCM=0 carries no claim whatsoever about combat.  Still strictly READ-ONLY: no behaviour
+// changes, so every v1.6/v1.7 result stays valid.
+//
+// (A) weaponInHands (CharacterHuman 0x6D8) is the logical "in the hands" slot, and
+//     weaponInHandsSheathLocation (0x6E0) names the sheath it left.  Pre-registered binary
+//     reading, taken across the forced draw:
+//       non-NULL after -> the logical hand slot IS set and only the scene attachment never
+//         refreshed; the next lever is the attach call itself (ATTACH_WEAPON).
+//       still NULL     -> drawWeapon does not get that far while carried and the field is
+//         gated behind the action that never runs; the next lever is driving attach directly.
+//     Read via isHuman() (virtual, hands back the derived pointer or NULL) rather than
+//     !isAnimal(), so the downcast is the engine's own answer instead of our inference.  Both
+//     annotated offsets are only ever READ here - a wrong one would be a runtime AV, which is
+//     precisely why the read comes before anything writes.
+//
+// (B) the slave sub-block: isActionSlave (0xB8), forcedSlaveLoop (0x110) and
+//     attachRootToMastersBone (0xC0).  We set forcedSlaveLoop ourselves every frame, so the
+//     point is not to discover it but to see whether the engine KEEPS it and whether the rider
+//     is flagged an action slave - i.e. whether the freeze is our own channel (P4-3 then has
+//     to give that channel up) or a property of the carried state (P4-3 then cannot).
+static const int kArmDumpCmbGap    = 60;  // stride between combat dumps (~0.5s at 130fps)
+static const int kArmDumpCmbBudget = 72;  // combat-only dumps per ride, on its own budget
+                                          // (P4-1i: three probe modes share it, ~24 each)
+static int gArmDumpCmbBudget  = 0;
+static int gArmDumpCmbEntries = -1;       // layer entry count last sample (-1 = not in combat)
+// ---- P4-1i: is the engine's requirement chooser reachable for a mounted rider? -------
+//
+// P4-1h answered both pre-registered questions and left one fork.  (A) the forced drawWeapon
+// DOES set CharacterHuman::weaponInHands (12/12 wih=0->1) - the logical hand slot is fine and
+// only the scene attachment never refreshes.  (B) isActionSlave=1 with
+// forcedSlaveLoop='sitting chair' in 92/92: the engine keeps OUR slave channel, so the
+// animation freeze is our own doing.  And the combat window finally landed: iCM=1 in 48/48
+// combat samples (the combat-mode gate IS satisfied) while cTech=0, act='', wpn=0, wih=0 and
+// ZERO cmb+ lines - the rider's layer set never gained or lost an entry for the whole fight
+// (48 dumps x exactly 2 records: pinned 'sitting chair' + suppressed 'carry me').  moveSpeed
+// sat byte-identical at 61.13 across all 92 samples spanning mount fade-in, standing, moving
+// and a real fight.  That last number is the tell: the requirement chooser looks like it
+// never runs for this character at all.
+//
+// Two candidate gates, leading to completely different P4-3 designs:
+//   our own pinned pose -> P4-3 swaps the whole-body pose pin for manual bones + blend masks
+//                          (LegPosePass already proves a clip cannot move a manually
+//                          controlled bone) and hands the upper body back to the engine.
+//   the carried state   -> P4-3 has to restore the rider's CharMovement (pickupObject
+//                          destroy()ed it, which is also why moveSpeed can never update), or
+//                          drive attack poses bone by bone ourselves.
+//
+// So this phase is a DRY RUN of the target architecture, not another read: while the rider is
+// in combat, stop asserting the channel and watch whether the chooser wakes up.  Three modes
+// cycle every kP41iModeGap frames so one fight covers all of them, control included:
+//   0  ship behaviour, untouched (the in-fight control)
+//   1  slave channel released - no forcedSlaveLoop, no runSlaveAnim/runAnimation, no
+//      PoseLayerPin.  Carried-pose suppression (carried=false + stopAnimation("carry me")) is
+//      KEPT, so a chooser that does run is free to pick something combat-like instead of
+//      being shoved straight back into ANIM_CARRIED.
+//   2  fully hands off - mode 1 plus giving up that suppression too.  It needs its own slot
+//      because "chooser runs but picks the carried pose" and "chooser never runs" are
+//      indistinguishable from mode 1 alone.
+//
+// Pre-registered reading: if cTech/act go non-NULL, spd unfreezes, or cmb+ lines appear in
+// modes 1/2 but not in mode 0, the blocker is our pose pin and the target architecture is
+// reachable.  If all three modes look like mode 0, the gate is the carried state / destroyed
+// movement and P4-3 goes the movement-restore route.
+//
+// Safety: gated on debugContinuous AND rider-in-combat, so a normal session and every
+// out-of-combat frame stay byte-identical to the shipping path.  SyncRiderNode and the
+// per-frame ragdoll kill are untouched - the rider stays in the saddle; only the pose is let
+// go, and it recovers by itself when mode 0 comes round (runSlaveAnim/runAnimation fade it
+// back in, and LegPosePass re-arms through its own weight>=0.5 gate - the same gate that
+// releases the legs while the pose is down, so no leg can be left stuck at 45 degrees).
+//
+// P4-1i VERDICT (2026-08-30): the release worked and NOTHING woke up - but the probe had a
+// hole, which is why P4-1j exists.  Combat was continuous for ~8400 frames (30 mode slots,
+// iCM=1 in all 72 samples; the player's enemy-kiting counts as combat).  All twelve sampled
+// fields were byte-identical across all three modes: aCW=5 iCM=1 cTech=0 act='' wpn=0 wih=0
+// slave=1 fsl='sitting chair' cat=0 spd=48.04 lays=5 idle=0/0/0, and spd held that same value
+// in the 44 out-of-combat samples too (48.04 this session vs 61.13 last => a snapshot taken at
+// mount time, frozen thereafter).  The release itself was real: 28/28 mode-1 dumps had an
+// EMPTY addList, LegPosePass released 9 times and re-armed 10, and the player saw three
+// distinct states matching the three modes one-for-one - bind pose (mode 1, i.e. no clip at
+// all), the vanilla carry pose (mode 2, the carry system's force-play simply not being kicked
+// out), and our seat (mode 0).  The 9 cmb+ lines all sit within 1-25 frames of a mode
+// boundary => our own switching, zero engine-side events.
+//
+// The hole: forcedSlaveLoop and isActionSlave are STICKY.  Modes 1/2 stopped writing them but
+// never cleared them, so slave=1 fsl='sitting chair' stood the whole time.  Handing the layers
+// back is therefore not the same as handing the CHARACTER back, and "the engine won't take the
+// upper body" currently has two possible causes.  P4-1j zeroes both fields every frame in
+// modes 1/2 to split them - see the else branch in the animUpdate pre-pass.
+//
+// One conclusion is already firm and it constrains P4-3: handing the upper body back is not a
+// thing the engine will do on its own.  With nothing asserted it renders the BIND pose, not an
+// idle or a guard stance, so whatever P4-3 becomes, something has to drive the upper body
+// actively.
+// A+C build (2026-08-30) rotated three slots for one fight: 0 = ship, 1 = route A ('guard 1h'
+// pinned at 1.0, the stance owning the whole torso and LegPosePass owning the legs), 2 = route
+// C (ride pose AND stance both at 0.5).  ⚠️ THE ROTATION IS RETIRED - it answered its question
+// and route A won.  Verdict and the numbers behind it:
+//   * The player saw A as a real sword guard with the straddle intact; C kept half the seat's
+//     own shaping but the arms did not read as "on guard".
+//   * C's weak arms are STRUCTURAL, not a pin failure: mode 2's 30 samples read w/dw/acw/ms
+//     all exactly 0.500, and pw/pms 0.500 on 27 of them, i.e. the pin held BOTH clips at half
+//     weight on the engine and the render side.  There is no weight to tune that does not
+//     simply turn C into A, so do not revisit C by nudging 0.5.
+//   * Mode 1 held w=1.000 on 27/30 with pw=-1.000 throughout (the ride pose genuinely leaves
+//     the layers, as designed), and kept= was 1.0000 on all 66 leg samples, so masking every
+//     weighted contributor covers a stance host too.
+// P4-1M therefore replaces the rotation with RideCombatStance() (defined next to
+// MountCombatEligible, which needs SeatInfo and so cannot be reached from here): route A is
+// what a mounted fighter looks like, in normal play, with no debugContinuous gate.
+static bool gRideStanceOn   = false;  // last frame's decision; read by the DBG tag
+static int  gRideStanceLast = -1;     // for the transition log only
+
+// Total entries over every layer's addList+removeList.  A clip entering or leaving the rider's
+// layers moves this number, and that event is the one worth spending combat budget on: a
+// stride on its own would very likely step straight over a swing.  Same bounds guards as the
+// dump below - this walks the same dangling-prone lektors.
+static unsigned int CountRiderLayerEntries(AnimationClass* rAnim)
+{
+    if (!rAnim || !rAnim->layer.valid()) return 0;
+    unsigned int nl = rAnim->layer.size();
+    if (nl == 0 || nl > 32) return 0;
+    unsigned int total = 0;
+    for (unsigned int li = 0; li < nl; ++li)
+    {
+        AnimationClassBase::AnimationLayer* lay = rAnim->layer[li];
+        if (!lay) continue;
+        for (int pass = 0; pass < 2; ++pass)
+        {
+            lektor<AnimationClassBase::SingleAnimation*>& lst =
+                pass ? lay->removeList : lay->addList;
+            if (!lst.valid()) continue;
+            unsigned int n = lst.size();
+            if (n > 64) continue;
+            total += n;
+        }
+    }
+    return total;
+}
+
+// weaponInHands plus the sheath it names, or NULL/"?" when the rider is not a CharacterHuman.
+// The returned pointer aliases the engine's std::string, so a caller that keeps it across an
+// engine call has to copy it first (the draw probe does).
+static Weapon* RiderWeaponInHands(Character* rider, const char** sheathOut)
+{
+    CharacterHuman* h = rider ? rider->isHuman() : NULL;
+    if (!h) { if (sheathOut) *sheathOut = "?"; return NULL; }
+    if (sheathOut) *sheathOut = h->weaponInHandsSheathLocation.c_str();
+    return h->weaponInHands;
+}
+
+static void DumpRiderAnimLayers(Character* rider, AnimationClass* rAnim, const char* tag)
+{
+    if (!rAnim) return;
+
+    const AnimationRequirement& rq = rAnim->animationRequirements;
+    const char* sh = "?";
+    Weapon* wih = RiderWeaponInHands(rider, &sh);
+    char hd[512];
+    _snprintf_s(hd, 512, _TRUNCATE,
+        "Riding: P41G req %s aCW=%d wL=%d wR=%d carried=%d iCM=%d cTech=%d act='%s' "
+        "idle=%d/%d/%d wpn=%d wih=%d sh='%s' slave=%d fsl='%s' arb='%s' cat=%d spd=%.2f "
+        "lays=%u f=%u",
+        tag, (int)rq.currentWeapon,
+        rq.weaponL ? 1 : 0, rq.weaponR ? 1 : 0, rq.carried ? 1 : 0,
+        (int)rq.isCombatMode.key,
+        rq._currentCombatTechnique ? 1 : 0,
+        rq._currentAction ? rq._currentAction->dataName.c_str() : "",
+        rq.idle ? 1 : 0, rq.legsIdle ? 1 : 0, rq.upperIdle ? 1 : 0,
+        rider->getCurrentWeapon() ? 1 : 0,
+        wih ? 1 : 0, sh,
+        rq.isActionSlave ? 1 : 0,
+        rq.forcedSlaveLoop ? rq.forcedSlaveLoop->dataName.c_str() : "",
+        rq.attachRootToMastersBone.c_str(),
+        (int)rq.currentAnimCategory, rq.moveSpeed,
+        rAnim->layer.valid() ? rAnim->layer.size() : 0u,
+        gP3Frames);
+    DebugLog(std::string(hd));
+
+    if (!rAnim->layer.valid()) return;
+    unsigned int nl = rAnim->layer.size();
+    if (nl == 0 || nl > 32) return;                 // garbage/dangling guard, as PoseLayerPin
+
+    for (unsigned int li = 0; li < nl; ++li)
+    {
+        AnimationClassBase::AnimationLayer* lay = rAnim->layer[li];
+        if (!lay) continue;
+        for (int pass = 0; pass < 2; ++pass)
+        {
+            lektor<AnimationClassBase::SingleAnimation*>& lst =
+                pass ? lay->removeList : lay->addList;
+            if (!lst.valid()) continue;
+            unsigned int n = lst.size();
+            if (n > 64) continue;
+            for (unsigned int ai = 0; ai < n; ++ai)
+            {
+                AnimationClassBase::SingleAnimation* sa = lst[ai];
+                if (!sa) continue;
+                const AnimationData* ad = sa->animationData;
+                char pl[480];
+                _snprintf_s(pl, 480, _TRUNCATE,
+                    "Riding:   P41G L%u %c%u rec='%s' clip='%s' w=%.3f dw=%.3f ms=%.3f "
+                    "t01=%.2f lay=%d cat=%d wt=0x%X hw=%d/%d dcm=%d act=%d whole=%d/%d "
+                    "flags=%s%s%s%s",
+                    li, pass ? 'R' : 'A', ai,
+                    ad ? ad->dataName.c_str() : "?",
+                    sa->animName.c_str(),
+                    sa->weight, sa->desiredWeight,
+                    sa->mainState ? sa->mainState->getWeight() : -1.0f,
+                    sa->currentFrameTime01,
+                    ad ? (int)ad->layername : -1,
+                    ad ? (int)ad->category  : -1,
+                    ad ? ad->weaponTypeFlags : 0u,
+                    ad ? (int)ad->holdingWeaponL.key : -1,
+                    ad ? (int)ad->holdingWeaponR.key : -1,
+                    ad ? (int)ad->isCombatMode.key   : -1,
+                    ad ? (ad->isAction ? 1 : 0) : -1,
+                    ad ? (ad->wholeBodyAllLayer ? 1 : 0) : -1,
+                    sa->isAWholeBodyAction ? 1 : 0,
+                    sa->looped      ? "loop," : "",
+                    sa->autoRemove  ? "auto," : "",
+                    sa->stillWanted ? "want," : "",
+                    (sa->usingRightArm || sa->usingLeftArm) ? "arm" : "");
+                DebugLog(std::string(pl));
+            }
+        }
+    }
+}
 
 // Pending "approach then mount" requests.  When the player picks "上马" (the repurposed
 // Bodyguard menu order) on an animal, the rider does NOT teleport onto it if it is far
@@ -432,12 +1268,12 @@ static const int   kMountReachedRepathGap = 24;
 // Per-species tuning: seat mode + (x = forward, y = up) world-space delta.
 // Orientation is NOT tunable - the rider always faces the mount's travel direction.
 // (cfg column 4 "mount" is a dead legacy field: every ride uses native carry since
-//  2026-08-20; the column position survives read-and-ignore / write-0 for file compat.)
+//  2026-08-20; column 9 "posture" joined it 2026-08-29 when the standing posture was
+//  deleted; the column positions survive read-and-ignore / write-0 for file compat.)
 struct SpeciesTuning
 {
     int           seatMode;
     bool          forceSit;      // re-assert the sitting pose every frame
-    int           posture;       // RiderPosture (0=sit, 1=stand)
     float         lateral;       // side offset (right/left), world units
     Ogre::Vector3 offset;
     // Settled per-pose constants persisted in riding.cfg columns 11-14 (2026-08-23):
@@ -461,8 +1297,8 @@ struct SpeciesTuning
     // automatically the first time the player tunes it (PersistTuning adopts the live
     // size), so no hand-editing is needed for anything ridden after an update.
     float         refScale;
-    SpeciesTuning() : seatMode(SEAT_MIDPOINT), forceSit(true), posture(POSTURE_SIT), lateral(0.0f), offset(Ogre::Vector3::ZERO), anchor(Ogre::Vector3::ZERO), base(0.0f), home(Ogre::Vector3::ZERO), homeLateral(0.0f), refScale(0.0f) {}
-    SpeciesTuning(int m, const Ogre::Vector3& o) : seatMode(m), forceSit(true), posture(POSTURE_SIT), lateral(0.0f), offset(o), anchor(Ogre::Vector3::ZERO), base(0.0f), home(Ogre::Vector3::ZERO), homeLateral(0.0f), refScale(0.0f) {}
+    SpeciesTuning() : seatMode(SEAT_MIDPOINT), forceSit(true), lateral(0.0f), offset(Ogre::Vector3::ZERO), anchor(Ogre::Vector3::ZERO), base(0.0f), home(Ogre::Vector3::ZERO), homeLateral(0.0f), refScale(0.0f) {}
+    SpeciesTuning(int m, const Ogre::Vector3& o) : seatMode(m), forceSit(true), lateral(0.0f), offset(o), anchor(Ogre::Vector3::ZERO), base(0.0f), home(Ogre::Vector3::ZERO), homeLateral(0.0f), refScale(0.0f) {}
 };
 boost::unordered_map<std::string, SpeciesTuning> speciesTuning;
 
@@ -535,6 +1371,7 @@ static void WipeAllRideState(const char* why)
     mountCap.clear();
     dbgNodeWritten.clear();
     dbgMoveWritten.clear();
+    p3Probe.clear();
     mountBaseVOffset.clear();
     mountSmoothOrient.clear();
     mountHeadingPos.clear();
@@ -897,7 +1734,12 @@ struct DefaultSeat
     const char* species;
     int   mode;                  // SeatMode (cfg column 1)
     float up, forward, lateral;  // the tuned seat, and its home
-    int   posture;               // POSTURE_SIT / POSTURE_STAND
+    int   posture;               // DEAD column (2026-08-29): mirrors cfg column 9, which
+                                 // became a dead field when the standing posture was
+                                 // deleted.  Read by nobody.  Kept - all 21 rows already
+                                 // hold 0 - so the table body stays byte-identical and
+                                 // tools\gen_default_seats.py / apply_default_seats.py
+                                 // need no change (and kDefaultsVersion needs no bump).
     int   sit;                   // force-sit
     float ax, ay, az, base;      // captured constants (cfg columns 11-14), 0 = capture live
     float ref;                   // body size these numbers were confirmed at (column 18),
@@ -1000,7 +1842,6 @@ static void SeedDefaultSeats()
         const DefaultSeat& d = kDefaultSeats[i];
         SpeciesTuning st(d.mode, Ogre::Vector3(d.forward, d.up, 0.0f));
         st.forceSit    = (d.sit != 0);
-        st.posture     = d.posture;
         st.lateral     = d.lateral;
         st.anchor      = Ogre::Vector3(d.ax, d.ay, d.az);
         st.base        = d.base;
@@ -1070,16 +1911,17 @@ static void LoadConfig()
         float up = 0.0f, fwd = 0.0f;
         int mode = SEAT_MIDPOINT;
         int sit = 1;
-        // columns 4 and 6-8 of the line format are obsolete: column 4 "mount" is a dead
+        // columns 4, 6-8 and 9 of the line format are obsolete: column 4 "mount" is a dead
         // legacy field (every ride uses native carry since 2026-08-20), columns 6-8 are
         // roll/pitch/yaw orientation tunes - facing is always the mount's travel direction
-        // now.  Parse them into dummies only so existing cfg files keep loading with the
+        // now - and column 9 "posture" died with the standing posture (2026-08-29, TASK.md
+        // P2-0).  Parse them into dummies only so existing cfg files keep loading with the
         // same column layout.
         int mountIg = 0;
         float rollIg = 0.0f, pitchIg = 0.0f, yawIg = 0.0f;
-        int posture = POSTURE_SIT;
+        int postureIg = 0;
         float lateral = 0.0f;
-        int n = sscanf(val.c_str(), "%d,%f,%f,%d,%d,%f,%f,%f,%d,%f", &mode, &up, &fwd, &mountIg, &sit, &rollIg, &pitchIg, &yawIg, &posture, &lateral);
+        int n = sscanf(val.c_str(), "%d,%f,%f,%d,%d,%f,%f,%f,%d,%f", &mode, &up, &fwd, &mountIg, &sit, &rollIg, &pitchIg, &yawIg, &postureIg, &lateral);
         if (n >= 3)
         {
             if (mode < SEAT_EXACT) mode = SEAT_EXACT;
@@ -1088,11 +1930,8 @@ static void LoadConfig()
             // must not be reinterpreted as a rear/neck anchor - drop it to the neutral mode
             // and let the built-in default / the tuning keys take it from there.
             if (mode > SEAT_REAR) mode = SEAT_MIDPOINT;
-            if (posture < POSTURE_SIT) posture = POSTURE_SIT;
-            if (posture > POSTURE_STAND) posture = POSTURE_STAND;
             SpeciesTuning st(mode, Ogre::Vector3(fwd, up, 0.0f));
             st.forceSit = (sit != 0);
-            st.posture = posture;
             st.lateral = lateral;
             // columns 11-14: persisted seat constants (anchor xyz + bob baseline),
             // written by the capture path - optional so old cfg files still load.
@@ -1187,8 +2026,8 @@ static void SaveConfig()
     FILE* f = fopen(GetConfigPath().c_str(), "w");
     if (!f) return;
     fprintf(f, "# riding.cfg - per-species seat tuning\n");
-    fprintf(f, "# <species>=<mode>,<up>,<forward>,<mount>,<sit>,<roll>,<pitch>,<yaw>,<posture>,<lateral>  mode 0=exact 1=midpoint 2=neck 3=rear  sit 0=off 1=on  posture 0=sit 1=stand  lateral=side offset\n");
-    fprintf(f, "# columns 4 and 6-8 are OBSOLETE legacy fields (mount method / roll-pitch-yaw) - parsed-and-ignored, always written as 0\n");
+    fprintf(f, "# <species>=<mode>,<up>,<forward>,<mount>,<sit>,<roll>,<pitch>,<yaw>,<posture>,<lateral>  mode 0=exact 1=midpoint 2=neck 3=rear  sit 0=off 1=on  lateral=side offset\n");
+    fprintf(f, "# columns 4, 6-8 and 9 are OBSOLETE legacy fields (mount method / roll-pitch-yaw / posture) - parsed-and-ignored, always written as 0\n");
     fprintf(f, "# columns 11-14 = persisted seat constants (anchor x/y/z + bob baseline), auto-captured - do not hand-edit\n");
     fprintf(f, "# columns 15-17 = the declared zero/home (up, forward, lateral): Numpad9 returns here, Ctrl+Numpad9 sets it to the current seat\n");
     fprintf(f, "# column 18 = the animal size columns 2/3/10/14 were tuned at; the seat is rescaled for bigger/smaller individuals of the same species (0 = unknown, no rescaling)\n");
@@ -1197,9 +2036,11 @@ static void SaveConfig()
     fprintf(f, "defaults=%d\n", kDefaultsVersion);
     boost::unordered_map<std::string, SpeciesTuning>::iterator it = speciesTuning.begin();
     for (; it != speciesTuning.end(); ++it)
+        // the two bare 0 arguments are the dead columns 4 (mount method) and 9 (posture);
+        // they hold their position in the line so old cfg files keep parsing.
         fprintf(f, "%s=%d,%.2f,%.2f,%d,%d,0.0,0.0,0.0,%d,%.2f,%.3f,%.3f,%.3f,%.3f,%.2f,%.2f,%.2f,%.3f\n", it->first.c_str(), it->second.seatMode,
                 it->second.offset.y, it->second.offset.x, 0,
-                it->second.forceSit ? 1 : 0, it->second.posture, it->second.lateral,
+                it->second.forceSit ? 1 : 0, 0, it->second.lateral,
                 it->second.anchor.x, it->second.anchor.y, it->second.anchor.z, it->second.base,
                 it->second.home.y, it->second.home.x, it->second.homeLateral,
                 it->second.refScale);
@@ -1244,7 +2085,6 @@ SeatInfo BuildSeatInfo(Character* mount)
     info.seatMode = SEAT_MIDPOINT;
     info.forceWalk = false;
     info.forceSit = true;
-    info.posture = POSTURE_SIT;
     info.lateral = 0.0f;
     info.torsoLen = 0.0f;
     info.rootAnchor = false;
@@ -1297,18 +2137,30 @@ SeatInfo BuildSeatInfo(Character* mount)
     //   * a race row covers every member we have never seen (宠物犬 needed a hand-added clone
     //     row in v6 for exactly this reason) and it is the ONLY layer that works on a
     //     non-Chinese install, where getName() returns "Garru" and no name row can match.
-    //   * a name row is a hand-written OVERRIDE for one animal.  ⚠️ Nothing in the plugin ever
-    //     CREATES one: the tuning keys write back through info.tuneKey, which IS the race key
-    //     whenever the race layer won, so tuning any member re-tunes its whole race.  The only
-    //     way to get a name row is to type it into riding.cfg.  That turned out to be enough -
-    //     the four big crabs (56089's 1.5-2.25 bracket) were supposed to be the case that
-    //     needed one, since their old hand tune was on the EXACT anchor while the shipped race
-    //     row is the small crabs' NECK anchor and the size law only converts within one anchor
-    //     frame; in game (2026-08-28) a single +0.27 nudge on the shared row seated the whole
-    //     0.94-2.24 span correctly, big crabs and small ones alike.
+    //   * a name row is a hand-written OVERRIDE for one animal.  ⚠️ The plugin creates one only
+    //     in ONE case, see below: tuning writes back through info.tuneKey, which IS the race key
+    //     whenever the race layer won, so tuning any member re-tunes its whole race.  Otherwise
+    //     the only way to get a name row is to type it into riding.cfg.  That turned out to be
+    //     enough - the four big crabs (56089's 1.5-2.25 bracket) were supposed to be the case
+    //     that needed one, since their old hand tune was on the EXACT anchor while the shipped
+    //     race row is the small crabs' NECK anchor and the size law only converts within one
+    //     anchor frame; in game (2026-08-28) a single +0.27 nudge on the shared row seated the
+    //     whole 0.94-2.24 span correctly, big crabs and small ones alike.
     // Whichever layer wins is recorded in info.tuneKey, and ⚠️ every write-back path must use
     // tuneKey rather than species - otherwise the first anchor capture on a race-served mount
     // silently forks a name row for it and the race layer stops covering it.
+    //
+    // ⚠️ THE ONE CASE THAT DOES FORK A NAME ROW (found 2026-08-29, not fixed): tuneKey DEFAULTS
+    // to species and is only replaced by the race key when speciesTuning ALREADY HOLDS a row for
+    // that race.  So an animal whose race is not among the 21 shipped rows - a modded species, or
+    // any mount where getRaceKey() came back empty - keeps a name-keyed tuneKey, and its first
+    // anchor capture writes a row keyed on the LOCALIZED NAME.  That is exactly the fragility the
+    // race layer exists to avoid (a different language install, or the player renaming the animal,
+    // and the row stops matching).  The live example in this machine's riding.cfg is `Brooke`
+    // (home columns all 0 = never seeded from the table, refScale 1.033 = adopted on first tune).
+    // Fix when someone touches this: fall back to `if (!info.raceKey.empty()) info.tuneKey =
+    // info.raceKey;` when NEITHER layer has a row, so the new capture lands as a race row.  A
+    // hand-written name override is unaffected - it is found by the first lookup.
     info.tuneKey = info.species;
     boost::unordered_map<std::string, SpeciesTuning>::iterator tit = speciesTuning.find(info.species);
     if (tit == speciesTuning.end() && !info.raceKey.empty())
@@ -1322,7 +2174,6 @@ SeatInfo BuildSeatInfo(Character* mount)
         info.seatMode = tit->second.seatMode;
         info.userOffset = tit->second.offset;
         info.forceSit = tit->second.forceSit;
-        info.posture = tit->second.posture;
         info.lateral = tit->second.lateral;
         info.homeOffset = tit->second.home;
         info.homeLateral = tit->second.homeLateral;
@@ -1811,6 +2662,162 @@ static bool IsBigMount(const SeatInfo& seat)
     return (seat.seatMode == SEAT_NECK || seat.seatMode == SEAT_REAR);
 }
 
+// ---------------------------------------------------------------------------
+// P4-0: the mounted-combat BODY SIZE gate.  "Only small animals" (user ruling)
+// means the rider swings only when the mount is at most 1.5x the ceiling group
+// (bison/cow, max=10.3) => kCombatSizeMax = 15.5.
+//
+// The metric is max(torsoLen, getRadius()) - ONE ceiling applied to the larger
+// of two numbers, NOT two constants each clamping its own number.  Both metrics
+// have a measured blind spot and the blind spots DO NOT OVERLAP:
+//   * torsoLen is the horizontal front<->rear bone distance, so it collapses on
+//     species with VERTICALLY STACKED spines (giant crab reads 3.8, smaller than
+//     a goat).  That is exactly the fwSrc=3 species list.
+//   * getRadius() is one hull axis * nsc, hand-authored in FCS, and it MIS-ORDERS:
+//     dogs read 9.8/9.9 while the far wider bison reads 6.7.
+// max() = "if either number says big, it IS big", and that conservative direction
+// is the same direction as the default-deny.  The original draft's pair of
+// DIFFERENT ceilings (torso 12 / rad 9) is what inverted dog-vs-bison; it never
+// reached code.
+//
+// Measured live anchors (torso / rad / max -> verdict):
+//   goat 3.2/3.9/3.9 in | pack bull 7.6/4.9/7.6 in | garru 9.5/7.0/9.5 in
+//   pet dog 8.4/9.8/9.8 in | settler's pup 8.5/9.9/9.9 in | bison 10.3/6.7/10.3 in
+//   cow 10.3/6.7/10.3 in | bonedog wolf 12.5/14.5/14.5 in (user ruling)
+//   giant crab 3.8/22/22 out | swamp turtle -/34.9 out | leviathan 85.4/-/ out
+// The max column is monotone with visual size with NO inversion, and the only
+// real gap in the series is 14.5 -> 22.  15.5 sits inside it: the wolf clears by
+// 1.0u, the nearest excluded species by 6.5u.
+//
+// WARNING: nsc CANNOT be the gate.  It is a multiplier against each race's OWN
+// base mesh (machine spider nsc 1.0 and leviathan nsc 1.0 differ by orders of
+// magnitude), so it is not comparable across races.  torso and rad are already
+// multiplied by nsc => they are absolute world units, which is what a gate needs.
+//
+// WARNING: this is NOT IsBigMount().  That one asks "does the mount swing instead
+// of the rider" (mode 2||3); the garru is mode 2 yet comfortably inside the size
+// gate.  Two separate questions - never merge them.
+//
+// Residual risk = "big animal + degenerate torso + small hull" all at once.  The
+// only unmeasured candidate is King/Curled-One (race 65260-Newwworld.mod, mode 2,
+// on the vertical-spine list so its torso must degenerate, rad unknown).  Handling
+// = the mount log prints size=/torso=/rad= plus a RECORD-ONLY h= (anchor bone
+// height above the mount's movement position; goat measured 6.99u) so a misjudged
+// species is visible the first time it is ridden.
+static const float kCombatSizeMax = 15.5f;
+
+static float MountCombatSize(Character* mount, const SeatInfo& seat)
+{
+    float rad = mount ? mount->getRadius() : 0.0f;
+    if (!(rad > 0.0f) || rad > 1000.0f) rad = 0.0f;   // same distrust as RideLegAbductDeg
+    float t = (seat.torsoLen > 0.0f) ? seat.torsoLen : 0.0f;
+    return (t > rad) ? t : rad;
+}
+
+static bool MountCombatEligible(Character* mount, const SeatInfo& seat)
+{
+    float s = MountCombatSize(mount, seat);
+    return s > 0.0f && s <= kCombatSizeMax;   // a failed read (0) DENIES
+}
+
+// Nearest live threat, or NULL; *distOut = HORIZONTAL distance to it (y ignored, because a
+// mounted rider is several units above everything he fights).  Declared attack target first -
+// that is the one a swing is for - then the nearest live entry in getAllAttackers(), because
+// P4-1b measured that list fills on the DECISION to attack, so it is the earlier signal rather
+// than a fallback of last resort.
+// ⚠️ isDown() disqualifies exactly as much as isDead() does: a knocked-out enemy ENDS the fight
+// but STAYS the engine's attack target.  P4-1M shipped with that check on the attacker scan and
+// missing on the attack target, and that single omission is most of why the stance never let go
+// (measured: target 122u behind the mount, isDead() == false, twist saturated at 60 deg).
+static Character* RideNearestThreat(Character* rider, float* distOut)
+{
+    if (distOut) *distOut = -1.0f;
+    if (!rider) return NULL;
+
+    Ogre::Vector3 rp = rider->getPosition();
+    Character* best  = NULL;
+    float bestSq     = 0.0f;
+
+    Character* tgt = rider->getAttackTarget().getCharacter();
+    if (tgt && tgt != rider && !tgt->isDead() && !tgt->isDown())
+    {
+        Ogre::Vector3 dv = tgt->getPosition() - rp;
+        best   = tgt;
+        bestSq = dv.x * dv.x + dv.z * dv.z;
+    }
+    if (!best)
+    {
+        lektor<hand> atk;
+        rider->getAllAttackers(atk);
+        for (lektor<hand>::iterator ait = atk.begin(); ait != atk.end(); ++ait)
+        {
+            Character* a = ait->getCharacter();
+            if (!a || a == rider || a->isDown() || a->isDead()) continue;
+            Ogre::Vector3 dv = a->getPosition() - rp;
+            float dsq = dv.x * dv.x + dv.z * dv.z;
+            if (!best || dsq < bestSq) { best = a; bestSq = dsq; }
+        }
+    }
+    if (best && distOut) *distOut = Ogre::Math::Sqrt(bestSq);
+    return best;
+}
+
+// ⚠️ P4-1M measured that isInCombatMode(true, true) DOES NOT DROP when a mounted fight ends: the
+// log holds STANCE 1 for ~8700 frames (≈67 s) after the last blow and never returns to 0, which
+// is exactly the "出战斗后没有回到纯坐姿" the player reported.  So the engine flag cannot be the
+// only term - we need our own "is anybody still fighting me" test.  ⚠️ The answer is NOT to clear
+// combat mode ourselves: the user ruled that out ("不需要无条件清，他自己会掉") and it would also
+// take the weapon out of the rider's hands, which is the one thing route A depends on.
+//   kRideThreatDist - a live threat must be at least this close.  Generous on purpose (a mounted
+//     fighter circles and re-approaches; getAllAttackers() itself registers out to ~1000u, so
+//     with no distance term at all the list is effectively "has ever fought anyone").
+//   kRideStanceHoldFrames - tail after the last raw frame, so the stance does not flicker in the
+//     gaps between swings or while the target is briefly unresolvable.  ≈1.2 s at 130 fps.
+static const float kRideThreatDist       = 60.0f;
+static const int   kRideStanceHoldFrames = 150;
+
+// Single-rider state, consistent with the rest of the P4-1 subsystem (gLegPoseArmed,
+// gLegTwistDeg, gLegCalfSnap are all globals too).  gRideStanceWho keeps one rider's tail from
+// leaking into another's - pointer compare only, never dereferenced, so a stale value is safe.
+static int        gRideStanceHold = 0;
+static Character* gRideStanceWho  = NULL;
+
+// The raw, stateless predicate.  True => the rider gives the pose channel back and holds a combat
+// stance instead, with the straddle carried entirely by LegPosePass's manual bones.  ⚠️ NO
+// debugContinuous gate anywhere in this path: this is what a mounted fighter looks like now, so
+// toggling diagnostics must not change the posture (same discipline as LegPosePass).  All three
+// terms are load-bearing:
+//   * MountCombatEligible - a big mount swings for itself (IsBigMount, mode 2||3 attack
+//     redirect) and its rider has no business waving a sword from up there.  Note this is the
+//     SIZE gate, not IsBigMount: the garru is mode 2 yet inside the size gate.
+//   * isInCombatMode(true, true) - out of combat there is no weapon in hand and the seat pose is
+//     the right answer.  P4-1i measured that kiting counts as combat, so this does not drop out
+//     the moment the rider stops swinging.
+//   * a live threat within kRideThreatDist - the term that actually ENDS the stance, see above.
+static bool RideStanceRaw(Character* rider, Character* mount, const SeatInfo& seat)
+{
+    if (!rider || !mount) return false;
+    if (!MountCombatEligible(mount, seat)) return false;
+    if (!rider->isInCombatMode(true, true)) return false;
+    float d = -1.0f;
+    if (!RideNearestThreat(rider, &d)) return false;
+    return d >= 0.0f && d <= kRideThreatDist;
+}
+
+// `advance` = "you are the once-per-frame caller".  HaltAndForceSitPass passes true (it is also
+// the last writer before render); the animUpdate pre-pass passes false and only reads, so the two
+// passes can never disagree about the stance inside one frame.
+static bool RideCombatStance(Character* rider, Character* mount, const SeatInfo& seat, bool advance)
+{
+    bool raw = RideStanceRaw(rider, mount, seat);
+    bool mine = (rider == gRideStanceWho);
+    if (!advance) return raw || (mine && gRideStanceHold > 0);
+    if (!mine) { gRideStanceWho = rider; gRideStanceHold = 0; }
+    if (raw) gRideStanceHold = kRideStanceHoldFrames;
+    else if (gRideStanceHold > 0) --gRideStanceHold;
+    return raw || gRideStanceHold > 0;
+}
+
 // Orient the rider's scene node after the game's own update.  The carry physics pins
 // the rider horizontally (lying flat, belly up); we override the render-node
 // orientation so the seated pose is drawn upright.  Facing is ALWAYS the mount's
@@ -1910,7 +2917,7 @@ static void ApplyRiderOrientation(Character* rider, const SeatInfo& seat, Charac
 //
 // `anchor` is captured once per mount on the first synced frame as (rBip - node),
 // preserving the height the riding.cfg tuning was calibrated against; boneLocal is
-// recomputed every frame so a cfg posture change self-corrects in one frame.
+// recomputed every frame so any pose change self-corrects in one frame.
 static void SyncRiderNode(Character* rider, Character* mount, AnimationClass* rAnim,
                           const Ogre::Vector3& seatPos, bool mainPhase)
 {
@@ -1944,7 +2951,7 @@ static void SyncRiderNode(Character* rider, Character* mount, AnimationClass* rA
     // permanently mis-seated after every save/load).  A value is only captured once
     // it has held steady for kCaptureStableNeed syncs, and a stored anchor is
     // re-validated against firmly-settled live readings - that heals both poison
-    // and staleness (a cfg posture change changes the pose constant too).
+    // and staleness (a different ride pose changes the pose constant too).
     //
     // Capture/heal bookkeeping happens ONLY at the main-loop sync: the raw relation
     // read mid-animation-phase differs by >1.5u between call sites (bones lag node
@@ -2392,21 +3399,25 @@ static void DebugLogRideFrame(Character* rider, Character* mount, const SeatInfo
         // ---- rider POSE state (2026-08-26) --------------------------------------
         // Everything above measures where the seat is.  A rider can be provably rigid on
         // the animal (per-frame world motion identical to the anchor bone's) and STILL
-        // visibly tremble, because none of it touches the rider's own animation.  The
-        // standing posture is the exposed case: "sitting chair" is a static pose so
-        // re-asserting it every frame is invisible, while idle_stand_normal is a live idle
-        // loop.  Fields: whether our pose is in the animation set, its weight and its
-        // progress (a progress pinned near 0 = something restarts it every frame), the
-        // weight of the OTHER posture's pose (nonzero = two full-body poses blending -
-        // Mount always starts the sitting pose, so a stand-posture ride used to carry both)
-        // and the total action-animation weight (nonzero = the engine is playing something
-        // of its own on top).
-        const char* poseNameDbg  = (seat.posture == POSTURE_STAND) ? "idle_stand_normal" : "sitting chair";
-        const char* otherNameDbg = (seat.posture == POSTURE_STAND) ? "sitting chair" : "idle_stand_normal";
+        // visibly tremble, because none of it touches the rider's own animation.  Fields:
+        // whether our pose is in the animation set, its weight and its progress (a progress
+        // pinned near 0 = something restarts it every frame), `oth` and the total
+        // action-animation weight (nonzero = the engine is playing something of its own on
+        // top).
+        //
+        // `oth` = the residual weight of the STANDING IDLE.  Until 2026-08-29 this was "the
+        // other posture's pose", back when a species could ask for idle_stand_normal instead
+        // (P2-0 deleted that).  It is still worth logging under the same name: the standing
+        // idle is what a rider is playing at the instant Mount() fires, and it cross-fades
+        // out over ~14-21 frames afterwards - the 0.94/0.89 readings in the v1.6 log are
+        // exactly that fade, not a blend fault.  Nonzero in STEADY STATE still means two
+        // full-body poses are mixing.  The lookup is safe: idle_stand_normal is a real
+        // vanilla record (P1 probe: lay=UPPER cat=NORMAL flags=whole,loop), so this
+        // getAnimationData cannot insert a NULL.
         int   posePlayDbg = 0;
         float poseWDbg = 0.0f, posePDbg = 0.0f, otherWDbg = 0.0f, actWDbg = 0.0f;
-        AnimationData* poseDataDbg  = rAnim->getAnimationData(poseNameDbg);
-        AnimationData* otherDataDbg = rAnim->getAnimationData(otherNameDbg);
+        AnimationData* poseDataDbg  = rAnim->getAnimationData(kRidePose);
+        AnimationData* otherDataDbg = rAnim->getAnimationData("idle_stand_normal");
         if (poseDataDbg)
         {
             posePlayDbg = rAnim->getAnimationPlaying(poseDataDbg) ? 1 : 0;
@@ -2502,7 +3513,6 @@ static void PersistTuning(const SeatInfo& seat)
         SpeciesTuning& st = speciesTuning[seat.tuneKey];
         st.seatMode = seat.seatMode;
         st.forceSit = seat.forceSit;
-        st.posture = seat.posture;
         st.lateral = seat.lateral;
         st.offset = seat.userOffset;
         st.home = seat.homeOffset;
@@ -2564,6 +3574,1194 @@ static void SeedPersistedConstants(Character* mount)
     try { DebugLog("Riding: seeded constants [" + si->second.species + "]" + SeatKeyTag(si->second) + " anchor=" + IntToStr((int)(ti->second.anchor.length() * 100.0f))
                    + " base=" + IntToStr((int)(SeatBase(si->second, ti->second.base) * 100.0f))
                    + " k=" + IntToStr((int)(si->second.sizeScale * 1000.0f))); } catch(...) {}
+}
+
+// ---- P1 diagnostic: enumerate the engine's REAL human animation table ------------
+//
+// TASK.md P1.  AnimsListsManager::AnimList::allAnims (AnimationClass.h:276) is the map
+// the engine actually resolves animation names against, and it INCLUDES clips added by
+// the player's animation mods - which is exactly why a hardcoded list of vanilla names
+// cannot be used to pick a riding pose.  One shot per DLL load: the table is hundreds
+// of rows and nothing in it changes at runtime.
+//
+// P0 already answered the fork this dump was originally meant to decide: our pose clip
+// is `sitting_new`, registered on L1 (UPPER) with wholeBodyAllLayer=true, so it drives
+// the upper body and mounted combat needs a DIFFERENT clip, not a different pin.  The
+// two questions left for this run:
+//   1. is there any straddle / riding / side-sit clip to swap TO?  Zero hits is also an
+//      answer - it sends P2 straight to the procedural (P2b) or content-mod (P2c) route.
+//   2. which attack clips are UPPER-only?  P4-3 needs precisely that list.
+// Bonus: the KEY a suffixed clip such as "jog lower-7" is stored under, because
+// getAnimationData() and every pin we do key off the record name, not the clip name.
+static bool gAnimTableDumped = false;
+
+// The exact type of AnimList::allAnims / actionAnims (AnimationClass.h:275-276),
+// spelled out instead of inferred so that iterating it with EngineAnimMap's iterator
+// is a COMPILE-time check on the boost declaration - a mismatch fails the build here
+// rather than walking wrong offsets in the game.
+typedef boost::unordered::unordered_map<std::string, AnimationData*,
+    boost::hash<std::string >, std::equal_to<std::string >,
+    Ogre::STLAllocator<std::pair<std::string const, AnimationData*>,
+                       Ogre::GeneralAllocPolicy > > EngineAnimMap;
+
+static const char* AnimLayerName(int l)
+{
+    switch (l)
+    {
+    case LOWER:   return "LOWER";
+    case UPPER:   return "UPPER";
+    case OVERLAY: return "OVERLAY";
+    case TAIL:    return "TAIL";
+    case EARS:    return "EARS";
+    case ALL:     return "ALL";
+    default:      return "?";
+    }
+}
+
+static const char* AnimCatName(int c)
+{
+    switch (c)
+    {
+    case ANIM_NORMAL:     return "NORMAL";
+    case ANIM_IMPRISONED: return "PRISON";
+    case ANIM_SLEEPING:   return "SLEEP";
+    case ANIM_CARRIED:    return "CARRIED";
+    case ANIM_SWIMMING:   return "SWIM";
+    case ANIM_GROUNDED:   return "GROUND";
+    case ANIM_COMBAT:     return "COMBAT";
+    case ANIM_ATTACKS:    return "ATTACKS";
+    case ANIM_RANGED:     return "RANGED";
+    default:              return "?";
+    }
+}
+
+// Plain-POD snapshot of one AnimationData.  Kept POD because the SEH-guarded read
+// below must not share a frame with unwindable C++ objects.
+struct AnimRowSnap
+{
+    int   category;
+    int   layer;
+    unsigned int weaponFlags;
+    float ideal, minSp, maxSp, playSp;
+    bool  relocates, looped, whole, synched, isAction, normalise;
+    bool  crouched, prone, rightArm, leftArm, carried, restricts;
+    char  dataName[80];
+    char  animName[80];
+    char  slave[80];
+};
+
+static bool SafeSnapAnimRow(AnimationData* ad, AnimRowSnap* o)
+{
+    if (!ad || !o) return false;
+    __try
+    {
+        o->category    = (int)ad->category;
+        o->layer       = (int)ad->layername;
+        o->weaponFlags = ad->weaponTypeFlags;
+        o->ideal       = ad->idealMoveSpeed;
+        o->minSp       = ad->minMoveSpeed;
+        o->maxSp       = ad->maxMoveSpeed;
+        o->playSp      = ad->playSpeed;
+        o->relocates   = ad->relocates;
+        o->looped      = ad->looped;
+        o->whole       = ad->wholeBodyAllLayer;
+        o->synched     = ad->synched;
+        o->isAction    = ad->isAction;
+        o->normalise   = ad->normalise;
+        o->crouched    = ad->crouched;
+        o->prone       = ad->prone;
+        o->rightArm    = ad->usesRightArm;
+        o->leftArm     = ad->usesLeftArm;
+        o->carried     = ad->carried;
+        o->restricts   = ad->restrictsMovementOrders;
+        _snprintf_s(o->dataName, sizeof(o->dataName), _TRUNCATE, "%s", ad->dataName.c_str());
+        _snprintf_s(o->animName, sizeof(o->animName), _TRUNCATE, "%s", ad->animName.c_str());
+        _snprintf_s(o->slave,    sizeof(o->slave),    _TRUNCATE, "%s", ad->slave.c_str());
+        return true;
+    }
+    __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION
+                  ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH)
+    { return false; }
+}
+
+static void LogAnimRow(const char* tag, const char* key, AnimationData* ad)
+{
+    AnimRowSnap s;
+    if (!SafeSnapAnimRow(ad, &s))
+    {
+        char bad[192];
+        _snprintf_s(bad, 192, _TRUNCATE, "Riding:   %s key='%s' ptr=%p UNREADABLE",
+                    tag, key ? key : "?", (void*)ad);
+        DebugLog(std::string(bad));
+        return;
+    }
+    char ln[640];
+    _snprintf_s(ln, 640, _TRUNCATE,
+        "Riding:   %s key='%s' data='%s' clip='%s' lay=%s cat=%s "
+        "flags=%s%s%s%s%s%s%s%s%s%s%s slave='%s' wt=%08X spd=%.2f/%.2f/%.2f play=%.2f",
+        tag, key ? key : "?", s.dataName, s.animName,
+        AnimLayerName(s.layer), AnimCatName(s.category),
+        s.whole     ? "whole,"    : "",
+        s.looped    ? "loop,"     : "",
+        s.isAction  ? "action,"   : "",
+        s.normalise ? "norm,"     : "",
+        s.relocates ? "reloc,"    : "",
+        s.restricts ? "restrict," : "",
+        s.synched   ? "sync,"     : "",
+        s.rightArm  ? "Rarm,"     : "",
+        s.leftArm   ? "Larm,"     : "",
+        s.crouched  ? "crouch,"   : "",
+        s.carried   ? "carried"   : "",
+        s.slave, s.weaponFlags, s.minSp, s.ideal, s.maxSp, s.playSp);
+    DebugLog(std::string(ln));
+}
+
+// ---- P4-1k: can a clip we ask for play on a mounted rider at all? ---------------------
+//
+// P4-1j closed the diagnosis: the engine will not choose animations for a mounted rider, and
+// neither key to that door is available.  Clearing forcedSlaveLoop stuck (fsl='' in 44 steady
+// -state samples) and changed nothing; isActionSlave read 1 in 72/72 post-update samples even
+// though we zeroed it before every update, so it is engine-maintained - a consequence of the
+// rider's carried state (prime suspect _isBeingCarried=1, which is load-bearing: clearing it
+// lets the mount's collision push the rider off the back) rather than a leftover of ours.  And
+// the other candidate, restoring the CharMovement that pickupObject destroy()ed, puts the rider
+// back into the physics world with gravity, ground and orders - the "free character" risk.
+// P4-3 therefore has to drive the upper body itself, so the one open question is whether we
+// CAN: put a clip of our own onto the rider's layers and see if it takes.
+//
+// Now is the moment to ask, because mode 1 leaves the addList EMPTY (24/24 dumps, and the
+// player sees a bind pose).  P2-1b-1's result - a requested LOWER clip pinned at w=0.000 for
+// 900 frames - was measured with the whole-body pose pinned on top of it; with nothing pinned
+// there is nothing left to do the suppressing, so the answer may well be different.
+//
+// Two clips, one per repurposed mode slot (mode 2's own question was answered - it shows the
+// vanilla carry pose - so the slot is free):
+//   'guard 1h'  UPPER, loop, NO 'whole', flags norm,Rarm,Larm - a weapon stance, i.e. exactly
+//               the "combat upper body" half of mounted combat, and non-'whole' so it will not
+//               fight LegPosePass for the legs.
+//   'mid blow'  UPPER, 'whole,action,norm,reloc,restrict' - a real melee swing.  'reloc' means
+//               it relocates the character, which may well fight SyncRiderNode; this phase only
+//               asks whether it PLAYS, not whether it looks right.
+static const char* kP41kGuardAnim = "guard 1h";
+static const char* kP41kBlowAnim  = "mid blow";
+
+static AnimationData* gP41kGuard    = NULL;
+static AnimationData* gP41kBlow     = NULL;
+static bool           gP41kResolved = false;  // per ride
+static int            gP41kBudget   = 0;      // weight-sample lines per ride
+
+// Existence-checked lookup.  getAnimationData() has operator[] semantics and inserts a NULL
+// into the engine's own allAnims on a miss, so a name that might be absent must never reach it
+// - find() decides first, and only a name the map already holds is ever resolved.
+static AnimationData* P41kFind(AnimationClass* rAnim, const char* name)
+{
+    if (!rAnim || !name) return NULL;
+    AnimsListsManager::AnimList* lst = rAnim->getAnimationDatasList();
+    if (!lst) return NULL;
+    // Same boost-layout self-check the table dump uses: if allAnims is not where the header
+    // says it is, find() would walk garbage.
+    long actOff = (long)((char*)&lst->actionAnims - (char*)lst);
+    long allOff = (long)((char*)&lst->allAnims    - (char*)lst);
+    if (allOff != 0xB8 || actOff != 0x78) return NULL;
+    EngineAnimMap::const_iterator mi = lst->allAnims.find(std::string(name));
+    if (mi == lst->allAnims.end()) return NULL;
+    return mi->second;
+}
+
+static void DumpHumanAnimTableImpl(Character* rider)
+{
+    AnimationClass* rAnim = rider ? rider->getAnimationClass() : NULL;
+    AnimsListsManager* mgr = AnimsListsManager::getSingleton();
+    // getAnimationDatasList() is the list THIS character resolves against (character
+    // list for humans, per-race list for animals), so it is the authoritative one for
+    // the rider; getCharacterList() is logged next to it as a cross-check.
+    AnimsListsManager::AnimList* own = rAnim ? rAnim->getAnimationDatasList() : NULL;
+    AnimsListsManager::AnimList* chr = mgr ? mgr->getCharacterList() : NULL;
+    AnimsListsManager::AnimList* lst = own ? own : chr;
+
+    // Layout self-check.  Everything after actionAnims depends on boost's
+    // unordered_map having the same size here as in the game build; if it does not,
+    // allAnims does not sit at 0xB8 and iterating it would walk garbage.  So this
+    // decides whether we iterate at all rather than trusting the header blindly.
+    long actOff = lst ? (long)((char*)&lst->actionAnims - (char*)lst) : -1;
+    long allOff = lst ? (long)((char*)&lst->allAnims    - (char*)lst) : -1;
+
+    char hd[320];
+    _snprintf_s(hd, 320, _TRUNCATE,
+        "Riding: ANIMTABLE own=%p charList=%p same=%d sizeof=%d "
+        "off(action)=%ld off(all)=%ld (want 120/184/384)",
+        (void*)own, (void*)chr, (own && own == chr) ? 1 : 0,
+        (int)sizeof(AnimsListsManager::AnimList), actOff, allOff);
+    DebugLog(std::string(hd));
+
+    if (!lst) { DebugLog("Riding: ANIMTABLE no list - aborted"); return; }
+    if (allOff != 0xB8 || actOff != 0x78)
+    {
+        DebugLog("Riding: ANIMTABLE boost layout mismatch - refusing to iterate");
+        return;
+    }
+
+    char cnt[320];
+    _snprintf_s(cnt, 320, _TRUNCATE,
+        "Riding: ANIMTABLE counts moveBase=%u moveUpper=%u idle=%u strafe=%u attacks=%u "
+        "action=%u all=%u",
+        lst->movementAnimsBase.valid()  ? lst->movementAnimsBase.size()  : 0u,
+        lst->movementAnimsUpper.valid() ? lst->movementAnimsUpper.size() : 0u,
+        lst->idleAnims.valid()          ? lst->idleAnims.size()          : 0u,
+        lst->strafeAnims.valid()        ? lst->strafeAnims.size()        : 0u,
+        lst->attacks.valid()            ? lst->attacks.size()            : 0u,
+        (unsigned int)lst->actionAnims.size(),
+        (unsigned int)lst->allAnims.size());
+    DebugLog(std::string(cnt));
+
+    // Targeted probes first, so the answers we came for are readable without paging
+    // through the whole table.  Both sides are printed: the map key AND what
+    // getAnimationData() resolves the same string to - a mismatch would mean the pin
+    // we do every frame is not pointing at the row we think it is.
+    static const char* kProbe[] = {
+        "sitting chair", "idle_stand_normal", "carry me",
+        "jog lower-7", "jog upper-6", "jog lower", "jog upper",
+        "run lower", "run upper", "sitting_new"
+    };
+    for (int pi = 0; pi < (int)(sizeof(kProbe) / sizeof(kProbe[0])); ++pi)
+    {
+        EngineAnimMap::const_iterator mi = lst->allAnims.find(std::string(kProbe[pi]));
+        AnimationData* viaGet = rAnim ? rAnim->getAnimationData(kProbe[pi]) : NULL;
+        if (mi == lst->allAnims.end() && !viaGet)
+        {
+            DebugLog(std::string("Riding:   PROBE '") + kProbe[pi] + "' absent");
+            continue;
+        }
+        char pt[96];
+        _snprintf_s(pt, 96, _TRUNCATE, "PROBE map=%p get=%p",
+                    (void*)(mi == lst->allAnims.end() ? NULL : mi->second), (void*)viaGet);
+        LogAnimRow(pt, kProbe[pi], (mi != lst->allAnims.end()) ? mi->second : viaGet);
+    }
+
+    // The attacks list is P4-3's raw material: which swings are UPPER-only decides
+    // whether the pose can keep LOWER to itself while the rider fights.
+    if (lst->attacks.valid())
+    {
+        unsigned int na = lst->attacks.size();
+        if (na > 512) na = 512;
+        for (unsigned int i = 0; i < na; ++i)
+            LogAnimRow("ATTACK", "", lst->attacks[i]);
+    }
+
+    // Full table.  Capped because a corrupt bucket chain would otherwise spin forever.
+    int n = 0;
+    for (EngineAnimMap::const_iterator ai = lst->allAnims.begin();
+         ai != lst->allAnims.end(); ++ai)
+    {
+        if (++n > 4000) { DebugLog("Riding: ANIMTABLE cap 4000 hit - truncated"); break; }
+        LogAnimRow("ALL", ai->first.c_str(), ai->second);
+    }
+    DebugLog("Riding: ANIMTABLE end rows=" + IntToStr(n));
+}
+
+// SEH shell: same rationale as mainLoop_hook.  This walks engine containers whose
+// layout we only believe, so a fault must cost the dump, not the session.  One shot
+// either way - the flag is set by the caller before we get here.
+static void DumpHumanAnimTable(Character* rider)
+{
+    __try
+    {
+        DumpHumanAnimTableImpl(rider);
+    }
+    __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION
+                  ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH)
+    {
+        DebugLog("Riding: ANIMTABLE access violation - dump abandoned");
+    }
+}
+
+// ---- P2-1b-2: the real straddle pose (TASK.md P2-1 route b, step 2) ----------------
+//
+// Route b poses the rider's legs OURSELVES because P1 proved there is nothing to swap
+// to: all 11 vanilla sit/kneel/lie records are UPPER *and* carry wholeBodyAllLayer, so
+// no vanilla clip leaves the legs to us (that killed route a), and P2-1b-1 proved a
+// pinned `whole` pose holds every other layer at w=0.000 however cleanly the request is
+// accepted (that killed the base-clip half of b, and route c standalone).  What
+// P2-1b-1 DID establish, and what this stage builds on:
+//
+//   * a manual write + blend mask is bit-exact (kept=1.0000 over 14 samples) while the
+//     write alone comes out as ours-composed-with-the-pose (kept=0.764).  The mask is a
+//     REQUIRED component, not an optimisation.
+//   * writing only the two thighs relocates the calves with them while their LOCAL knee
+//     bend still comes from the pose track - so "thighs ours, knee borrowed" works and
+//     the calves stay out of this.
+//   * thigh local axes, reverse-solved from stage 2's derived positions: X = femur
+//     twist (the knee does not move at all), Z = abduction, therefore Y = flexion.
+//     Signs from the same measurement (skeleton frame: +X = rider's left, +Y = up,
+//     +Z = forward): R thigh +40deg local Z put the knee at x=-2.69 = OUTWARD, so the
+//     right leg abducts on +Z and the left needs -Z (the two bind orientations are
+//     near-IDENTICAL, not mirrored, so a symmetric pose needs opposite deltas).  That
+//     same number makes local Z = skeleton -Z, hence local Y = skeleton -X, hence
+//     +Y swings the knee FORWARD - and flexion is NOT mirrored, both legs take +Y.
+//
+// That last link was derived rather than seen, so P2-1b-2 spent one sweep stage on each
+// sign instead of trusting it.  ANSWERED 2026-08-29, in-game + in the log: the player
+// reports stage 1 (+local Y) straddles, and the knee's fore/aft displacement flips with
+// the sign at equal magnitude (fore=+2.96 on +Y vs -2.95 on -Y, femur length 4.18 either
+// way) => local Y is pure flexion and +Y is forward.  Same run: kept=1.0000 on every
+// sample (mask holds), L and R rows numerically identical at every sample (the mirror is
+// right - this was the asymmetry the player reported in P2-1b-1), and boneLocal (DBG
+// rel.y) sat at 6.35/6.36 in all four stage windows INCLUDING after restore, i.e. taking
+// the thighs does not move Bip01 => the seat table needs no migration (TASK.md P2-2).
+//
+// Taking a thigh over DISCARDS the chair pose's ~90deg hip flexion (writes start from
+// the bind pose = legs straight down), so flexion has to be re-supplied explicitly -
+// which is why stage 0 (abduction only) is a splayed kneel and not a bug.
+//
+// Write point is this pass (mainLoop: after the game's update, before render): Ogre
+// applies skeletal animation at render time, so this is the only window where a manual
+// write is what the frame actually draws.  P2-1b-3 (2026-08-29) locks stage 1 in and
+// takes the debugContinuous gate off, so this is now the pose every ride gets; the
+// 4-stage sweep is gone and only the (budgeted, debug-gated) sampling lines remain.
+// Cleanup is Dismount()'s job plus the release path below - we never hold two bones out
+// of the animation system for longer than we hold the pose itself.
+
+// Degrees.  The signs are settled above; these magnitudes are pure taste, and stage 1's
+// 45deg flexion with a width-adapted spread is what the player accepted in-game.
+static const float kRideLegFlexDeg      = 45.0f;  // hip flexion, +local Y = forward
+static const float kRideLegAbductAtRef  = 20.0f;  // abduction at kRideLegRadRef
+static const float kRideLegAbductMin    = 15.0f;  // narrowest mount we would ever seat
+static const float kRideLegAbductMax    = 45.0f;  // hit at rad ~9.7 = the P4-0 size gate
+static const float kRideLegRadRef       = 3.0f;   // getRadius() of a dog-sized mount
+static const float kRideLegAbductPerRad = 3.75f;  // degrees per world unit of radius
+static const float kRideLegTorsoToRad   = 0.65f;  // fallback fit: 7.6->4.9 and 10.3->6.7
+
+// Order is load-bearing: 0/1 are the thighs we take over (masked + written), 2/3 are
+// the calves, whose local knee bend is borrowed from the pose track or replayed from a
+// snapshot (index i's calf is at i+2), and 4/5 are the spine bones the P4-1M torso twist
+// takes.  Anything indexed off these positions is written as an explicit range, never as
+// "everything past 2" - see LegMaskApply's per-bone policy.  Names confirmed present by
+// P2-1b-1's inventory, which still prints every bone once per DLL load.
+static const char* kLegPoseBones[] = {
+    "Bip01 L Thigh", "Bip01 R Thigh", "Bip01 L Calf", "Bip01 R Calf",
+    "Bip01 Spine1",  "Bip01 Spine2"
+};
+static const int          kLegPoseBoneCount   = 6;
+static const int          kLegBoneThighFirst  = 0;   // [0,2)
+static const int          kLegBoneCalfFirst   = 2;   // [2,4)
+static const int          kLegBoneSpineFirst  = 4;   // [4,6)
+
+// ---- P4-1M torso side-twist -------------------------------------------------------------
+// The player's requirement: "地面是往正前方砍，我们应该往侧方，测前方砍" - a ground fighter
+// swings straight ahead, a mounted one has to swing to the side / side-front, because the
+// mount's body is in the way of everything directly forward.
+//
+// Mechanism: 'guard 1h' (and any P4-3 swing) is authored for a body facing its own +Z, and we
+// cannot re-author it, so instead the SPINE is rotated and the arms come along as children.
+// Bip01 Spine1 + Spine2 go manual + masked and each takes half the yaw about its own local +X.
+// Local +X is the along-the-bone axis for this rig (RE_NOTES §16, measured on the femur), and
+// for an upward-pointing spine bone the along-bone axis IS the vertical twist axis - so this
+// needs no new axis measurement, only a SIGN, which the TWIST log line below settles by
+// printing the requested angle next to the shoulder line it actually produced.
+//
+// Cost, accepted deliberately: masking the spine discards the host clip's own spine tracks, so
+// the torso renders at bind o yaw.  For 'guard 1h' that means a straight back instead of its
+// slight lean.  Fixing it would be capture-and-replay like the calf snapshot; not worth a
+// second state machine before the direction itself has been seen in game.
+static const float kRideTwistMaxDeg   = 60.0f;  // clamp: past this the rider faces backwards
+static const float kRideTwistNoTgtDeg = 30.0f;  // in combat with no identifiable target
+static const float kRideTwistMinDeg   = 1.0f;   // below this we hand the spine back entirely
+static const float kRideTwistLerp     = 0.12f;  // per-frame low pass, see below
+// ⚠️ The exponential low pass is legitimate HERE even though CLAUDE.md warns about them: that
+// warning is about filters called SEVERAL TIMES per frame (they converge to the target and the
+// coefficient stops meaning anything).  This one lives in LegPosePassImpl, which runs exactly
+// once per frame from HaltAndForceSitPass.  It exists because the target can change instantly -
+// without it a target swap snaps the head and sword across in one frame.
+// ✅ SIGN MEASURED AND CORRECT (2026-08-30, P4-1M in game): 115 TWIST samples, of the 112 with
+// |want| > 5 deg, want and sh had OPPOSITE signs on **112 of 112** - exactly the reading rule
+// below.  Player confirmed "上半身侧向敌人（可以侧前方砍）".  Do not flip this.
+static const float kRideTwistSign     = 1.0f;
+// TWIST sampling is deliberately DENSER than the leg sampling (300 frames): the sign question
+// only has an answer while a fight is actually running, and a fight is a few seconds long.
+static const unsigned int kRideTwistLogGap    = 45;
+static const int          kRideTwistLogBudget = 40;
+static bool  gLegTwistManual = false;   // spine currently held by us
+static float gLegTwistDeg    = 0.0f;    // smoothed angle, degrees
+static int   gLegTwistBudget = 0;       // TWIST log lines this ride
+
+// ⚠️ kRideLegTakeoverW (0.5f) IS GONE, deliberately - do not put it back.  It used to gate
+// the straddle on the RIDE POSE's weight, which was correct only while the blend mask was
+// pose-only.  Route A parks the ride pose at zero weight (the combat stance is the host) and
+// route C parks the host at 0.5, so a gate keyed to the ride pose either releases the legs
+// mid-combat or sits exactly on the boundary.  Its replacement is kRideLegHostMinW below,
+// measured against whichever clip is actually driving the skeleton; the crossfade
+// contamination the 0.5 existed to avoid (kept=0.764) is now handled by masking every
+// weighted contributor instead of by waiting.
+static const unsigned int kRideLegLogGap       = 300;  // frames between sample lines
+static const int          kRideLegLogBudget    = 30;   // lines per takeover, debug only
+
+static bool  gLegSkelDumped    = false;
+static bool  gLegBonesResolved = false;
+static int   gLegPoseBudget = 0;
+static unsigned int gLegPoseFrames = 0;
+static bool  gLegPoseArmed  = false;     // manual flags / blend mask currently set
+static bool  gLegPoseHas[kLegPoseBoneCount];
+static unsigned short   gLegPoseHandle[kLegPoseBoneCount];
+static Ogre::Quaternion gLegPoseWrote[kLegPoseBoneCount];
+
+// P4-1L (route A): the pose that carries the skeleton is no longer necessarily
+// kRidePose.  When a combat stance drives the torso instead, two things that used to
+// be constants become variable:
+//
+//  1) THE MASK MOVES.  A blend mask lives on ONE Ogre::AnimationState (the clip's own),
+//     so masking only the ride pose leaves every OTHER weighted clip's thigh tracks
+//     composing onto our manual write - that is literally the kept=0.764 contamination
+//     P2-1b-1 measured during the mount crossfade.  So the mask goes on EVERY weighted
+//     addList entry that has a mainState, and the bone entries are re-asserted every
+//     frame (idempotent, and it self-corrects when calf ownership flips below).
+//     We remember which states we masked AND whether we were the one who created the
+//     mask, because destroying a mask the engine owns would silently unmask its bones.
+//     On restore, a tracked pointer is validated against the live addList BY POINTER
+//     COMPARISON ONLY - a stale AnimationState must never be dereferenced.
+//
+//  2) THE KNEE BEND IS NOT ALWAYS THERE.  Today the calves are read-only and borrow
+//     their local bend from the sitting pose's own tracks.  Combat clips are UPPER
+//     WITHOUT 'whole' (P4-1k measured 'guard 1h' as the sole UPPER entry at w=1.000),
+//     so they carry no leg tracks at all - swap the torso and the calves snap straight.
+//     Guessing a knee angle would be two guesses (axis and sign are unmeasured), so
+//     instead we CAPTURE it: while the ride pose is host at >= kLegCalfSnapW and the
+//     calf is still non-manual, the calf's local orientation IS the pure pose
+//     contribution (bind o track from the last render - the Ogre write-window fact),
+//     so we snapshot it and replay it under manual control + mask once the host
+//     changes.  No snapshot yet => calves are left alone and we say so in the log,
+//     which reads as straight legs rather than as a crash.
+static const int   kLegMaskMax   = 8;      // AnimationStates we track masks for
+static const float kLegCalfSnapW = 0.99f;  // pose weight required to trust a snapshot
+// How much weight the HOST needs before we take the legs.  Deliberately much lower than the
+// retired kRideLegTakeoverW: that 0.5 existed because the mask was pose-only, so writing during
+// the mount crossfade produced "ours o theirs" (kept=0.764).  With the mask on every
+// weighted contributor that reason is gone, and route C deliberately parks the host at
+// 0.5 - a 0.5 gate would sit exactly on the boundary.  This is now only a "is anything
+// driving the skeleton at all" check.
+static const float kRideLegHostMinW = 0.05f;
+// A host swap costs exactly one frame of "no host" and the A+C log measured it: each of the 11
+// mid-ride releases was followed by a takeover 0.008-0.015 s later (one frame at 130 fps), and
+// mode 1 showed exactly 3 samples with ms=-1.000 - the frames where the stance exists but has
+// no Ogre::AnimationState yet.  Releasing on the first such frame snaps the legs straight and
+// re-bends them the next frame; that was probe-induced churn there but would land once at the
+// START OF EVERY FIGHT in shipping code.  So a missing host is tolerated for a few frames:
+// manual bones survive Skeleton::reset(), so simply doing nothing HOLDS the last pose - we do
+// not have to write anything to bridge the gap, and we must not (there is no mask target).
+static const int kLegHostGraceFrames = 12;
+static int       gLegHostGrace = 0;   // frames of missing host tolerated so far
+static Ogre::AnimationState* gLegMasked[kLegMaskMax];
+static bool                  gLegMaskedMine[kLegMaskMax];  // we created that mask
+static int                   gLegMaskedCount = 0;
+static bool                  gLegMaskOverflow = false;  // said once, then stop nagging
+static bool              gLegCalfHave[2];   // knee bend captured this ride
+static Ogre::Quaternion gLegCalfSnap[2];
+static bool             gLegCalfManual = false;  // we are replaying the bend right now
+static bool             gLegCalfWarned = false;  // "no snapshot" said once per ride
+// Every change of host, up to a budget, NOT debug-gated: "which clip owned the skeleton
+// when the legs looked wrong" is unanswerable after the fact otherwise, and the takeover
+// line only fires once per arming.  Budgeted rather than gated because a stance that
+// flickers would otherwise flood the log.
+static const AnimationData* gLegHostLast = NULL;
+static int                  gLegHostLogBudget = 40;
+
+// One shot per DLL load: every bone handle + name, so route b can be written against
+// the real skeleton instead of guessed names.  Handles are what blend masks index by.
+static void DumpRiderSkeletonImpl(AnimationClass* rAnim)
+{
+    Ogre::OldSkeletonInstance* sk = rAnim ? rAnim->skeleton : NULL;
+    if (!sk) { DebugLog("Riding: SKEL no skeleton instance"); return; }
+    unsigned short nb = sk->getNumBones();
+    char hd[160];
+    _snprintf_s(hd, 160, _TRUNCATE, "Riding: SKEL bones=%u entity=%p node=%p",
+                (unsigned int)nb, (void*)rAnim->body, (void*)rAnim->node);
+    DebugLog(std::string(hd));
+    if (nb > 400) { DebugLog("Riding: SKEL count implausible - not walking"); return; }
+    for (unsigned short i = 0; i < nb; ++i)
+    {
+        Ogre::OldBone* b = sk->getBone(i);
+        if (!b) continue;
+        const Ogre::Quaternion& q = b->getOrientation();
+        const Ogre::Vector3&    p = b->getPosition();
+        char ln[288];
+        _snprintf_s(ln, 288, _TRUNCATE,
+            "Riding:   SKEL h=%u '%s' man=%d q=(%.3f,%.3f,%.3f,%.3f) p=(%.2f,%.2f,%.2f)",
+            (unsigned int)b->getHandle(), b->getName().c_str(),
+            b->isManuallyControlled() ? 1 : 0, q.w, q.x, q.y, q.z, p.x, p.y, p.z);
+        DebugLog(std::string(ln));
+    }
+    DebugLog("Riding: SKEL end");
+}
+
+static void DumpRiderSkeleton(AnimationClass* rAnim)
+{
+    __try { DumpRiderSkeletonImpl(rAnim); }
+    __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION
+                  ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH)
+    { DebugLog("Riding: SKEL access violation - inventory abandoned"); }
+}
+
+// The layer entry for one AnimationData, so this pass can read a clip's real weight /
+// desired weight / Ogre-side weight the same way PoseLayerPin does.  Separate walk on
+// purpose: PoseLayerPin is load-bearing shipping code and must not grow a second path.
+static AnimationClassBase::SingleAnimation* LegPoseFindSingle(
+    AnimationClass* rAnim, AnimationData* ad, int* layerOut)
+{
+    if (layerOut) *layerOut = -1;
+    if (!rAnim || !ad || !rAnim->layer.valid()) return NULL;
+    unsigned int nl = rAnim->layer.size();
+    if (nl == 0 || nl > 32) return NULL;
+    for (unsigned int li = 0; li < nl; ++li)
+    {
+        AnimationClassBase::AnimationLayer* lay = rAnim->layer[li];
+        if (!lay || !lay->addList.valid()) continue;
+        unsigned int n = lay->addList.size();
+        if (n > 64) continue;
+        for (unsigned int ai = 0; ai < n; ++ai)
+        {
+            AnimationClassBase::SingleAnimation* sa = lay->addList[ai];
+            if (sa && sa->animationData == ad)
+            {
+                if (layerOut) *layerOut = (int)li;
+                return sa;
+            }
+        }
+    }
+    return NULL;
+}
+
+// The clip that currently CARRIES THE SKELETON: the highest-weight addList entry that
+// owns an Ogre::AnimationState.  In the shipping path that is kRidePose; under route A it
+// is the combat stance.  Gating the leg takeover on "is there a host at all" rather than
+// "is the ride pose weighted" is what lets the straddle survive a torso swap - the
+// pre-route-A gate keyed off the ride pose's own SingleAnimation and therefore RELEASED
+// the legs the instant the pose stood down, which is exactly when they are needed most.
+static AnimationClassBase::SingleAnimation* LegPoseFindHost(AnimationClass* rAnim,
+                                                            int* layerOut)
+{
+    if (layerOut) *layerOut = -1;
+    if (!rAnim || !rAnim->layer.valid()) return NULL;
+    unsigned int nl = rAnim->layer.size();
+    if (nl == 0 || nl > 32) return NULL;
+    AnimationClassBase::SingleAnimation* best = NULL;
+    for (unsigned int li = 0; li < nl; ++li)
+    {
+        AnimationClassBase::AnimationLayer* lay = rAnim->layer[li];
+        if (!lay || !lay->addList.valid()) continue;
+        unsigned int n = lay->addList.size();
+        if (n > 64) continue;
+        for (unsigned int ai = 0; ai < n; ++ai)
+        {
+            AnimationClassBase::SingleAnimation* sa = lay->addList[ai];
+            if (!sa || !sa->mainState) continue;
+            if (!best || sa->weight > best->weight)
+            {
+                best = sa;
+                if (layerOut) *layerOut = (int)li;
+            }
+        }
+    }
+    return best;
+}
+
+// Remember one masked AnimationState so the restore can undo exactly what we did - and
+// nothing else.  "mine" records that WE created the mask; destroying one the engine owns
+// would silently unmask whatever bones it was holding out.
+static void LegMaskTrack(Ogre::AnimationState* st, bool mine)
+{
+    if (!st) return;
+    for (int i = 0; i < gLegMaskedCount; ++i)
+        if (gLegMasked[i] == st) return;
+    if (gLegMaskedCount >= kLegMaskMax)
+    {
+        if (!gLegMaskOverflow)
+        {
+            gLegMaskOverflow = true;
+            DebugLog("Riding: LEGPOSE mask table full - a mask may outlive the ride");
+        }
+        return;
+    }
+    gLegMasked[gLegMaskedCount]     = st;
+    gLegMaskedMine[gLegMaskedCount] = mine;
+    ++gLegMaskedCount;
+}
+
+// Mask our bones out of EVERY weighted clip, not just the pose.  Re-asserted every frame
+// on purpose: it is idempotent, it picks up clips that appear mid-ride, and it self-heals
+// when calf or spine ownership flips.  Only the bones we are actually writing this frame get
+// masked to 0 - a bone we are not holding must stay at 1.0 so it keeps receiving its track
+// (that is the borrowed-knee-bend path, and the same rule now covers the spine, which is only
+// ours while the torso twist is engaged).
+static int LegMaskApply(AnimationClass* rAnim, unsigned short nb, bool calfMask, bool spineMask)
+{
+    if (!rAnim || !rAnim->layer.valid() || nb == 0) return 0;
+    unsigned int nl = rAnim->layer.size();
+    if (nl == 0 || nl > 32) return 0;
+    int touched = 0;
+    for (unsigned int li = 0; li < nl; ++li)
+    {
+        AnimationClassBase::AnimationLayer* lay = rAnim->layer[li];
+        if (!lay || !lay->addList.valid()) continue;
+        unsigned int n = lay->addList.size();
+        if (n > 64) continue;
+        for (unsigned int ai = 0; ai < n; ++ai)
+        {
+            AnimationClassBase::SingleAnimation* sa = lay->addList[ai];
+            if (!sa || !sa->mainState) continue;
+            if (sa->weight <= 0.001f) continue;
+            bool mine = false;
+            if (!sa->mainState->hasBlendMask())
+            {
+                sa->mainState->createBlendMask((size_t)nb, 1.0f);
+                mine = true;
+            }
+            LegMaskTrack(sa->mainState, mine);
+            for (int i = 0; i < kLegPoseBoneCount; ++i)
+            {
+                if (!gLegPoseHas[i] || gLegPoseHandle[i] >= nb) continue;
+                bool ours;
+                if (i < kLegBoneCalfFirst)       ours = true;        // thighs: always
+                else if (i < kLegBoneSpineFirst) ours = calfMask;    // calves: on replay
+                else                             ours = spineMask;   // spine: while twisting
+                sa->mainState->setBlendMaskEntry((size_t)gLegPoseHandle[i],
+                                                 ours ? 0.0f : 1.0f);
+            }
+            ++touched;
+        }
+    }
+    return touched;
+}
+
+// Undo LegMaskApply.  A tracked AnimationState is validated against the LIVE lists BY
+// POINTER COMPARISON ONLY - a state that has been torn down under us must never be
+// dereferenced, so an untraceable pointer is simply dropped (its mask leaks, which is
+// why gLegMaskOverflow above is worth logging).
+static void LegMaskRelease(AnimationClass* rAnim, unsigned short nb)
+{
+    for (int t = 0; t < gLegMaskedCount; ++t)
+    {
+        Ogre::AnimationState* st = gLegMasked[t];
+        gLegMasked[t] = NULL;
+        if (!st) continue;
+        bool live = false;
+        if (rAnim && rAnim->layer.valid())
+        {
+            unsigned int nl = rAnim->layer.size();
+            if (nl <= 32)
+            {
+                for (unsigned int li = 0; li < nl && !live; ++li)
+                {
+                    AnimationClassBase::AnimationLayer* lay = rAnim->layer[li];
+                    if (!lay) continue;
+                    for (int pass = 0; pass < 2 && !live; ++pass)
+                    {
+                        lektor<AnimationClassBase::SingleAnimation*>* lst =
+                            (pass == 0) ? &lay->addList : &lay->removeList;
+                        if (!lst->valid()) continue;
+                        unsigned int n = lst->size();
+                        if (n > 64) continue;
+                        for (unsigned int ai = 0; ai < n; ++ai)
+                        {
+                            AnimationClassBase::SingleAnimation* sa = (*lst)[ai];
+                            if (sa && sa->mainState == st) { live = true; break; }
+                        }
+                    }
+                }
+            }
+        }
+        if (!live) continue;
+        if (gLegMaskedMine[t])
+        {
+            if (st->hasBlendMask()) st->destroyBlendMask();
+        }
+        else if (st->hasBlendMask())
+        {
+            for (int i = 0; i < kLegPoseBoneCount; ++i)
+                if (gLegPoseHas[i] && (nb == 0 || gLegPoseHandle[i] < nb))
+                    st->setBlendMaskEntry((size_t)gLegPoseHandle[i], 1.0f);
+        }
+    }
+    gLegMaskedCount = 0;
+}
+
+// Hand the legs back: clear the manual flags, return the bones to the binding pose and
+// drop the blend mask.  Must run on dismount and whenever the pose stops carrying the
+// skeleton, or the rider walks away with a leg stuck at 40 degrees for the rest of the
+// session (Skeleton::reset() will not touch a manually-controlled bone).  Bones are
+// re-resolved by NAME every time - never cached across frames, because a skeleton
+// instance can be rebuilt under us.
+static void LegPoseRestoreImpl(AnimationClass* rAnim, AnimationData* poseData)
+{
+    if (!rAnim) return;
+    for (int i = 0; i < kLegPoseBoneCount; ++i)
+    {
+        if (!gLegPoseHas[i]) continue;
+        std::string bn(kLegPoseBones[i]);
+        if (!rAnim->getHasBone(bn)) continue;
+        Ogre::OldBone* b = rAnim->_getBone(bn);
+        if (!b) continue;
+        b->setManuallyControlled(false);
+        b->reset();
+        b->needUpdate();
+    }
+    gLegCalfManual = false;
+    gLegTwistManual = false;
+    gLegTwistDeg    = 0.0f;   // so the next fight ramps in instead of snapping
+    // Drop the masks.  Ownership-aware and pointer-validated (see LegMaskRelease): the
+    // pose's own AnimationState is just one of the tracked entries now, so the old
+    // pose-only destroyBlendMask() is gone - it would have destroyed a mask the engine
+    // owned in the case where the clip already had one.
+    LegMaskRelease(rAnim, rAnim->skeleton ? rAnim->skeleton->getNumBones() : 0);
+    (void)poseData;
+}
+
+// How wide the legs have to spread for THIS mount.  Primary metric is
+// Character::getRadius() - 2026-08-29 measured it as hull size Y * node scale, i.e. a
+// LIVE physical half-size that already tracks the individual (race 3985: 0.706 -> 4.9,
+// 0.959 -> 6.7), which is exactly the quantity a straddle cares about and the same one
+// MountBoardEnvelope leans on.  torsoLen is the fallback because it is a front<->rear
+// bone distance, not a girth (crab: torso 3.8 / rad 22) - the 0.65 factor is fitted to
+// the two anchors we have live numbers for (7.6 -> 4.9, 10.3 -> 6.7).
+static float RideLegAbductDeg(Character* mount, const SeatInfo& seat)
+{
+    float rad = mount ? mount->getRadius() : 0.0f;
+    if (!(rad > 0.1f) || rad > 200.0f)
+        rad = (seat.torsoLen > 0.1f) ? seat.torsoLen * kRideLegTorsoToRad : kRideLegRadRef;
+    float a = kRideLegAbductAtRef + (rad - kRideLegRadRef) * kRideLegAbductPerRad;
+    if (a < kRideLegAbductMin) a = kRideLegAbductMin;
+    if (a > kRideLegAbductMax) a = kRideLegAbductMax;
+    return a;
+}
+
+// Where the rider should be aiming, in degrees of yaw away from the mount's heading.
+// Positive = toward the rider skeleton's local +X, which RE_NOTES §16 measured as the rider's
+// LEFT.  Zero (and only zero) means "hand the spine back".
+//
+// Reference direction is the rider's OWN node orientation rather than a fresh GetMountForward:
+// ApplyRiderOrientation already resolved the heading question once per frame (move direction,
+// held when stationary, bone forward as a last resort) and low-passed it, and the node is where
+// that answer landed.  Reading it back means the twist can never disagree with the facing it is
+// measured against.  It is one frame stale (LegPosePass runs just before ApplyRiderOrientation
+// in HaltAndForceSitPass) - at 0.12 smoothing that is invisible.
+static float RideTwistTargetDeg(Character* rider, AnimationClass* rAnim, bool stance,
+                                Character** tgtOut, float* distOut)
+{
+    if (tgtOut)  *tgtOut  = NULL;
+    if (distOut) *distOut = -1.0f;
+    if (!stance) return 0.0f;          // out of combat: decay to zero and unmask
+    if (!rider || !rAnim || !rAnim->node) return 0.0f;
+
+    // Who to face.  Same threat finder the stance itself uses (RideNearestThreat), so the pose
+    // can never twist toward somebody the stance has already written off - e.g. the knocked-out
+    // body that kept P4-1M's twist pinned at 60 deg.
+    float tdist = -1.0f;
+    Character* tgt = RideNearestThreat(rider, &tdist);
+    Ogre::Vector3 rp = rider->getPosition();
+
+    // In stance but nobody identifiable: still twist, by a fixed amount.  A mounted fighter who
+    // is squared up dead ahead is exactly the pose the player rejected, and this is also the
+    // normal state during the kRideStanceHoldFrames tail, where a snap back to square-on would
+    // be worse than a held twist that then decays.
+    if (!tgt) return kRideTwistNoTgtDeg * kRideTwistSign;
+
+    Ogre::Vector3 d = tgt->getPosition() - rp;
+    if (distOut) *distOut = tdist;      // horizontal, from RideNearestThreat
+    if (tgtOut)  *tgtOut  = tgt;
+    d.y = 0.0f;
+    float dl = Ogre::Math::Sqrt(d.x * d.x + d.z * d.z);
+    if (dl < 0.01f) return 0.0f;       // standing inside each other: no direction to speak of
+    d /= dl;
+
+    Ogre::Vector3 f = rAnim->node->getOrientation() * Ogre::Vector3::UNIT_Z;  // sitting fwd=+Z
+    f.y = 0.0f;
+    float fl = Ogre::Math::Sqrt(f.x * f.x + f.z * f.z);
+    if (fl < 0.01f) return 0.0f;
+    f /= fl;
+
+    // Signed yaw from f to d.  The cross term is (f x d).y, which is also d . (f.z,0,-f.x) -
+    // and (f.z,0,-f.x) is precisely the local +X axis ApplyRiderOrientation feeds to FromAxes,
+    // so a positive angle really does mean "target lies toward skeleton +X".
+    float cr  = f.z * d.x - f.x * d.z;
+    float dt  = f.x * d.x + f.z * d.z;
+    float ang = Ogre::Math::ATan2(cr, dt).valueDegrees();
+    if (ang >  kRideTwistMaxDeg) ang =  kRideTwistMaxDeg;
+    if (ang < -kRideTwistMaxDeg) ang = -kRideTwistMaxDeg;
+    return ang * kRideTwistSign;
+}
+
+// `stance` = RideCombatStance(): mounted, small enough to fight from, and in combat mode.  It
+// only ever decides the TORSO; the straddle itself runs unconditionally, because it is the
+// shipping seat pose and not a combat feature.
+static void LegPosePassImpl(AnimationClass* rAnim, AnimationData* poseData, Character* rider,
+                             Character* mount, const SeatInfo& seat, bool stance)
+{
+    ++gLegPoseFrames;
+    bool logNow = debugContinuous && gLegPoseBudget > 0
+               && (gLegPoseFrames % kRideLegLogGap) == 0;
+
+    // ~30 lines, once per DLL load, and only when someone is actually watching.
+    if (debugContinuous && !gLegSkelDumped) { gLegSkelDumped = true; DumpRiderSkeleton(rAnim); }
+
+    if (!gLegBonesResolved)
+    {
+        gLegBonesResolved = true;
+        for (int i = 0; i < kLegPoseBoneCount; ++i)
+        {
+            gLegPoseHandle[i] = 0;
+            gLegPoseHas[i] = rAnim->getHasBone(std::string(kLegPoseBones[i]));
+            if (gLegPoseHas[i])
+            {
+                Ogre::OldBone* b = rAnim->_getBone(std::string(kLegPoseBones[i]));
+                if (b) gLegPoseHandle[i] = b->getHandle(); else gLegPoseHas[i] = false;
+            }
+            char bn[176];
+            _snprintf_s(bn, 176, _TRUNCATE, "Riding: LEGPOSE bone '%s' has=%d handle=%u",
+                        kLegPoseBones[i], gLegPoseHas[i] ? 1 : 0,
+                        (unsigned int)gLegPoseHandle[i]);
+            DebugLog(std::string(bn));
+        }
+    }
+
+    // ---- gate + mask ----------------------------------------------------------------
+    // The gate asks "is SOMETHING driving the skeleton", not "is the ride pose weighted"
+    // (see LegPoseFindHost): keying it off kRidePose released the legs the moment a combat
+    // stance took the torso, which is exactly when the straddle is needed.  A host without
+    // an Ogre AnimationState is still a reason to skip the frame - that state is where the
+    // blend mask lives, and writing bones without the mask is measurably worse than not
+    // writing them (kept=0.764).
+    int hostLayer = -1;
+    AnimationClassBase::SingleAnimation* host = LegPoseFindHost(rAnim, &hostLayer);
+    unsigned short nb = rAnim->skeleton ? rAnim->skeleton->getNumBones() : 0;
+    if (!host || !host->mainState || nb == 0 || host->weight < kRideLegHostMinW)
+    {
+        // Grace period (P4-1M).  The A+C run released the legs 11 times mid-ride and EVERY
+        // one of them was followed by a fresh takeover 0.008-0.015 s later - one frame at
+        // 130 fps.  Cause is visible in the same log: mode 1 logged exactly 3 samples with
+        // ms=-1.000, i.e. the incoming stance clip exists in the addList but has no
+        // Ogre::AnimationState yet, so there is nothing to hang a blend mask on for that
+        // single frame.  Restoring across it costs a visible leg snap at the start of every
+        // fight.  Doing NOTHING is correct instead of merely cheaper: a manually controlled
+        // bone survives Skeleton::reset(), so the pose we wrote last frame simply stays.  We
+        // must not WRITE either - without a mask a write renders as "ours o theirs"
+        // (kept=0.764) - hence a bare return rather than falling through.
+        if (gLegPoseArmed && gLegHostGrace < kLegHostGraceFrames)
+        {
+            ++gLegHostGrace;
+            return;
+        }
+        if (gLegPoseArmed)
+        {
+            LegPoseRestoreImpl(rAnim, poseData);
+            gLegPoseArmed = false;
+            char rl[160];
+            _snprintf_s(rl, 160, _TRUNCATE,
+                "Riding: LEGPOSE released - nothing is carrying the skeleton (grace=%d f=%u)",
+                gLegHostGrace, gLegPoseFrames);
+            DebugLog(std::string(rl));
+        }
+        gLegHostGrace = 0;
+        return;
+    }
+    gLegHostGrace = 0;
+
+    bool poseIsHost = (host->animationData == poseData);
+
+    if (host->animationData != gLegHostLast && gLegHostLogBudget > 0)
+    {
+        --gLegHostLogBudget;
+        gLegHostLast = host->animationData;
+        char hl[224];
+        _snprintf_s(hl, 224, _TRUNCATE,
+            "Riding: LEGPOSE host -> '%s' w=%.3f L=%d pose=%d f=%u",
+            host->animName.c_str(), host->weight, hostLayer, poseIsHost ? 1 : 0,
+            gLegPoseFrames);
+        DebugLog(std::string(hl));
+    }
+
+    // Capture the borrowed knee bend while it is still trustworthy: the ride pose owns the
+    // skeleton at full weight and the calf is still non-manual, so its local orientation
+    // is bind o (pose track) and nothing else.  Re-taken every qualifying frame so the
+    // snapshot stays fresh; the pose is static, so this converges immediately.
+    if (poseIsHost && host->weight >= kLegCalfSnapW && !gLegCalfManual)
+    {
+        for (int i = 0; i < 2; ++i)
+        {
+            if (!gLegPoseHas[i + 2]) continue;
+            std::string cn(kLegPoseBones[i + 2]);
+            if (!rAnim->getHasBone(cn)) continue;
+            Ogre::OldBone* cb = rAnim->_getBone(cn);
+            if (!cb || cb->isManuallyControlled()) continue;
+            gLegCalfSnap[i] = cb->getOrientation();
+            gLegCalfHave[i] = true;
+        }
+    }
+
+    // Calves: borrow the bend from the host while the ride pose IS the host, replay the
+    // snapshot once anything else takes over (combat clips are UPPER without 'whole' and
+    // carry no leg tracks, so borrowing there means straight knees).  No snapshot => stay
+    // out of it entirely, and mask nothing, so the legs look wrong rather than broken.
+    bool calfReplay = !poseIsHost && gLegCalfHave[0] && gLegCalfHave[1];
+    if (!poseIsHost && !calfReplay && !gLegCalfWarned)
+    {
+        gLegCalfWarned = true;
+        DebugLog("Riding: LEGPOSE knee bend unavailable - calves left to the host clip");
+    }
+
+    // ---- how far to twist the torso ---------------------------------------------------
+    // Low-passed toward the target angle.  ⚠️ An exponential low pass is only legitimate
+    // because this runs EXACTLY once per frame (HaltAndForceSitPass); CLAUDE.md's "per-frame
+    // exponential low passes are useless" warning is about the position code, which is called
+    // several times per frame and therefore converges to the target immediately.  Smoothing
+    // matters here for target SWITCHES: a fight with two enemies flips the raw angle by tens
+    // of degrees in one frame, and the rider should turn, not teleport.
+    float twistDist = -1.0f;
+    Character* twistTgt = NULL;
+    float twistWant = RideTwistTargetDeg(rider, rAnim, stance, &twistTgt, &twistDist);
+    gLegTwistDeg += (twistWant - gLegTwistDeg) * kRideTwistLerp;
+    // Hand the spine back once the residue is invisible, so out of combat the torso is the
+    // pose clip's again and nothing of ours is left masked.
+    bool twistOn = (Ogre::Math::Abs(gLegTwistDeg) >= kRideTwistMinDeg)
+                && gLegPoseHas[kLegBoneSpineFirst] && gLegPoseHas[kLegBoneSpineFirst + 1];
+
+    // Mask our bones out of every weighted contributor, not just the pose.
+    int msk = LegMaskApply(rAnim, nb, calfReplay, twistOn);
+
+    bool takeover = !gLegPoseArmed;
+    if (takeover) gLegPoseBudget = kRideLegLogBudget;
+
+    // ---- take the legs away from the animation system and pose them ourselves --------
+    // Abduction is mirrored (left -Z, right +Z) because the two bind orientations are
+    // near-IDENTICAL rather than mirrored; flexion is NOT mirrored, for the same reason.
+    // Both deltas stay in the BIND frame (qAbd * qFlx rotates by flexion first, then
+    // abducts about the bind Z), which is what keeps P2-1b-1's single-axis measurements
+    // applicable here.  The calves stay untouched: their local knee bend comes from the
+    // pose track and rides along with the thigh.
+    {
+        float abd = RideLegAbductDeg(mount, seat);
+        float flx = kRideLegFlexDeg;
+        for (int i = 0; i < 2; ++i)
+        {
+            if (!gLegPoseHas[i]) continue;
+            std::string bn(kLegPoseBones[i]);
+            if (!rAnim->getHasBone(bn)) continue;      // re-resolve by name every frame:
+            Ogre::OldBone* b = rAnim->_getBone(bn);    // a skeleton instance can be rebuilt
+            if (!b) continue;
+
+            // Read back BEFORE writing.  What sits here now is whatever survived last
+            // frame's Skeleton::reset() + track application, so |dot| with what we wrote
+            // is the direct answer to "does a manual write hold, or does the pose win?"
+            Ogre::Quaternion had = b->getOrientation();
+            float kept = gLegPoseArmed
+                       ? (float)Ogre::Math::Abs(had.Dot(gLegPoseWrote[i])) : -1.0f;
+
+            b->setManuallyControlled(true);
+            Ogre::Quaternion qAbd(Ogre::Degree(abd * ((i == 0) ? -1.0f : 1.0f)),
+                                  Ogre::Vector3::UNIT_Z);
+            Ogre::Quaternion qFlx(Ogre::Degree(flx), Ogre::Vector3::UNIT_Y);
+            Ogre::Quaternion want = b->getInitialOrientation() * (qAbd * qFlx);
+            b->setOrientation(want);
+            b->needUpdate();
+            gLegPoseWrote[i] = want;
+
+            if (logNow)
+            {
+                Ogre::Vector3 dp = b->_getDerivedPosition();
+                Ogre::Vector3 cp = Ogre::Vector3::ZERO;
+                if (gLegPoseHas[i + 2] && rAnim->getHasBone(std::string(kLegPoseBones[i + 2])))
+                {
+                    Ogre::OldBone* cb = rAnim->_getBone(std::string(kLegPoseBones[i + 2]));
+                    if (cb) cp = cb->_getDerivedPosition();
+                }
+                // hip -> knee in skeleton space.  `out` is sign-normalised so positive
+                // always means "away from the body" for either leg (that is the mirror
+                // check in one number), and `fore` is what settles the flexion sign
+                // (+Z = forward).  `down` keeps the 4.17 femur length in view, so a
+                // nonsense read is obvious rather than plausible.
+                Ogre::Vector3 rel = cp - dp;
+                char ln[320];
+                _snprintf_s(ln, 320, _TRUNCATE,
+                    "Riding: LEGPOSE f=%u '%s' kept=%.4f abd=%.1f flx=%.1f "
+                    "out=%.2f fore=%.2f down=%.2f hip=(%.2f,%.2f,%.2f) knee=(%.2f,%.2f,%.2f)",
+                    gLegPoseFrames, kLegPoseBones[i], kept, abd, flx,
+                    rel.x * ((i == 0) ? 1.0f : -1.0f), rel.z, -rel.y,
+                    dp.x, dp.y, dp.z, cp.x, cp.y, cp.z);
+                DebugLog(std::string(ln));
+                --gLegPoseBudget;
+            }
+        }
+        // Calves.  Replay = manual + masked (the host has no knee track to borrow);
+        // otherwise make sure we are NOT holding them, so the host's own bend rides along
+        // with the thigh exactly as it did before route A.
+        for (int i = 0; i < 2; ++i)
+        {
+            if (!gLegPoseHas[i + 2]) continue;
+            std::string cn(kLegPoseBones[i + 2]);
+            if (!rAnim->getHasBone(cn)) continue;
+            Ogre::OldBone* cb = rAnim->_getBone(cn);
+            if (!cb) continue;
+            if (calfReplay)
+            {
+                cb->setManuallyControlled(true);
+                cb->setOrientation(gLegCalfSnap[i]);
+                cb->needUpdate();
+            }
+            else if (gLegCalfManual)
+            {
+                cb->setManuallyControlled(false);
+                cb->reset();
+                cb->needUpdate();
+            }
+        }
+        gLegCalfManual = calfReplay;
+
+        // ---- torso side-twist ---------------------------------------------------------
+        // 「地面是往正前方砍，我们应该往侧方，测前方砍」 - the ground swing squares up dead
+        // ahead, a mounted one must not.  The mount's heading is not negotiable (it is where
+        // the animal is going), so the aim has to come out of the rider's spine.
+        //
+        // Half the yaw on each of Spine1/Spine2 about that bone's own local +X.  RE_NOTES §16
+        // measured local +X as "along the bone toward the child", and for a spine bone the
+        // child is straight up, so along-bone IS the vertical twist axis - no new axis
+        // measurement needed.  Splitting it over two joints is what keeps it reading as a
+        // torso turn rather than a broken neck.  Everything downstream (neck/head, clavicles,
+        // arms, and therefore the weapon) inherits, so gaze and blade follow for free.
+        //
+        // ⚠️ Accepted cost: masking the spine throws away the stance clip's OWN spine track,
+        // so the back renders as bind o yaw - straight. Capture-and-replay (the calf trick)
+        // was deliberately NOT used here: the spine's interesting frames are mid-crossfade,
+        // and a snapshot taken then bakes a blend into a frozen pose.
+        // ⚠️ The rotation SIGN about local +X is the one unmeasured fact in this build; the
+        // TWIST line below prints the requested angle next to the shoulder-line rotation it
+        // actually produced, and kRideTwistSign flips it in one constant if they disagree.
+        if (twistOn)
+        {
+            // Refill the log budget on the edge, i.e. once per fight rather than once per
+            // ride: the sign question can only be answered while the torso is actually
+            // turning, and a ride can contain several fights minutes apart.
+            if (!gLegTwistManual) gLegTwistBudget = kRideTwistLogBudget;
+            float half = gLegTwistDeg * 0.5f;
+            for (int i = kLegBoneSpineFirst; i < kLegPoseBoneCount; ++i)
+            {
+                if (!gLegPoseHas[i]) continue;
+                std::string sn(kLegPoseBones[i]);
+                if (!rAnim->getHasBone(sn)) continue;
+                Ogre::OldBone* sb = rAnim->_getBone(sn);
+                if (!sb) continue;
+                sb->setManuallyControlled(true);
+                Ogre::Quaternion qTw(Ogre::Degree(half), Ogre::Vector3::UNIT_X);
+                Ogre::Quaternion want = sb->getInitialOrientation() * qTw;
+                sb->setOrientation(want);
+                sb->needUpdate();
+                gLegPoseWrote[i] = want;
+            }
+        }
+        else if (gLegTwistManual)
+        {
+            for (int i = kLegBoneSpineFirst; i < kLegPoseBoneCount; ++i)
+            {
+                if (!gLegPoseHas[i]) continue;
+                std::string sn(kLegPoseBones[i]);
+                if (!rAnim->getHasBone(sn)) continue;
+                Ogre::OldBone* sb = rAnim->_getBone(sn);
+                if (!sb) continue;
+                sb->setManuallyControlled(false);
+                sb->reset();
+                sb->needUpdate();
+            }
+        }
+        gLegTwistManual = twistOn;
+
+        // What the twist actually did, measured off the shoulder line rather than trusted.
+        // v = L shoulder - R shoulder points along skeleton +X (= the rider's LEFT) at rest,
+        // so sh = atan2(v.z, v.x) is 0 when squared up.  A yaw of +phi about +Y (which takes
+        // forward +Z toward +X) rotates that line to (cos phi, 0, -sin phi) => sh = -phi.
+        // ⚠️ READ IT LIKE THIS: want=+30 (target on the rider's left) should come with
+        // sh ~= -30.  Same sign on both => we are turning AWAY from the target; flip
+        // kRideTwistSign.  |sh| far below |want| => the mask is not covering some contributor
+        // that still owns the spine (cross-check msk= on the takeover line).
+        if (debugContinuous && gLegTwistBudget > 0
+            && (gLegPoseFrames % kRideTwistLogGap) == 0)
+        {
+            --gLegTwistBudget;
+            float sh = 0.0f; bool haveSh = false;
+            if (rAnim->getHasBone(std::string("Bip01 L UpperArm"))
+                && rAnim->getHasBone(std::string("Bip01 R UpperArm")))
+            {
+                Ogre::OldBone* la = rAnim->_getBone(std::string("Bip01 L UpperArm"));
+                Ogre::OldBone* ra = rAnim->_getBone(std::string("Bip01 R UpperArm"));
+                if (la && ra)
+                {
+                    Ogre::Vector3 v = la->_getDerivedPosition() - ra->_getDerivedPosition();
+                    sh = Ogre::Math::ATan2(v.z, v.x).valueDegrees();
+                    haveSh = true;
+                }
+            }
+            char tw[288];
+            _snprintf_s(tw, 288, _TRUNCATE,
+                "Riding: TWIST f=%u want=%.1f raw=%.1f on=%d tgt=%d d=%.1f sh=%.1f/%d "
+                "host='%s' msk=%d hold=%d",
+                gLegPoseFrames, gLegTwistDeg, twistWant, twistOn ? 1 : 0,
+                twistTgt ? 1 : 0, twistDist, sh, haveSh ? 1 : 0,
+                host->animName.c_str(), msk, gRideStanceHold);
+            DebugLog(std::string(tw));
+        }
+
+        gLegPoseArmed = true;
+
+        // One line per takeover, NOT debug-gated: it is the only record of what spread
+        // this mount actually got, and the width adaptation can only be checked by
+        // comparing it across body sizes.  Handles are in it because a blend mask indexes
+        // by handle - a wrong one silently masks somebody else's bone.  host=/msk= are the
+        // route-A additions: which clip opened the gate, and how many AnimationStates got
+        // masked (msk=1 while a stance is up means we missed a contributor, which is what
+        // a kept< 1.0000 further down would then be blamed on).
+        if (takeover)
+        {
+            char tk[352];
+            _snprintf_s(tk, 352, _TRUNCATE,
+                "Riding: LEGPOSE takeover abd=%.1f flx=%.1f rad=%.1f torso=%.1f "
+                "h=(%u,%u) bones=%u host='%s' hw=%.3f L=%d msk=%d calf=%d "
+                "spine=(%u,%u) stance=%d twist=%.1f",
+                abd, flx, mount ? mount->getRadius() : -1.0f, seat.torsoLen,
+                (unsigned int)gLegPoseHandle[0], (unsigned int)gLegPoseHandle[1],
+                (unsigned int)nb, host->animName.c_str(), host->weight, hostLayer,
+                msk, calfReplay ? 1 : 0,
+                (unsigned int)gLegPoseHandle[kLegBoneSpineFirst],
+                (unsigned int)gLegPoseHandle[kLegBoneSpineFirst + 1],
+                stance ? 1 : 0, gLegTwistDeg);
+            DebugLog(std::string(tk));
+        }
+    }
+}
+
+// SEH shells: kept free of anything that needs C++ unwinding (C2712), same shape as
+// DumpHumanAnimTable.  Everything that allocates lives in the *Impl functions.
+static void LegPoseRestore(AnimationClass* rAnim, AnimationData* poseData)
+{
+    __try { LegPoseRestoreImpl(rAnim, poseData); }
+    __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION
+                  ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH)
+    { DebugLog("Riding: LEGPOSE restore access violation"); }
+}
+
+static void LegPosePassSEH(AnimationClass* rAnim, AnimationData* poseData, Character* rider,
+                            Character* mount, const SeatInfo& seat, bool stance)
+{
+    __try { LegPosePassImpl(rAnim, poseData, rider, mount, seat, stance); }
+    __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION
+                  ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH)
+    { gLegPoseArmed = false; DebugLog("Riding: LEGPOSE access violation - straddle disarmed"); }
+}
+
+// Thin wrapper.  ⚠️ NO debugContinuous gate any more (P2-1b-3): the straddle is the
+// shipping pose, so it has to run in normal play.  Handing the legs back is now driven
+// by whether ANY clip is driving the skeleton (kRideLegHostMinW against the host clip's
+// weight, NOT against the ride pose's - see LegPoseFindHost) and by Dismount().  Toggling
+// diagnostics must not change what the rider looks like, only how much gets logged.
+static void LegPosePass(AnimationClass* rAnim, AnimationData* poseData, Character* rider,
+                         Character* mount, const SeatInfo& seat, bool stance)
+{
+    if (!rAnim) return;
+    LegPosePassSEH(rAnim, poseData, rider, mount, seat, stance);
 }
 
 void Mount(Character* rider, Character* mount)
@@ -2644,15 +4842,60 @@ void Mount(Character* rider, Character* mount)
     //    attach is dropped for every mount.
 
     // 3) Play the native sitting animation so the rider sits upright on the back.
-    //    "sitting chair" is the toilet-sitting pose the player confirmed.
-    rider->runSlaveAnim("sitting chair", 1.0f, 1.0f);
+    //    kRidePose is the toilet-sitting pose the player confirmed.
+    rider->runSlaveAnim(kRidePose, 1.0f, 1.0f);
 
     mountSeat[mount] = seat;
 
     riderToMount[rider] = mount;
     mountToRider[mount] = rider;
     SeedPersistedConstants(mount);   // frame-one placement from riding.cfg constants
-
+    p3Probe.erase(rider);
+    gP3Budget = kP3LogBudget;        // P3-0: fresh line budget for this ride
+    gP3HullCreates = 0;              // P3-2: rebuilds this ride (~1 per 30 frames)
+    gCmbBudget = kCmbBudget;         // P3-3: combat-visibility lines for this ride
+    gCmbSig    = -1;
+    gAtkTries  = kAtkTryBudget;      // P4-1b: hand-issued attack orders for this ride
+    gAtkReads  = kAtkReadBudget;
+    gAtkLastFrame = 0;
+    gAtkStage  = 0;
+    gAtkCurRung = -1;                // P4-1d: nothing in flight, every rung re-armed
+    for (int p41dRung = 0; p41dRung < kAtkStages; ++p41dRung) gRungDead[p41dRung] = false;
+    gDrawTries = kDrawTryBudget;     // P4-1e: re-arm the draw attempts for this ride
+    gDrawCalls = 0;
+    gDrawNoWpn = 0;
+    gDrawLastFrame = 0;
+    gInvDumped = 0;
+    gArmBudget = kArmBudget;         // P4-1e-2: arm/aggro state lines for this ride
+    gArmSig    = -1;
+    gEdgeBudget = kEdgeBudget;       // P4-1f: weapon-state edges for this ride
+    gEdgeWpn    = -1;
+    gEdgeACW    = -99;
+    gArmDumpBudget = kArmDumpBudget;  // P4-1g: layer dumps for this ride
+    gArmDumpLeft   = kArmDumpBase;    // a short baseline before the first forced draw
+    gArmDumpCmbBudget  = kArmDumpCmbBudget;  // P4-1h: combat-only dumps, own budget
+    gArmDumpCmbEntries = -1;
+    gRideStanceLast    = -1;                 // P4-1M: re-arm the stance transition log
+    gRideStanceOn      = false;
+    gRideStanceHold    = 0;                  // P4-1N: no release tail into a new ride
+    gRideStanceWho     = NULL;
+    gP41kResolved      = false;              // P4-1k: re-resolve + re-log the probe clips
+    // Route A straddle bookkeeping, per ride.  gLegCalfSnap holds a knee bend captured from
+    // whoever rode last, gLegHostLast would swallow the first host line, and a stale mask
+    // table would have LegMaskRelease pointer-validating against a dead AnimationClass - so
+    // the table is dropped rather than released here (the release belongs to the dismount
+    // path, which has the live rAnim; this is only the belt to that braces).
+    gLegCalfHave[0]  = false;
+    gLegCalfHave[1]  = false;
+    gLegCalfManual   = false;
+    gLegCalfWarned   = false;
+    gLegHostLast     = NULL;
+    gLegMaskedCount  = 0;
+    gLegMaskOverflow = false;
+    gLegHostGrace    = 0;            // P4-1M: nobody has been missing yet
+    gLegTwistManual  = false;        // spine ownership never survives a ride boundary
+    gLegTwistDeg     = 0.0f;         // the next fight ramps in from square-on
+    gLegTwistBudget  = 0;            // refilled on the first twist edge, not here
     if (rider->getMovement())
         rider->getMovement()->halt();
 
@@ -2668,6 +4911,19 @@ void Mount(Character* rider, Character* mount)
     Ogre::Vector3 nscDbg = ReadNodeScale(mAnimDbg, true);
     Ogre::Vector3 lscDbg = ReadNodeScale(mAnimDbg, false);
     Ogre::Vector3 bscDbg = ReadBoneScale(mAnimDbg, "Bip01");
+
+    // P4-0 body-size gate.  Printed on EVERY mount, deliberately: the gate's one residual
+    // risk is "big animal + degenerate torso + small hull" all at once, and the only way that
+    // shows up is somebody riding such an animal and the line reading elig=1 next to an
+    // obviously huge mount.  h= is RECORD ONLY and never decides anything - it is the
+    // candidate third term (anchor-bone height above the mount's own movement position; goat
+    // measured 6.99u), collected now so the decision has data if it is ever needed.
+    float sizeDbg = MountCombatSize(mount, seat);
+    float radDbg  = mount->getRadius();
+    float hDbg    = -999.0f;                  // sentinel: "not measurable", not a height
+    CharMovement* mMoveDbg = mount->getMovement();
+    if (mMoveDbg && !seat.backBone.empty())
+        hDbg = mount->getBoneWorldPosition(seat.backBone).y - mMoveDbg->getPosition().y;
 
     DebugLog("Riding: mounted [" + seat.species + "]" + SeatKeyTag(seat) + " mode=" + IntToStr(seat.seatMode)
              + " race=" + (raceKey.empty() ? std::string("?") : raceKey)
@@ -2687,19 +4943,58 @@ void Mount(Character* rider, Character* mount)
              + " live=" + IntToStr((int)(seat.liveScale * 1000.0f))
              + " k=" + IntToStr((int)(seat.sizeScale * 1000.0f))
              + " tune=" + IntToStr((int)(seat.userOffset.y * 100.0f)) + "/" + IntToStr((int)(seat.userOffset.x * 100.0f))
-             + " adapt=" + IntToStr((int)(SeatUp(seat) * 100.0f)) + "/" + IntToStr((int)(SeatForward(seat) * 100.0f)));
+             + " adapt=" + IntToStr((int)(SeatUp(seat) * 100.0f)) + "/" + IntToStr((int)(SeatForward(seat) * 100.0f))
+             // P4-0: rad=/size=/elig= are the gate itself (all ×10), h= is the record-only
+             // candidate third term.  size = max(torso, rad) so it is comparable to torso=
+             // and rad= printed beside it; elig= is what the gate would answer today.
+             + " rad=" + IntToStr((int)(radDbg * 10.0f))
+             + " size=" + IntToStr((int)(sizeDbg * 10.0f))
+             + " elig=" + IntToStr(MountCombatEligible(mount, seat) ? 1 : 0)
+             + " h=" + IntToStr((int)(hDbg * 10.0f)));
+
+    // P1 (TASK.md): one-shot enumeration of the engine's real human animation table.
+    // Fired from HERE because this is the first moment a rider's AnimationClass is
+    // guaranteed live, and gated on debugContinuous so a normal session never pays for
+    // it.  Budget 1 per DLL load: the table is hundreds of rows and static at runtime.
+    if (debugContinuous && !gAnimTableDumped)
+    {
+        gAnimTableDumped = true;          // set BEFORE the dump: one shot, pass or fail
+        DumpHumanAnimTable(rider);
+    }
 }
 
 void Dismount(Character* rider)
 {
     if (!rider) return;
 
-    // stop the ride pose.  BOTH postures are ended: HaltAndForceSitPass asserts whichever
-    // one the species asks for, so a stand-posture rider would otherwise walk away still
-    // running idle_stand_normal as a slave loop.  Ending an animation that is not playing
-    // is a no-op, so this stays safe for the common sitting case.
-    rider->endSlaveAnim("sitting chair");
-    rider->endSlaveAnim("idle_stand_normal");
+    // P2-1b: hand the legs back before anything else.  If the straddle is armed when the ride
+    // ends, the rider walks away with manually-controlled thighs (Skeleton::reset() will not
+    // touch them) and a blend-masked pose - i.e. permanently broken until a reload.  This is
+    // a no-op when it was never armed.
+    if (gLegPoseArmed)
+    {
+        AnimationClass* pAnim = rider->getAnimationClass();
+        if (pAnim)
+        {
+            LegPoseRestore(pAnim, pAnim->getAnimationData(kRidePose));
+            gLegPoseArmed = false;
+            DebugLog("Riding: LEGPOSE restored on dismount");
+        }
+    }
+
+    // P4-1d: undo rung 3.  runCombatAnimation() puts the animation layer into a combat swing
+    // that nothing else in this plugin ever ends, so a rider who dismounts mid-probe would walk
+    // away stuck in it.  @0x5B34E0, public, and a no-op when no combat animation is playing -
+    // same discipline as the LegPose restore above: the probe cleans up unconditionally.
+    {
+        AnimationClass* cAnim = rider->getAnimationClass();
+        if (cAnim) cAnim->endCombatAnimation();
+    }
+
+    // stop the ride pose.  Only one pose exists now (P2-0, 2026-08-29); the companion
+    // endSlaveAnim("idle_stand_normal") was deleted with the standing posture.  Ending an
+    // animation that is not playing is a no-op, so nothing here depends on it having run.
+    rider->endSlaveAnim(kRidePose);
 
     // THE put-down (2026-08-24 rev 6, confirmed in-game).  Mount() only severs the CARRIER's
     // side of the carry link (dropCarriedObject with removeOnly), which leaves the rider stuck
@@ -2775,6 +5070,7 @@ void Dismount(Character* rider)
         debugLastPos.erase(mount);
         dbgNodeWritten.erase(rider);
         dbgMoveWritten.erase(rider);
+        p3Probe.erase(rider);
     }
 
     DebugLog("Riding: dismounted");
@@ -2792,7 +5088,7 @@ void RestoreRideAfterLoad(Character* rider, Character* mount)
 {
     SeatInfo seat = BuildSeatInfo(mount);
 
-    rider->runSlaveAnim("sitting chair", 1.0f, 1.0f);
+    rider->runSlaveAnim(kRidePose, 1.0f, 1.0f);
     mountSeat[mount] = seat;
     riderToMount[rider] = mount;
     mountToRider[mount] = rider;
@@ -2811,6 +5107,52 @@ void RestoreRideAfterLoad(Character* rider, Character* mount)
     debugLastPos.erase(mount);
     dbgNodeWritten.erase(rider);
     dbgMoveWritten.erase(rider);
+    p3Probe.erase(rider);
+    gP3Budget = kP3LogBudget;        // P3-0: fresh line budget for this ride
+    gP3HullCreates = 0;              // P3-2: rebuilds this ride (~1 per 30 frames)
+    gCmbBudget = kCmbBudget;         // P3-3: combat-visibility lines for this ride
+    gCmbSig    = -1;
+    gAtkTries  = kAtkTryBudget;      // P4-1b: hand-issued attack orders for this ride
+    gAtkReads  = kAtkReadBudget;
+    gAtkLastFrame = 0;
+    gAtkStage  = 0;
+    gAtkCurRung = -1;                // P4-1d: nothing in flight, every rung re-armed
+    for (int p41dRung = 0; p41dRung < kAtkStages; ++p41dRung) gRungDead[p41dRung] = false;
+    gDrawTries = kDrawTryBudget;     // P4-1e: re-arm the draw attempts for this ride
+    gDrawCalls = 0;
+    gDrawNoWpn = 0;
+    gDrawLastFrame = 0;
+    gInvDumped = 0;
+    gArmBudget = kArmBudget;         // P4-1e-2: arm/aggro state lines for this ride
+    gArmSig    = -1;
+    gEdgeBudget = kEdgeBudget;       // P4-1f: weapon-state edges for this ride
+    gEdgeWpn    = -1;
+    gEdgeACW    = -99;
+    gArmDumpBudget = kArmDumpBudget;  // P4-1g: layer dumps for this ride
+    gArmDumpLeft   = kArmDumpBase;    // a short baseline before the first forced draw
+    gArmDumpCmbBudget  = kArmDumpCmbBudget;  // P4-1h: combat-only dumps, own budget
+    gArmDumpCmbEntries = -1;
+    gRideStanceLast    = -1;                 // P4-1M: re-arm the stance transition log
+    gRideStanceOn      = false;
+    gRideStanceHold    = 0;                  // P4-1N: no release tail into a new ride
+    gRideStanceWho     = NULL;
+    gP41kResolved      = false;              // P4-1k: re-resolve + re-log the probe clips
+    // Route A straddle bookkeeping, per ride.  gLegCalfSnap holds a knee bend captured from
+    // whoever rode last, gLegHostLast would swallow the first host line, and a stale mask
+    // table would have LegMaskRelease pointer-validating against a dead AnimationClass - so
+    // the table is dropped rather than released here (the release belongs to the dismount
+    // path, which has the live rAnim; this is only the belt to that braces).
+    gLegCalfHave[0]  = false;
+    gLegCalfHave[1]  = false;
+    gLegCalfManual   = false;
+    gLegCalfWarned   = false;
+    gLegHostLast     = NULL;
+    gLegMaskedCount  = 0;
+    gLegMaskOverflow = false;
+    gLegHostGrace    = 0;            // P4-1M: nobody has been missing yet
+    gLegTwistManual  = false;        // spine ownership never survives a ride boundary
+    gLegTwistDeg     = 0.0f;         // the next fight ramps in from square-on
+    gLegTwistBudget  = 0;            // refilled on the first twist edge, not here
     SeedPersistedConstants(mount);   // frame-one placement from riding.cfg constants
 
     DebugLog("Riding: restored ride after load [" + seat.species + "]" + SeatKeyTag(seat) + " mode="
@@ -3001,6 +5343,152 @@ void newPlayerTask_hook(PlayerInterface* thisptr, TaskType t, const hand& target
     newPlayerTask_orig(thisptr, t, targetH, destinationIndoors, clickpos, addDontClear);
 }
 
+// ---- pose weight pin + animation layer dump (v1.6, 2026-08-29) ------------
+//
+// v1.5 pinned the REQUEST (unconditional runAnimation every frame) and that did
+// kill the old two-frame 1.00/0.96 limit cycle.  A residual survived it: exactly
+// 57 one-frame dips to 0.95-0.97 in 1975 settled frames, spaced a rock-steady
+// 35 frames apart (0.267 s at the 131 fps that run was measured on).  Locked to
+// a FRAME count, not to wall time, so it is somebody's counter, not a physical
+// cadence.  `act` (total weight) dips with it while `oth` stays 0.00, so nothing
+// was added - our own pose simply loses 3-5% for one frame, i.e. that fraction
+// of the skeleton renders as whatever the layer falls back to.  Vanilla's
+// "sitting chair" barely moves Bip01 so nobody ever saw it; Wakigawa's Animation
+// Overhaul (workshop 2810262017) moves the root ~3.7u per unit weight, so the
+// same dip is a visible flick four times a second.
+//
+// Why a request cannot fix it: runAnimation only sets desiredWeight, which the
+// NEXT animUpdate fades toward.  A dip that happens inside that update is
+// already rendered by the time our next request lands.  So write the fields:
+//   weight / desiredWeight / stillWanted   engine-side truth for the fade
+//   mainState->setWeight()                 render-side truth for THIS frame
+//                                          (Ogre blends from the AnimationState
+//                                          at render time, i.e. after mainLoop)
+// Deliberate limits:
+//   - only pins once the pose is past 0.5, so the mount crossfade (the standing
+//     idle takes ~21 frames to fade out) still happens instead of snapping;
+//   - render-side write only when nothing else carries weight, so a combat swing
+//     or any future blend is never pushed over 1.0 total.
+// The dump (debugContinuous only, budgeted) walks addList AND removeList of every
+// layer so the next in-game run NAMES whatever is draining the 3-5% - the current
+// DBG fields cannot (`oth` only watches the standing idle, `act` mirrors us).
+static int gPoseDumpBudget = 60;
+static unsigned int gPoseDumpFrame = 0;
+
+static void PoseLayerPin(AnimationClass* rAnim, AnimationData* poseData,
+                         bool renderSide, bool dump)
+{
+    if (!rAnim || !poseData || !rAnim->layer.valid()) return;
+    unsigned int nl = rAnim->layer.size();
+    if (nl == 0 || nl > 32) return;                 // garbage/dangling guard
+
+    AnimationClassBase::SingleAnimation* mine = NULL;
+    float others = 0.0f;
+
+    for (unsigned int li = 0; li < nl; ++li)
+    {
+        AnimationClassBase::AnimationLayer* lay = rAnim->layer[li];
+        if (!lay) continue;
+        for (int pass = 0; pass < 2; ++pass)
+        {
+            lektor<AnimationClassBase::SingleAnimation*>& lst =
+                pass ? lay->removeList : lay->addList;
+            if (!lst.valid()) continue;
+            unsigned int n = lst.size();
+            if (n > 64) continue;
+            for (unsigned int ai = 0; ai < n; ++ai)
+            {
+                AnimationClassBase::SingleAnimation* sa = lst[ai];
+                if (!sa) continue;
+                bool isMine = (pass == 0 && sa->animationData == poseData);
+                if (isMine) mine = sa;
+                else others += sa->weight;
+                if (dump)
+                {
+                    char pl[320];
+                    _snprintf_s(pl, 320, _TRUNCATE,
+                        "Riding:   POSE L%u %c%u '%s'%s w=%.3f dw=%.3f ms=%.3f "
+                        "t01=%.2f sp=%.2f flags=%s%s%s%s%s%s",
+                        li, pass ? 'R' : 'A', ai,
+                        sa->animName.c_str(), isMine ? " <-MINE" : "",
+                        sa->weight, sa->desiredWeight,
+                        sa->mainState ? sa->mainState->getWeight() : -1.0f,
+                        sa->currentFrameTime01, sa->speed,
+                        sa->looped ? "loop," : "",
+                        sa->synchSlave ? "slave," : "",
+                        sa->normalise ? "norm," : "",
+                        sa->autoRemove ? "auto," : "",
+                        sa->stillWanted ? "want," : "",
+                        sa->isAWholeBodyAction ? "whole" : "");
+                    DebugLog(std::string(pl));
+                }
+            }
+        }
+    }
+
+    if (mine && mine->weight >= 0.5f)
+    {
+        mine->desiredWeight = 1.0f;
+        mine->weight = 1.0f;
+        mine->stillWanted = true;
+        if (renderSide && mine->mainState && others < 0.02f)
+            mine->mainState->setWeight(1.0f);
+    }
+}
+
+// Same trick as PoseLayerPin but for an ARBITRARY clip at an ARBITRARY weight, which is
+// what route C needs (ride pose + combat stance both held at 0.5).  It is a separate
+// function on purpose - PoseLayerPin is shipping code with two hardcoded 1.0s and a
+// render-side condition (others < 0.02f) that is deliberately FALSE the moment two clips
+// share the body, so route C cannot be expressed by parameterising it without putting the
+// shipping pose at risk.
+//
+// Why a pin rather than a request: runAnimation's two floats are speed and blend, and
+// runSlaveAnim's startWeight is only a starting point - there is no API that asks for a
+// steady 0.5.  So the request stays normal and the pin owns the weight.
+//   arm gate:  weight >= target * 0.5f   (same "let the crossfade happen" idea as the
+//              0.5 in PoseLayerPin, expressed relative to the target)
+//   render:    only when target + others <= 1.02f, so we never push total weight past 1
+static void ClipPin(AnimationClass* rAnim, AnimationData* ad, float target, bool renderSide)
+{
+    if (!rAnim || !ad || target <= 0.0f || !rAnim->layer.valid()) return;
+    unsigned int nl = rAnim->layer.size();
+    if (nl == 0 || nl > 32) return;                 // garbage/dangling guard, as above
+
+    AnimationClassBase::SingleAnimation* mine = NULL;
+    float others = 0.0f;
+
+    for (unsigned int li = 0; li < nl; ++li)
+    {
+        AnimationClassBase::AnimationLayer* lay = rAnim->layer[li];
+        if (!lay) continue;
+        for (int pass = 0; pass < 2; ++pass)
+        {
+            lektor<AnimationClassBase::SingleAnimation*>& lst =
+                pass ? lay->removeList : lay->addList;
+            if (!lst.valid()) continue;
+            unsigned int n = lst.size();
+            if (n > 64) continue;
+            for (unsigned int ai = 0; ai < n; ++ai)
+            {
+                AnimationClassBase::SingleAnimation* sa = lst[ai];
+                if (!sa) continue;
+                if (pass == 0 && sa->animationData == ad) mine = sa;
+                else others += sa->weight;
+            }
+        }
+    }
+
+    if (mine && mine->weight >= target * 0.5f)
+    {
+        mine->desiredWeight = target;
+        mine->weight = target;
+        mine->stillWanted = true;
+        if (renderSide && mine->mainState && (target + others) <= 1.02f)
+            mine->mainState->setWeight(target);
+    }
+}
+
 // ---- AnimationClass::update hook: steer the rider's animation selection ----
 //
 // While a rider is carried (pickupObject), the game's animation selection forces
@@ -3033,13 +5521,48 @@ static void AnimUpdateImpl(AnimationClass* thisptr, float frameTIME)
                     boost::unordered_map<Character*, SeatInfo>::iterator sit = mountSeat.find(mount);
                     if (sit != mountSeat.end() && sit->second.forceSit)
                     {
-                        const char* poseAnim = (sit->second.posture == POSTURE_STAND) ? "idle_stand_normal" : "sitting chair";
-                        AnimationData* poseData = thisptr->getAnimationData(poseAnim);
-                        // stop the animation system from choosing the carried pose
+                        AnimationData* poseData = thisptr->getAnimationData(kRidePose);
+                        // P4-1M: route A ships.  `stance` is the shipping predicate, NOT a
+                        // probe - no debugContinuous gate, no rotation: eligible mount + the
+                        // rider actually in combat mode.  Route C (both clips at 0.5) is DELETED,
+                        // and the A+C numbers say not to revive it by tuning that 0.5: mode 2
+                        // held w/dw/acw/ms at exactly 0.500 on all 30 samples, i.e. the pin did
+                        // precisely what was asked and the arms STILL did not read as on guard.
+                        // The weakness is what a 50/50 blend of a seated pose and a sword guard
+                        // looks like, so the only 0.5 that fixes it is 1.0, which is route A.
+                        // `advance=false`: HaltAndForceSitPass owns the once-per-frame hold
+                        // counter, this pass only reads its decision.
+                        bool stance = RideCombatStance(ch, mount, sit->second, false);
+                        // stop the animation system from choosing the carried pose.
+                        // Unconditional in both branches: the carried pose has to go whether the
+                        // torso ends up on the ride pose or on the combat stance.
                         thisptr->animationRequirements.carried = false;
-                        // force the wanted loop as the slave animation for this frame
-                        if (poseData)
-                            thisptr->animationRequirements.forcedSlaveLoop = poseData;
+                        if (!stance)
+                        {
+                            // force the wanted loop as the slave animation for this frame
+                            if (poseData)
+                                thisptr->animationRequirements.forcedSlaveLoop = poseData;
+                            // ...and pin the pose's weight fields BEFORE the engine's own
+                            // update fades them, so this frame is evaluated at full weight
+                            // (the post-update pin in HaltAndForceSitPass is the render-side
+                            // half of the same fix - see PoseLayerPin).
+                            PoseLayerPin(thisptr, poseData, false, false);
+                        }
+                        else
+                        {
+                            // Route A: the stance owns the whole torso, the legs are ours via
+                            // manual bones.  Keep P4-1j's zeroing of the slave channel - those
+                            // are sticky fields nobody else clears, and the ride pose must
+                            // genuinely leave the layers for the stance to be the host (A+C
+                            // confirmed it does: pw=-1.000 on 27 of 30 samples).
+                            thisptr->animationRequirements.forcedSlaveLoop = NULL;
+                            thisptr->animationRequirements.isActionSlave   = false;
+                            // gP41kGuard is resolved later, in HaltAndForceSitPass, so on the
+                            // very first frame of a ride this is still NULL - ClipPin tolerates
+                            // it, but the explicit test documents that the ordering is known.
+                            if (gP41kGuard)
+                                ClipPin(thisptr, gP41kGuard, 1.0f, false);
+                        }
                     }
                 }
             }
@@ -3089,7 +5612,19 @@ static void AnimUpdateImpl(AnimationClass* thisptr, float frameTIME)
             // so every sync point agrees.
             Ogre::Vector3 seatPos = ComputeDampedSeatPos(mount, seat);
             if (rider->getMovement())
-                rider->getMovement()->_setPositionSimple(seatPos);
+            {
+                // P3-0 probe: bracket THIS write.  aPre is the drag that happened
+                // between the previous main-loop write and now (i.e. the early part of
+                // the engine's update phase); aPost proves the write still lands here
+                // too, on the same destroyed movement.
+                CharMovement* rMv = rider->getMovement();
+                P3Sample& p3 = p3Probe[rider];
+                p3.aPre = rMv->getPosition() - seatPos;
+                rMv->_setPositionSimple(seatPos);
+                p3.aPost = rMv->getPosition() - seatPos;
+                ++p3.animHits;
+                p3.sawAnim = true;
+            }
             SyncRiderNode(rider, mount, rAnim, seatPos, false);
         }
     }
@@ -3468,8 +6003,8 @@ static void HaltAndForceSitPass()
                 riderMove->halt();
 
             // force-sit: clear the carried flag (so the animation system stops forcing
-            // the ANIM_CARRIED "limp, limbs dangling" pose) and re-assert the chosen
-            // posture after the game's own update.
+            // the ANIM_CARRIED "limp, limbs dangling" pose) and re-assert the ride pose
+            // after the game's own update.
             Character* mount = it->second;
             if (mount)
             {
@@ -3479,36 +6014,180 @@ static void HaltAndForceSitPass()
                     AnimationClass* rAnim = rider->getAnimationClass();
                     if (rAnim)
                     {
+                        // P4-1M: route A ships.  See RideCombatStance() - eligible mount, rider in
+                        // combat mode, AND a live threat within kRideThreatDist, with NO
+                        // debugContinuous gate.  Route C is gone.  `advance=true`: this is the
+                        // once-per-frame caller that ticks the release tail.
+                        bool stance = RideCombatStance(rider, mount, sit->second, true);
+                        gRideStanceOn = stance;   // read by the DBG tag, nothing else
+                        if (debugContinuous && (stance ? 1 : 0) != gRideStanceLast)
+                        {
+                            gRideStanceLast = stance ? 1 : 0;
+                            // d= / hold= are how a stuck stance is diagnosed now: cm=1 with no
+                            // threat (d=-1) is the engine flag lingering and OUR term doing its
+                            // job; cm=1 with a real d beyond kRideThreatDist is a fight that
+                            // moved away; hold= counting down is the tail, not a fault.
+                            float td = -1.0f;
+                            RideNearestThreat(rider, &td);
+                            char pl[160];
+                            _snprintf_s(pl, 160, _TRUNCATE,
+                                "Riding: STANCE %d f=%u cm=%d d=%.1f hold=%d",
+                                stance ? 1 : 0, gP3Frames,
+                                rider->isInCombatMode(true, true) ? 1 : 0, td, gRideStanceHold);
+                            DebugLog(std::string(pl));
+                        }
+                        // Unconditional: both branches want the carried pose gone and
+                        // "carry me" evicted.
                         rAnim->animationRequirements.carried = false;
                         // The carry system force-plays "carry me" (the being-carried
                         // pose) every frame at 0.5 weight, which blends with and ruins
                         // our pose.  Kick it out after the game's update so our pose
                         // owns the full animation weight.
                         rAnim->stopAnimation("carry me");
-                        const char* poseAnim = (sit->second.posture == POSTURE_STAND) ? "idle_stand_normal" : "sitting chair";
-                        // The OTHER posture's pose has to go too (2026-08-26).  Mount()
-                        // always starts "sitting chair" while the cfg may ask for the
-                        // stand posture, so a standing rider used to carry BOTH full-body
-                        // poses and render whatever blend of the two the engine settled on.
-                        const char* otherAnim = (sit->second.posture == POSTURE_STAND) ? "sitting chair" : "idle_stand_normal";
-                        AnimationData* otherData = rAnim->getAnimationData(otherAnim);
-                        if (otherData && rAnim->getAnimationPlaying(otherData))
-                            rAnim->stopAnimation(otherData);
-                        // Re-assert the pose only when it is not already running at full
-                        // weight.  Restarting a STATIC pose ("sitting chair") every frame is
-                        // invisible, which is why the unconditional version went unnoticed
-                        // for months - but idle_stand_normal is a live idle LOOP, and
-                        // re-adding it every frame keeps resetting its playback, so the body
-                        // trembles instead of standing still.  The weight test keeps the
-                        // original guarantee (anything that dilutes our pose gets answered
-                        // the very next frame) without touching a pose that is already won.
-                        AnimationData* poseData = rAnim->getAnimationData(poseAnim);
-                        if (!poseData || !rAnim->getAnimationPlaying(poseData)
-                                      || rAnim->getAnimationCurrentWeight(poseData) < 0.99f)
+                        // Pose weight has to be held CONSTANT, not merely high (2026-08-29).
+                        //
+                        // The old code re-asserted only when the weight had already sagged
+                        // below 0.99.  That gate is itself an oscillator: runAnimation sets a
+                        // TARGET that the next animUpdate applies, so the steady state is a
+                        // two-frame limit cycle - measure 0.96, re-assert, next frame reads
+                        // 1.00, skip, the carry system's per-frame dilution takes it back to
+                        // 0.96, repeat.  Measured in both a vanilla run and a run with
+                        // Wakigawa's Animation Overhaul (workshop 2810262017): weight
+                        // alternates 1.00 / 0.96 forever, identically, in both.
+                        //
+                        // Why the 4% matters: SyncRiderNode measures boneLocal BEFORE this
+                        // frame's skeleton update and solves the node from it, so any pose
+                        // change between the measurement and the render lands on rBip
+                        // uncancelled.  Vanilla "sitting chair" barely moves Bip01, so the
+                        // 4% dip costs ~0.01u and nobody ever saw it (1797 of 1800 frames had
+                        // rel.y inside 5.90-5.94).  The overhaul's sitting pose moves the root
+                        // bone ~3.7u per unit weight, so the SAME dip became rel.y alternating
+                        // 5.99 <-> 6.14 every frame = a 0.3u peak-to-peak vibration at frame
+                        // rate.  That is the shake players report with that mod, and the fix
+                        // belongs here rather than in the position solver: with the weight
+                        // pinned there is no delta left to cancel.
+                        //
+                        // So: top the animation layer up EVERY frame (unconditional), and keep
+                        // the weight test on runSlaveAnim only.  The historical reason for the
+                        // gate - "re-adding the pose every frame resets a live idle LOOP's
+                        // playback, so a standing rider trembles" - was blamed on the wrong
+                        // call.  Control-run evidence that runAnimation does NOT reset
+                        // progress: re-asserts landed on the frames reading progress 1.00 and
+                        // 0.50, and the following frames read 0.24 and 0.76 - the loop kept
+                        // advancing ~0.26/frame straight through them.  And since P2-0
+                        // (2026-08-29) deleted the standing posture there is no live idle loop
+                        // in the ride path at all, so that whole class of risk is gone.
+                        // runSlaveAnim stays gated because it is the untested half (and the
+                        // slave side is already maintained every frame by
+                        // animationRequirements.forcedSlaveLoop in the animUpdate pre-pass).
+                        AnimationData* poseData = rAnim->getAnimationData(kRidePose);
+                        // In stance the pose channel is handed back entirely - the stance owns
+                        // the torso and LegPosePass owns the legs.
+                        if (!stance && (!poseData || !rAnim->getAnimationPlaying(poseData)
+                                      || rAnim->getAnimationCurrentWeight(poseData) < 0.99f))
+                            rAnim->runSlaveAnim(kRidePose, 1.0f, 1.0f, 1.0f);
+                        if (!stance)
+                            rAnim->runAnimation(kRidePose, 1.0f, 1.0f);
+                        // P4-1k/A: hand the channel back AND ask for a clip of our own, which is
+                        // the whole point of this phase - with the layers empty (24/24 dumps in
+                        // P4-1i) there is no 'whole' pose left to press a request to w=0.000, so
+                        // P2-1b-1's negative does not apply here.  Both names are resolved
+                        // through find() once per ride and requested through the AnimationData*
+                        // overload, so getAnimationData() - which inserts a NULL into the
+                        // engine's own allAnims on a miss - is never handed either name at all.
+                        if (stance)
                         {
-                            rAnim->runSlaveAnim(poseAnim, 1.0f, 1.0f, 1.0f);
-                            rAnim->runAnimation(poseAnim, 1.0f, 1.0f);
+                            if (!gP41kResolved)
+                            {
+                                gP41kResolved = true;
+                                gP41kGuard  = P41kFind(rAnim, kP41kGuardAnim);
+                                gP41kBlow   = P41kFind(rAnim, kP41kBlowAnim);
+                                gP41kBudget = 60;
+                                char rl[224];
+                                _snprintf_s(rl, 224, _TRUNCATE,
+                                    "Riding: P41K resolve guard='%s' %s blow='%s' %s",
+                                    kP41kGuardAnim, gP41kGuard ? "found" : "ABSENT",
+                                    kP41kBlowAnim,  gP41kBlow  ? "found" : "ABSENT");
+                                DebugLog(std::string(rl));
+                            }
+                            // Both routes drive the STANCE now, not the swing: 'guard 1h' is
+                            // UPPER without 'whole' and loops, so it is the one clip that can
+                            // hold a combat upper body indefinitely while the legs stay ours.
+                            // ('mid blow' stays resolved - the resolve line is the evidence that
+                            // a real swing exists in this rider's table - but requesting a
+                            // one-shot action clip every frame answers nothing about posture.)
+                            // Route A gives it the whole body; there is no other route left.
+                            AnimationData* want   = gP41kGuard;
+                            const char*    wantNm = kP41kGuardAnim;
+                            float          wantW  = 1.0f;
+                            if (want)
+                            {
+                                // Requested EVERY frame, exactly the way the ride pose is
+                                // requested out of stance: a single request would not distinguish
+                                // "refused" from "accepted then continuously drained".
+                                rAnim->runAnimation(want, 1.0f, 1.0f);
+                                // ...and the request alone cannot ask for a weight (runAnimation's
+                                // two floats are speed and blend), so the pin owns it - render
+                                // side included, this pass being the last writer before render.
+                                ClipPin(rAnim, want, wantW, true);
+                                if (debugContinuous && gP41kBudget > 0 && (gP3Frames % 30) == 0)
+                                {
+                                    --gP41kBudget;
+                                    AnimationClassBase::SingleAnimation* sa =
+                                        rAnim->getAnimationPlaying(want);
+                                    AnimationClassBase::SingleAnimation* sp =
+                                        poseData ? rAnim->getAnimationPlaying(poseData) : NULL;
+                                    char kl[320];
+                                    _snprintf_s(kl, 320, _TRUNCATE,
+                                        "Riding: P41K st=%d '%s' tgt=%.2f play=%d w=%.3f dw=%.3f "
+                                        "acw=%.3f ms=%.3f t01=%.3f prog=%.3f pw=%.3f pms=%.3f f=%u",
+                                        stance ? 1 : 0, wantNm, wantW, sa ? 1 : 0,
+                                        sa ? sa->weight : -1.0f,
+                                        sa ? sa->desiredWeight : -1.0f,
+                                        rAnim->getAnimationCurrentWeight(want),
+                                        (sa && sa->mainState) ? sa->mainState->getWeight() : -1.0f,
+                                        sa ? sa->currentFrameTime01 : -1.0f,
+                                        rAnim->getAnimationProgress(want),
+                                        sp ? sp->weight : -1.0f,
+                                        (sp && sp->mainState) ? sp->mainState->getWeight() : -1.0f,
+                                        gP3Frames);
+                                    DebugLog(std::string(kl));
+                                }
+                            }
                         }
+                        // v1.6: the request above is not enough on its own - it only moves
+                        // desiredWeight, and the residual dip happens inside the animUpdate
+                        // that consumes it (57 one-frame dips to 0.95-0.97, every 35 frames,
+                        // measured after v1.5).  Pin the fields here too, this time including
+                        // the render-side Ogre weight, since this pass is the last writer
+                        // before the frame is drawn.  Dump the whole layer list on the dip
+                        // frames so the drainer gets named.
+                        if (poseData && !stance)
+                        {
+                            ++gPoseDumpFrame;
+                            float pw = rAnim->getAnimationCurrentWeight(poseData);
+                            bool dump = debugContinuous && gPoseDumpBudget > 0
+                                        && (pw < 0.995f || (gPoseDumpFrame % 900) == 0);
+                            if (dump)
+                            {
+                                --gPoseDumpBudget;
+                                char ph[160];
+                                _snprintf_s(ph, 160, _TRUNCATE,
+                                    "Riding: POSE dump frame=%u pose='%s' w=%.3f budget=%d",
+                                    gPoseDumpFrame, kRidePose, pw, gPoseDumpBudget);
+                                DebugLog(std::string(ph));
+                            }
+                            PoseLayerPin(rAnim, poseData, true, dump);
+                        }
+                        // P2-1b-3 straddle + P4-1M torso twist.  Deliberately the same window as
+                        // the render-side weight pin: after Ogre's per-frame Skeleton::reset(),
+                        // before render - which is precisely where a manual bone write has to
+                        // land to be visible.  NOT debug-gated: this is the shipping seat pose.
+                        // `sit->second` is here for the width adaptation (torsoLen fallback),
+                        // `mount` for getRadius() (the primary width metric), `rider` for the
+                        // attack target the twist aims at, and `stance` to decide whether the
+                        // torso is ours this frame at all.
+                        LegPosePass(rAnim, poseData, rider, mount, sit->second, stance);
                     }
                     ApplyRiderOrientation(rider, sit->second, mount);
                 }
@@ -3517,11 +6196,120 @@ static void HaltAndForceSitPass()
     }
 }
 
+// ---- Rider click hull while mounted (P3-1 fix, P3-2 churn cut) ---------------------
+// The mouse does not pick characters through the movement position at all - it picks
+// through CharMovement::clickHull (@0x3B0), a separate physics object.
+//
+// P3-0 (2026-08-29) settled what the state actually is, and it is the worse of the two
+// possibilities: 105/105 sampled frames read has=0 / p=0000000000000000, i.e. the rider
+// has NO click hull at all while mounted - it died with the CharMovement that
+// pickupObject destroy()ed.  So the old teleportCollisionHull() action never even ran
+// (it was gated on hasClickHull()), and 点不中 was never a position problem: getAABB()
+// returned a centre exactly equal to seatPos on all 105 lines, +-(2.50,8.50,2.50).
+// There was nothing to move; there was nothing there.
+//
+// P3-1 (2026-08-29) fixed it with one line: call refreshClickHull() even when clickHull
+// is NULL and the engine builds one.  79/79 sampled lines then read has0=1, and the
+// user could click the rider.  restore() was NOT needed, so we keep the property the
+// carry-dissolve architecture bought ("the rider is not shoved around by the mount's
+// collision body").  nrc (dontEverRecreateMe, 0x330) read 0 throughout, i.e. restore()
+// was not being blocked either - it is simply unnecessary.
+//
+// ⚠️ P3-2 is about what P3-1 also showed: p0 != p2 on every single line, and no two
+// lines shared a pointer, while the mount's own hull pointer never changed all session.
+// refreshClickHull() DESTROYS AND REBUILDS the hull; it is not an update.  P3-1 called
+// it every frame, so we were allocating and freeing a physics hull 60-130 times a
+// second for no reason.  So: create it once (only when it is missing) and just
+// teleportCollisionHull() it to the seat every frame.
+//   Judging the log: creates= should be 1 per ride and p0 == p2 == the same pointer on
+//   every line.  creates= climbing with the frame count means something destroys the
+//   hull every frame and the per-frame rebuild was load-bearing after all (put it back
+//   and accept the allocation).  Clicking breaking while creates=1 and the pointer is
+//   stable means teleport alone does not move the hull for picking, i.e. the rebuild is
+//   what re-placed it - same fix, same cost note.
+// ⚠️ getAABB() cannot answer where the hull is: in P3-0 its centre equalled seatPos
+// while clickHull was NULL, so it is derived from the movement position.  PhysicsHullT
+// is only forward-declared in KenshiLib, so the hull's own transform is not readable
+// from here; "does the click land on the rider" stays an in-game observation.
+//
+// The mount's own hull is logged next to the rider's as a control group: the mount IS
+// clickable, so mHas=1/mp!=0 proves hasClickHull() reports honestly and has0=0 was a
+// real absence rather than an API that always says no.
+//
+// Separate Impl/wrapper pair on purpose: the __try shell cannot live in a function
+// that needs object unwinding (C2712, and SyncMountedRiders holds map iterators), and
+// an AV inside the engine's hull code must cost a log line, not the session.
+static void P3HullPassImpl(CharMovement* rMv, CharMovement* mMv,
+                           const Ogre::Vector3& seatPos, bool logNow)
+{
+    bool  has0 = rMv->hasClickHull();
+    void* hp0  = (void*)rMv->clickHull;
+    bool  nrc  = rMv->dontEverRecreateMe;
+
+    // The P3-1 fix: build one when there is none.  Rebuilds are counted, not repeated -
+    // see the P3-2 note above for why calling this every frame was wrong.
+    if (!has0)
+    {
+        rMv->refreshClickHull();
+        ++gP3HullCreates;
+    }
+
+    bool has1 = rMv->hasClickHull();
+    if (has1)
+        rMv->teleportCollisionHull(seatPos);
+
+    void* hp2 = (void*)rMv->clickHull;
+    Ogre::Aabb box = rMv->getAABB();
+
+    bool  mHas = false;
+    void* mhp  = 0;
+    if (mMv) { mHas = mMv->hasClickHull(); mhp = (void*)mMv->clickHull; }
+
+    if (!logNow) return;
+    char b[512];
+    _snprintf_s(b, 512, _TRUNCATE,
+        "Riding: P3HULL has0=%d p0=%p nrc=%d -> has1=%d p2=%p creates=%d | mHas=%d mp=%p "
+        "seat=(%.2f,%.2f,%.2f) box=(%.2f,%.2f,%.2f)+-(%.2f,%.2f,%.2f)",
+        has0 ? 1 : 0, hp0, nrc ? 1 : 0, has1 ? 1 : 0, hp2, gP3HullCreates,
+        mHas ? 1 : 0, mhp,
+        seatPos.x, seatPos.y, seatPos.z,
+        box.mCenter.x, box.mCenter.y, box.mCenter.z,
+        box.mHalfSize.x, box.mHalfSize.y, box.mHalfSize.z);
+    DebugLog(std::string(b));
+}
+
+static void P3HullPass(CharMovement* rMv, CharMovement* mMv,
+                       const Ogre::Vector3& seatPos, bool logNow)
+{
+    __try { P3HullPassImpl(rMv, mMv, seatPos, logNow); }
+    __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION
+                  ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH)
+    { DebugLog("Riding: P3HULL access violation - hull probe abandoned"); }
+}
+
+// One P3 timeline line: the four (movement position - seat) samples of this frame.
+// Own function for the same C2712 reason as above (std::string temporaries).
+static void P3LogTimeline(const P3Sample& p3)
+{
+    char b[512];
+    _snprintf_s(b, 512, _TRUNCATE,
+        "Riding: P3 f=%u hits=%d sawA=%d aPre=(%.2f,%.2f,%.2f) aPost=(%.2f,%.2f,%.2f) "
+        "mPre=(%.2f,%.2f,%.2f) mPost=(%.2f,%.2f,%.2f) |aPre|=%.2f |mPre|=%.2f",
+        gP3Frames, p3.animHits, p3.sawAnim ? 1 : 0,
+        p3.aPre.x,  p3.aPre.y,  p3.aPre.z,
+        p3.aPost.x, p3.aPost.y, p3.aPost.z,
+        p3.mPre.x,  p3.mPre.y,  p3.mPre.z,
+        p3.mPost.x, p3.mPost.y, p3.mPost.z,
+        p3.aPre.length(), p3.mPre.length());
+    DebugLog(std::string(b));
+}
+
 // 1b) Apply the computed seat position.  We run after the game's own update,
 //     so our offset on top of the slave attachment sticks until next frame.
 //     Skipped when there is nothing to correct (small/medium animals).
 static void SyncMountedRiders()
 {
+    ++gP3Frames;   // P3-0 probe cadence, counted whether or not anyone is mounted
     if (!mountSeat.empty())
     {
         boost::unordered_map<Character*, Character*>::iterator it = riderToMount.begin();
@@ -3557,28 +6345,55 @@ static void SyncMountedRiders()
             // +17.6 / -6.4), so the logical position never gets to the back at all.  Two
             // things follow from that: the mouse picks characters through
             // CharMovement::clickHull - a separate physics object that has to be told where
-            // the body went - and _setPositionSimple is being called on a movement that
-            // pickupObject DESTROYED, so it may not be landing in the first place.  Hence
-            // the read-back into mvW (answers exactly that, in the same breath as the
-            // write) and the click hull refresh.  Read mvW like this: ~0 means the write
-            // DID land and something later in the frame drags it back to the slot (the
-            // engine's own beingCarriedUpdate is the prime suspect, and we are forbidden
-            // from hooking it - see the DISABLED HOOKS block - so the answer there is to
-            // move this write to the last pass of the frame, not to fight it here);
-            // nonzero means the call itself is a no-op on a destroyed movement, and the
-            // next lever is teleportCollisionHull(seatPos).
+            // the body went - and _setPositionSimple might not even be landing, being
+            // called on a movement that pickupObject DESTROYED.
+            //
+            // 2026-08-29, mvW settled the second half: ZERO on all 19511 frames of the v1.6
+            // log, i.e. the write DOES land and reads back exactly.  So this is a DRAG-BACK
+            // problem, not a no-op problem, and the "next lever is teleportCollisionHull"
+            // note that used to sit here was reasoning from the wrong premise.  Note also
+            // that this pass is already the last writer before render and the value is
+            // still back at the slot next frame => the drag happens in the NEXT frame's
+            // update phase; moving this write later cannot fix it on its own.
+            //
+            // P3-0 (below) brackets both of our writes to find out WHERE in the frame that
+            // happens, because no existing log can: DebugLogRideFrame above samples rMove
+            // BEFORE this frame's own write, so its rMove field is last frame's post-drag
+            // value.  The prime suspect is the engine's own beingCarriedUpdate, which we
+            // are forbidden from hooking (see the DISABLED HOOKS block).
             //
             // There is no setCurrentPosition to write the field behind getPosition():
             // that name belongs to FlockingTools (get-out-of-the-way state), not to
             // AbstractMovementBase.  The field itself is AbstractMovementBase::pos
             // (+0xC4, public) if it ever comes to poking it directly.
+            // P3-0 result (2026-08-29, 105 sampled frames over 2 rides, all identical):
+            // aPre = ZERO on every line, mPre = 7.6..13.5u off.  So the drag-back happens
+            // in the part of the engine update that runs AFTER the rider's animUpdate, and
+            // nothing touches the position between this pass and the next frame's
+            // animUpdate.  The rider IS on the saddle at render time; the carry slot only
+            // owns the tail of the update phase.  hits=2 on every line (the resync fires
+            // twice per frame: once for the mount's animUpdate, once for the rider's).
             if (rider->getMovement())
             {
                 CharMovement* rMv = rider->getMovement();
+                P3Sample& p3 = p3Probe[rider];
+                p3.mPre = rMv->getPosition() - seatPos;
                 rMv->_setPositionSimple(seatPos);
-                dbgMoveWritten[rider] = rMv->getPosition() - seatPos;
-                if (rMv->hasClickHull())
-                    rMv->refreshClickHull();
+                p3.mPost = rMv->getPosition() - seatPos;
+                dbgMoveWritten[rider] = p3.mPost;
+
+                bool p3Log = debugContinuous && gP3Budget > 0
+                             && (gP3Frames % kP3LogGap) == 0;
+                if (p3Log)
+                {
+                    --gP3Budget;
+                    P3LogTimeline(p3);
+                }
+                // Was `if (hasClickHull()) refreshClickHull();`, which never fired: the
+                // mounted rider has no hull to refresh.  This pass builds one and keeps
+                // it on the seat - it is the 「骑手点不中」 fix, not a probe.
+                P3HullPass(rMv, mount->getMovement(), seatPos, p3Log);
+                p3.animHits = 0;   // per-frame count, consumed by the line above
             }
             AnimationClass* rAnim = rider->getAnimationClass();
             if (rAnim)
@@ -3625,6 +6440,694 @@ static void ForceWalkPass()
     }
 }
 
+// P3-3 / P4-1: read out what the combat system thinks of a mounted rider.  Pure probe -
+// nothing here writes.  See the kCmbBudget block near the top of the file for the
+// pre-registered readings; the short version is that getAllAttackers() on the rider is the
+// engine's own answer to 「敌人会不会走过来打骑手」, so one fight decides whether the
+// 鞍座 XZ + 贴地 Y lever is needed before we write a line of it.
+//
+// Distances are logged three ways because that is what discriminates the failure modes:
+//   dR3/dRxz  nearest attacker to the rider's LOGICAL position (what combat reach uses)
+//   dB3       nearest attacker to the rider's RENDER root bone (where the player sees them)
+//   dM3/dMxz  nearest attacker to the mount - the control group.  The mount is a normal
+//             character with a live CharMovement, so if the mount is engaged and the rider
+//             is not, the difference is about the rider, not about the fight.
+// A large dR3 with a small dRxz is the vertical-reach story the lever would fix; both small
+// with rAtk=0 means targeting rejects the rider for some other reason and the lever is a
+// waste.  SEH shell for the same reason as P3HULL: DebugLog takes a std::string, so the
+// string temporaries cannot live inside __try (C2712).
+static void CombatProbeImpl(Character* rider, Character* mount, bool neck)
+{
+    lektor<hand> rAtk;  rider->getAllAttackers(rAtk);
+    lektor<hand> mAtk;  mount->getAllAttackers(mAtk);
+    int rn = (int)rAtk.size();
+    int mn = (int)mAtk.size();
+
+    bool cm   = rider->isInCombatMode(true, true);
+    bool cmM  = rider->isInCombatMode(true, false);
+    bool rTgt = rider->getAttackTarget().getCharacter() != NULL;
+    bool mTgt = mount->getAttackTarget().getCharacter() != NULL;
+    bool cc   = rider->getCombatClass() != NULL;
+    bool bc   = rider->_isBeingCarried ? true : false;
+    bool dn   = rider->isDown();
+
+    // Signature: log on any change, plus a periodic baseline.  Counts are clamped so a big
+    // brawl cannot alias two different states onto the same signature bits.
+    int sig = (rn > 7 ? 7 : rn) | ((mn > 7 ? 7 : mn) << 3)
+            | (cm ? 0x40 : 0) | (cmM ? 0x80 : 0) | (rTgt ? 0x100 : 0) | (mTgt ? 0x200 : 0)
+            | (cc ? 0x400 : 0) | (bc ? 0x800 : 0) | (dn ? 0x1000 : 0) | (neck ? 0x2000 : 0);
+
+    bool changed  = (sig != gCmbSig);
+    bool baseline = (gP3Frames % kCmbBaseGap) == 0;
+    if (!changed && !baseline) return;
+    gCmbSig = sig;
+    --gCmbBudget;
+
+    CharMovement* rMv = rider->getMovement();
+    CharMovement* mMv = mount->getMovement();
+    Ogre::Vector3 rP  = rMv ? rMv->getPosition() : Ogre::Vector3::ZERO;
+    Ogre::Vector3 mP  = mMv ? mMv->getPosition() : Ogre::Vector3::ZERO;
+    Ogre::Vector3 rB  = rider->getBoneWorldPosition("Bip01");
+
+    // Nearest attacker over BOTH lists - whoever is fighting this pair is a data point for
+    // reach whichever of the two they picked as their target.
+    float dR3 = -1.0f, dRxz = -1.0f, dB3 = -1.0f, dM3 = -1.0f, dMxz = -1.0f;
+    for (int pass = 0; pass < 2; ++pass)
+    {
+        lektor<hand>& L = (pass == 0) ? rAtk : mAtk;
+        for (lektor<hand>::iterator ait = L.begin(); ait != L.end(); ++ait)
+        {
+            Character* a = ait->getCharacter();
+            if (!a) continue;
+            CharMovement* aMv = a->getMovement();
+            if (!aMv) continue;
+            Ogre::Vector3 aP = aMv->getPosition();
+            float r3  = (aP - rP).length();
+            float rdx = aP.x - rP.x, rdz = aP.z - rP.z;
+            float rxz = sqrtf(rdx * rdx + rdz * rdz);
+            float b3  = (aP - rB).length();
+            float m3  = (aP - mP).length();
+            float mdx = aP.x - mP.x, mdz = aP.z - mP.z;
+            float mxz = sqrtf(mdx * mdx + mdz * mdz);
+            if (dR3  < 0.0f || r3  < dR3)  dR3  = r3;
+            if (dRxz < 0.0f || rxz < dRxz) dRxz = rxz;
+            if (dB3  < 0.0f || b3  < dB3)  dB3  = b3;
+            if (dM3  < 0.0f || m3  < dM3)  dM3  = m3;
+            if (dMxz < 0.0f || mxz < dMxz) dMxz = mxz;
+        }
+    }
+
+    char b[512];
+    _snprintf_s(b, 512, _TRUNCATE,
+        "Riding: P3CMB neck=%d rAtk=%d mAtk=%d cm=%d cmM=%d rTgt=%d mTgt=%d cc=%d bc=%d down=%d "
+        "| dR3=%.2f dRxz=%.2f dB3=%.2f dM3=%.2f dMxz=%.2f | rY=%.2f bY=%.2f mY=%.2f",
+        neck ? 1 : 0, rn, mn, cm ? 1 : 0, cmM ? 1 : 0, rTgt ? 1 : 0, mTgt ? 1 : 0,
+        cc ? 1 : 0, bc ? 1 : 0, dn ? 1 : 0,
+        dR3, dRxz, dB3, dM3, dMxz, rP.y, rB.y, mP.y);
+    DebugLog(std::string(b));
+}
+
+static void CombatProbe(Character* rider, Character* mount, bool neck)
+{
+    __try { CombatProbeImpl(rider, mount, neck); }
+    __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION
+                  ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH)
+    { DebugLog("Riding: P3CMB access violation - combat probe abandoned"); }
+}
+
+// P4-1e-2: put the weapon back in the mounted rider's hand, and report the aggro/weapon state.
+// No attacker requirement - see the kArmBudget block for why that gate had to go.  Called every
+// frame while mounted on a small mount under debugContinuous; the rationing lives inside.
+static void RiderArmProbeImpl(Character* rider, Character* mount)
+{
+    Inventory* rInv = rider->getInventory();
+
+    // ---- P4-1g: spend one window frame (see kArmDumpFrames) ------------------------------
+    // Sampled at the TOP, i.e. the state the engine left behind after its own update, before
+    // this probe touches anything - the same reasoning as the P4-1f edge sampler.  The window
+    // is armed by the draw below, so frame 1 of every cycle is the "post" line and the rest
+    // are these; windows cannot chain because a successful draw holds wpn=1 for ~18 frames and
+    // no new attempt is made while the weapon is out.
+    if (gArmDumpLeft > 0 && gArmDumpBudget > 0)
+    {
+        --gArmDumpLeft;
+        --gArmDumpBudget;
+        DumpRiderAnimLayers(rider, rider->getAnimationClass(), "win");
+    }
+
+    // ---- P4-1h: make sure some dump budget actually lands IN combat -----------------------
+    // The P4-1g windows are armed by our forced draw, which happens in the opening frames of a
+    // ride, so every one of its 132 samples was out of combat and its iCM=0 says nothing about
+    // the state P4-3 has to work in.  This budget is separate so those windows cannot eat it,
+    // it re-arms for each fight, and it spends on two triggers: a slow stride for coverage,
+    // plus any change in the number of entries in the rider's layers.  The second is the one
+    // that matters - "something new entered the layers during a fight" IS the question, and at
+    // one dump per kArmDumpCmbGap frames a stride would step over a whole swing.
+    if (gArmDumpCmbBudget > 0)
+    {
+        if (rider->isInCombatMode(true, true))
+        {
+            unsigned int ec = CountRiderLayerEntries(rider->getAnimationClass());
+            bool entered    = (gArmDumpCmbEntries >= 0 && (int)ec != gArmDumpCmbEntries);
+            bool stride     = (gP3Frames % kArmDumpCmbGap) == 0;
+            gArmDumpCmbEntries = (int)ec;
+            if (entered || stride)
+            {
+                --gArmDumpCmbBudget;
+                // P4-1M: the tag carries whether the combat stance was up on the last frame
+                // HaltAndForceSitPass ran ("cmb1" / "cmb1+"), so a layer dump can still be read
+                // against what the torso was supposed to be doing.
+                char ct[16];
+                _snprintf_s(ct, 16, _TRUNCATE, "cmb%d%s",
+                            gRideStanceOn ? 1 : 0, entered ? "+" : "");
+                DumpRiderAnimLayers(rider, rider->getAnimationClass(), ct);
+            }
+        }
+        else gArmDumpCmbEntries = -1;   // entering combat again re-arms the change detector
+    }
+
+    // One dump per ride, before anything is touched: if getPrimaryWeapon() comes back NULL
+    // this is the line that says whether the slots are empty or just not where we looked.
+    // Accessors only - no raw field reads - because InventorySection's annotated offsets
+    // depend on this build's std::string/std::vector sizes and getting that wrong is a
+    // runtime AV, while a wrong accessor signature is a link error we would see immediately.
+    if (!gInvDumped && rInv)
+    {
+        gInvDumped = 1;
+        lektor<InventorySection*>& secs = rInv->getAllSections();
+        lektor<Item*> eqw;  rInv->getEquippedWeapons(eqw);
+        char sl[512];
+        int  used = 0;
+        sl[0] = 0;
+        for (uint32_t si = 0; si < secs.size() && used < 400; ++si)
+        {
+            InventorySection* sc = secs[si];
+            if (!sc) continue;
+            int n = _snprintf_s(sl + used, 512 - used, _TRUNCATE, "[%d:%u%s]",
+                                (int)sc->getLimitedSlot(), sc->getNumItems(),
+                                sc->getItem() ? "*" : "");
+            if (n <= 0) break;
+            used += n;
+        }
+        DebugLog("Riding: P41E slots sec=" + IntToStr((int)secs.size())
+                 + " eqw=" + IntToStr((int)eqw.size())
+                 + " prim=" + IntToStr(rInv->getPrimaryWeapon() ? 1 : 0)
+                 + " sec2=" + IntToStr(rInv->getSecondaryWeapon() ? 1 : 0)
+                 + " | " + std::string(sl));
+    }
+
+    // ---- P4-1f: name the writer that puts the weapon away (ordering test, see kEdgeBudget) ----
+    if (gEdgeBudget > 0)
+    {
+        AnimationClass* eAnim = rider->getAnimationClass();
+        int eWpn = rider->getCurrentWeapon() ? 1 : 0;
+        int eACW = eAnim ? (int)eAnim->animationRequirements.currentWeapon : -1;
+        if (eWpn != gEdgeWpn || eACW != gEdgeACW)
+        {
+            --gEdgeBudget;
+            char eb[224];
+            _snprintf_s(eb, 224, _TRUNCATE,
+                "Riding: P41F edge wpn=%d->%d aCW=%d->%d pref=%d cma=%d bc=%d draws=%d f=%u",
+                gEdgeWpn, eWpn, gEdgeACW, eACW,
+                rider->getThePreferredWeapon()      ? 1 : 0,
+                rider->isInCombatMode(true, true)   ? 1 : 0,
+                rider->_isBeingCarried              ? 1 : 0,
+                gDrawCalls, gP3Frames);
+            DebugLog(std::string(eb));
+            gEdgeWpn = eWpn;
+            gEdgeACW = eACW;
+        }
+    }
+
+    if (!rider->getCurrentWeapon() && gDrawTries > 0 && rInv
+        && (!gDrawLastFrame || (gP3Frames - gDrawLastFrame) >= kDrawTryGap))
+    {
+        // getPrimaryWeapon() reads the equipment slots, so it answers even while the weapon
+        // is sheathed - that is the whole difference from getThePreferredWeapon(), which was
+        // NULL in every P4-1d read.  Weapon -> Item is offset-0 single inheritance all the
+        // way down (Gear.h annotates the base offsets), so reinterpret_cast is the sound cast
+        // here: both types are incomplete to the compiler, which rules out a language upcast.
+        Weapon* sw = rInv->getPrimaryWeapon();
+        if (!sw) sw = rInv->getSecondaryWeapon();
+        gDrawLastFrame = gP3Frames;
+        if (sw)
+        {
+            --gDrawTries;
+            ++gDrawCalls;
+            // P4-1h: the deciding read, taken across the call.  The sheath name has to be
+            // COPIED here - the const char* aliases the engine's std::string and drawWeapon is
+            // entitled to reallocate it, which would leave the pre-value dangling.
+            const char* shPreP = "?";
+            Weapon* wihPre = RiderWeaponInHands(rider, &shPreP);
+            std::string shPre(shPreP ? shPreP : "");
+            rider->drawWeapon(reinterpret_cast<Item*>(sw), std::string());
+            const char* shPost = "?";
+            Weapon* wihPost = RiderWeaponInHands(rider, &shPost);
+            AnimationClass* dAnim = rider->getAnimationClass();
+            char dw[384];
+            _snprintf_s(dw, 384, _TRUNCATE,
+                "Riding: P41E draw n=%d left=%d sw=1 post=%d pref=%d aCW=%d bc=%d "
+                "wih=%d->%d sh='%s'->'%s' f=%u",
+                gDrawCalls, gDrawTries,
+                rider->getCurrentWeapon()        ? 1 : 0,
+                rider->getThePreferredWeapon()   ? 1 : 0,
+                dAnim ? (int)dAnim->animationRequirements.currentWeapon : -1,
+                rider->_isBeingCarried ? 1 : 0,
+                wihPre ? 1 : 0, wihPost ? 1 : 0,
+                shPre.c_str(), shPost,
+                gP3Frames);
+            DebugLog(std::string(dw));
+
+            // P4-1g: catch a SYNCHRONOUS draw request in the frame it is made, then arm the
+            // window so the following kArmDumpFrames cover the hold and the revert.  Only the
+            // first couple of cycles are sampled (kArmDumpBudget); that is enough because the
+            // question is categorical - does a draw clip appear at all, and at what weight.
+            if (gArmDumpBudget > 0)
+            {
+                --gArmDumpBudget;
+                DumpRiderAnimLayers(rider, dAnim, "post");
+                gArmDumpLeft = kArmDumpFrames;
+            }
+        }
+        else if (!gDrawNoWpn)
+        {
+            // Log the empty-handed case once, not every kDrawTryGap frames: "no weapon in
+            // the slots" is a single fact about this ride, and it is answered by the dump.
+            gDrawNoWpn = 1;
+            DebugLog("Riding: P41E draw skipped - no equipped weapon in the slots");
+        }
+    }
+
+    // ---- state line: aggro AND weapon, same sample ---------------------------------------
+    if (gArmBudget <= 0) return;
+
+    lektor<hand> rAtk;  rider->getAllAttackers(rAtk);
+    lektor<hand> mAtk;  mount->getAllAttackers(mAtk);
+    int rn = (int)rAtk.size();
+    int mn = (int)mAtk.size();
+
+    int wpn  = rider->getCurrentWeapon()      ? 1 : 0;
+    int pref = rider->getThePreferredWeapon() ? 1 : 0;
+    int prim = (rInv && rInv->getPrimaryWeapon()) ? 1 : 0;
+    int cma  = rider->isInCombatMode(true, true) ? 1 : 0;
+    int bc   = rider->_isBeingCarried ? 1 : 0;
+    AnimationClass* aAnim = rider->getAnimationClass();
+    int aCW  = aAnim ? (int)aAnim->animationRequirements.currentWeapon : -1;
+
+    int sig = (rn > 7 ? 7 : rn) | ((mn > 7 ? 7 : mn) << 3)
+            | (wpn ? 0x40 : 0) | (pref ? 0x80 : 0) | (prim ? 0x100 : 0)
+            | (cma ? 0x200 : 0) | (bc ? 0x400 : 0) | ((aCW & 0xF) << 11);
+
+    bool changed  = (sig != gArmSig);
+    bool baseline = (gP3Frames % kArmBaseGap) == 0;
+    if (!changed && !baseline) return;
+    gArmSig = sig;
+    --gArmBudget;
+
+    char b[288];
+    _snprintf_s(b, 288, _TRUNCATE,
+        "Riding: P41E arm rAtk=%d mAtk=%d wpn=%d pref=%d prim=%d aCW=%d cma=%d bc=%d "
+        "draws=%d left=%d f=%u",
+        rn, mn, wpn, pref, prim, aCW, cma, bc, gDrawCalls, gDrawTries, gP3Frames);
+    DebugLog(std::string(b));
+}
+
+static void RiderArmProbe(Character* rider, Character* mount)
+{
+    __try { RiderArmProbeImpl(rider, mount); }
+    __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION
+                  ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH)
+    { DebugLog("Riding: P41E access violation - arm probe abandoned"); }
+}
+
+// P4-1b/1c: ask the engine WHY the rider is not a combat participant, then try to make it one.
+// See the kAtkTryBudget block near the top of the file for the P4-1b result and the P4-1c
+// pre-registered readings.  P4-1b settled the gate (the rider CAN be a participant, via
+// cc->setAttackTarget + rider->attackingYou); P4-1c is about the one thing still missing, the
+// swing, whose named mechanism is reach=0.00 with combat mode never active.
+//   Target = nearest live attacker over BOTH attacker lists (the rider's is empty at the start
+// of a ride - that is the bug - so the first one always comes from the mount's), and it must be
+// within kAtkTryRange, which was the whole point of the P4-1b revision: P4-1a's single order
+// went out at d=971 because getAllAttackers() registers an attacker the moment it DECIDES to
+// attack, so distance was never controlled for.
+//   The read lines are emitted on the same cadence as the ladder and keep going (own budget)
+// after the ladder is spent, so "nothing stuck" and "stuck then cleared" stay separable.
+static void RiderCombatLeverImpl(Character* rider, Character* mount)
+{
+    lektor<hand> rAtk;  rider->getAllAttackers(rAtk);
+    lektor<hand> mAtk;  mount->getAllAttackers(mAtk);
+    if (!rAtk.size() && !mAtk.size()) return;
+
+    CharMovement* rMv = rider->getMovement();
+    Ogre::Vector3 rP  = rMv ? rMv->getPosition() : Ogre::Vector3::ZERO;
+
+    Character* best  = NULL;
+    float      bestD = 0.0f, bestXZ = 0.0f;
+    for (int pass = 0; pass < 2; ++pass)
+    {
+        lektor<hand>& L = (pass == 0) ? rAtk : mAtk;
+        for (lektor<hand>::iterator ait = L.begin(); ait != L.end(); ++ait)
+        {
+            Character* a = ait->getCharacter();
+            if (!a || a == rider || a->isDown() || a->isDead()) continue;
+            CharMovement* aMv = a->getMovement();
+            if (!aMv) continue;
+            Ogre::Vector3 aP = aMv->getPosition();
+            float d  = (aP - rP).length();
+            float dx = aP.x - rP.x, dz = aP.z - rP.z;
+            if (!best || d < bestD) { best = a; bestD = d; bestXZ = sqrtf(dx * dx + dz * dz); }
+        }
+    }
+    if (!best || bestD > kAtkTryRange) return;   // short range only - P4-1a's core mistake
+
+    // P4-1e used to sit here, inside this attacker gate.  It was moved out to RiderArmProbe,
+    // which runs every frame with no attacker requirement: mounting turns out to DROP an
+    // existing aggro relationship (measured 2026-08-30), so this gate can never be relied on
+    // to fire, and "can a mounted rider draw a weapon" is not a combat question anyway.
+
+    if (gAtkLastFrame && (gP3Frames - gAtkLastFrame) < kAtkTryGap) return;
+    gAtkLastFrame = gP3Frames;
+
+    CombatClass* rcc = rider->getCombatClass();
+    CombatClass* ecc = best->getCombatClass();
+
+    // Classify targets by identity instead of by nullness: "holds A target" and "holds THE
+    // target we asked for" are different answers and P4-1a could not tell them apart.
+    Character* rt  = rider->getAttackTarget().getCharacter();
+    Character* ct  = rcc ? rcc->_getAttackTarget().getCharacter() : NULL;
+    Character* et  = best->getAttackTarget().getCharacter();
+    Character* nz  = rcc ? rcc->getNearestEnemyInAttackZone() : NULL;
+    int rTgt  = !rt ? 0 : (rt == best ? 1 : 2);
+    int cTgt  = !ct ? 0 : (ct == best ? 1 : 2);
+    int eTgt  = !et ? 0 : (et == rider ? 1 : (et == mount ? 2 : 3));
+    int nearZ = !nz ? 0 : (nz == best ? 1 : 2);
+
+    // Prefix note: every line in this probe is P41D now, so a fresh log can never be mistaken
+    // for a P41C one.  The two read lines keep DIFFERENT tokens on purpose - "P41D ai" is this
+    // one (the P41B-era AI-layer view, kept verbatim as a regression check) and "P41D read" is
+    // the deep raw/API one below.  One token per line type, or the log parsers conflate them.
+    char b[768];
+    _snprintf_s(b, 768, _TRUNCATE,
+        "Riding: P41D ai d=%.2f dxz=%.2f reach=%.2f eReach=%.2f | r cm=%d cmM=%d rTgt=%d "
+        "cTgt=%d in=%d opp=%d wait=%d inZ=%d nearZ=%d lst=%d atkg=%.2f | e eTgt=%d eLstR=%d "
+        "eLstM=%d eIn=%d | v ordProb=%d rGet=%d eGet=%d noAgg=%d bc=%d",
+        bestD, bestXZ,
+        rcc ? rcc->weaponReach() : -1.0f,
+        ecc ? ecc->weaponReach() : -1.0f,
+        rider->isInCombatMode(true, true)  ? 1 : 0,
+        rider->isInCombatMode(true, false) ? 1 : 0,
+        rTgt, cTgt,
+        rcc ? (rcc->_isInCombatMode() ? 1 : 0) : -1,
+        rcc ? rcc->getNumOpponents() : -1,
+        rcc ? rcc->getNumWaitingAttackers() : -1,
+        rcc ? (rcc->isInAttackZone(best) ? 1 : 0) : -1,
+        nearZ,
+        rcc ? (rcc->isInAttackerListH(best) ? 1 : 0) : -1,
+        rcc ? rcc->isAttacking(best) : -1.0f,
+        eTgt,
+        ecc ? (ecc->isInAttackerListH(rider) ? 1 : 0) : -1,
+        ecc ? (ecc->isInAttackerListH(mount) ? 1 : 0) : -1,
+        ecc ? (ecc->_isInCombatMode() ? 1 : 0) : -1,
+        rider->checkPlayerOrderForProblems(FOCUSED_MELEE_ATTACK, best) ? 1 : 0,
+        rider->areYouGonnaGetMe(best)  ? 1 : 0,
+        best->areYouGonnaGetMe(rider)  ? 1 : 0,
+        rider->iShouldntAggravateThisTarget(best) ? 1 : 0,
+        rider->_isBeingCarried ? 1 : 0);
+    DebugLog(std::string(b));
+    if (gAtkReads > 0) --gAtkReads;
+
+    // ---- P4-1d precondition: the three rungs already proven, re-applied idempotently -------
+    // All of them stuck for the rest of the ride that proved them, so on a fresh ride we want
+    // them in place BEFORE the new ladder runs - otherwise rung 0 gets tested without a combat
+    // relationship and rung 4 with one, and the round-robin confounds the two.  Guarded so a
+    // repeat is a no-op: the target only when the slot does not already name our enemy, and
+    // attackingYou only when the attacker list does not already contain it, because that one is
+    // an EVENT rather than a field write and re-firing it every 75 frames is a real state change.
+    // Deliberately outside the gAtkTries budget: it has to outlive the ladder, or the later
+    // reads measure a relationship that has quietly lapsed.
+    int preT = 0, preA = 0, preC = 0;
+    if (rcc && ct != best)
+    {
+        rcc->setAttackTarget(best);
+        rcc->setAttackTargetHandle(best);
+        preT = 1;
+    }
+    if (rcc && !rcc->isInAttackerListH(best))
+    {
+        rider->attackingYou(best, true, false);
+        preA = 1;
+    }
+
+    // The subject for initCombatMode comes straight out of the combat class, so no `hand` is
+    // ever constructed in this DLL: hand has virtuals and its ctor would be one more exported
+    // stub to depend on.  Read AFTER setAttackTarget above, so the slot is already populated.
+    hand tgtH = rcc ? rcc->_getAttackTarget() : hand();
+
+    // P4-1d promotes initCombatMode into the precondition, because P4-1c proved it is THE lever
+    // P4-1b was missing: cma 0->1 with _isInCombatMode() agreeing, rTgt 0->1 (33/33 zero in
+    // P4-1b), cst 3->4, and all of it held to the end of the log.  So combat mode is now part of
+    // the baseline and every rung below is tested ON TOP of it instead of racing it.  Idempotent
+    // via the cma!=1 guard.  Unfocused on purpose - the focused variant stays a ladder rung so
+    // the two remain distinguishable.  Cast: CombatClassPlayer and CombatClassAI are
+    // single-inheritance siblings with CombatClass first and only at offset 0 (CombatClass.h:
+    // 55/257/273), so this needs no this-adjustment; reinterpret_cast because the shim declares
+    // CombatClassAI standalone rather than restating the whole hierarchy.
+    if (rcc && CcBool(rcc, 0x130) != 1 && tgtH.getCharacter())
+    {
+        reinterpret_cast<CombatClassAI*>(rcc)->_NV_initCombatMode(tgtH, 0, false);
+        preC = 1;
+    }
+    if (preT || preA || preC)
+        DebugLog("Riding: P41D precond tgt=" + IntToStr(preT) + " atk=" + IntToStr(preA)
+                 + " icm=" + IntToStr(preC));
+
+    // ---- P4-1d deep read --------------------------------------------------------------
+    // Raw fields first, then the API calls that must agree with them, then the ENEMY's same
+    // three raw fields as the positive control: that character is provably in combat mode, so
+    // its cma/tech/cst show what "in combat mode" looks like in these very bytes.  Without it
+    // a rider reading cma=0 tech=0 cst=0 is indistinguishable from three bad offsets.
+    // ⚠ nxt (0x1F4, nextMove) is GONE from this line.  P4-1c read 1818135763 in the two reads
+    // before combat mode came up and 8 in the two after: the field is uninitialised until the
+    // state machine starts, so it can never be read as a state.  (That it changed at all is
+    // still evidence the machine turns - that argument is recorded, the field is not.)
+    CombatClass*    mcc   = mount->getCombatClass();
+    AnimationClass* rAnim = rider->getAnimationClass();
+
+    // The boring explanation P4-1c left open.  getCurrentWeapon() (wpn= below) is a DRAWN-
+    // weapon test and read NULL 4/4 even though the player had equipped one, so it cannot tell
+    // "owns nothing" from "owns one, never drew it".  getThePreferredWeapon() (vtable 0x3C8)
+    // asks the inventory instead and getCategory() (Gear.h:49, @0x5C71D0) says what it is.  If
+    // pWpn=1 with a real pCat while aCW stays SKILL_UNARMED(5), the entire reach=0 chain is
+    // just a sheathed weapon and rung 0 is the whole fix.
+    Weapon* pw   = rider->getThePreferredWeapon();
+    int     pWpn = pw ? 1 : 0;
+    int     pCat = pw ? (int)pw->getCategory() : -1;
+
+    // The dry run that breaks the reach=0 -> no technique -> reach=0 circle: chooseAttack takes
+    // weaponReach as an ARGUMENT (@0x886880), so we can hand it a reach the rider does not have
+    // and find out whether a technique would exist at all.  R = the rider's own reach when it is
+    // non-zero, else the enemy's (9.00 in P4-1c), else 9.0f.  READ-ONLY: the returned pointer is
+    // deliberately not installed here - that is rung 2's job, so the ladder stays attributable.
+    float synthReach = 9.0f;
+    if (rcc && rcc->weaponReach() > 0.01f)      synthReach = rcc->weaponReach();
+    else if (ecc && ecc->weaponReach() > 0.01f) synthReach = ecc->weaponReach();
+    CharStats*           rst    = rider->getStats();
+    CombatTechniqueData* chTech = rst ? rst->chooseAttack(bestD, synthReach, NULL, false) : NULL;
+
+    // CombatTechniqueData is read by raw offset on purpose: its own header drags in
+    // MedicalSystem.h, which this tree never compiles.  `animation` at 0x0 is a std::string -
+    // the same ABI bet SafeSnapAnimRow already makes on AnimationData::dataName, so this adds no
+    // new dependency.  0x38 initialDistance / 0x3C minDistanceVsStatic are the engine's own
+    // opinion of the range this swing is usable at, which is the number to compare against d=.
+    char  chAnim[64];
+    chAnim[0] = 0;
+    float chInit = -1.0f, chMinS = -1.0f;
+    if (chTech)
+    {
+        const std::string* an = (const std::string*)((const char*)chTech + 0x00);
+        _snprintf_s(chAnim, 64, _TRUNCATE, "%s", an->c_str());
+        chInit = *(const float*)((const char*)chTech + 0x38);
+        chMinS = *(const float*)((const char*)chTech + 0x3C);
+    }
+
+    char p[1280];
+    _snprintf_s(p, 1280, _TRUNCATE,
+        "Riding: P41D read d=%.2f | raw cma=%d tech=%d cst=%d atk=%.2f mei=%.2f/%.2f "
+        "| api in=%d gcs=%d blk=%d reach=%.2f | vp R=%08X M=%08X E=%08X "
+        "| wpn=%d eWpn=%d aCW=%d aCM=%d | pWpn=%d pCat=%d cTech=%d "
+        "| ch=%d sR=%.2f anim='%s' init=%.2f minS=%.2f "
+        "| e cma=%d tech=%d cst=%d reach=%.2f",
+        bestD,
+        CcBool(rcc, 0x130), CcPtrSet(rcc, 0x150),
+        CcInt(rcc, 0x1F0),
+        CcFloat(rcc, 0x140), CcFloat(rcc, 0x278), CcFloat(rcc, 0x27C),
+        rcc ? (rcc->_isInCombatMode() ? 1 : 0) : -1,
+        rcc ? (int)rcc->getCombatState() : -1,
+        rcc ? (int)rcc->getBlockStateEnum() : -1,
+        rcc ? rcc->weaponReach() : -1.0f,
+        CcVptrLo(rcc), CcVptrLo(mcc), CcVptrLo(ecc),
+        rider->getCurrentWeapon() ? 1 : 0,
+        best->getCurrentWeapon()  ? 1 : 0,
+        rAnim ? (int)rAnim->animationRequirements.currentWeapon : -1,
+        rAnim ? (int)rAnim->animationRequirements.isCombatMode.key  : -1,
+        pWpn, pCat,
+        // cTech: _currentCombatTechnique lives on AnimationRequirement (0x118 within that
+        // struct), NOT on AnimationClass - AnimationClass.h:349 sits inside the
+        // AnimationRequirement body (318-377) while AnimationClass itself only opens at :401.
+        // Same struct the two lines above already read (currentWeapon / isCombatMode).
+        (rAnim && rAnim->animationRequirements._currentCombatTechnique) ? 1 : 0,
+        chTech ? 1 : 0, synthReach, chAnim, chInit, chMinS,
+        CcBool(ecc, 0x130), CcPtrSet(ecc, 0x150), CcInt(ecc, 0x1F0),
+        ecc ? ecc->weaponReach() : -1.0f);
+    DebugLog(std::string(p));
+
+    // P4-3 premise #2, answered here instead of by a separate probe: resolve that clip name in
+    // allAnims and print its layer and flags, so we learn whether the swing carries
+    // wholeBodyAllLayer - i.e. whether it collides with kRidePose the same way kRidePose
+    // collides with everything else.  Once per DISTINCT name: the name only changes when
+    // chooseAttack picks differently, and that is exactly when a new row is worth a log line.
+    // ⚠ find() ONLY.  getAnimationData() has operator[] semantics and would insert a permanent
+    // NULL into the engine's own table on a miss - and a miss is a live possibility here, since
+    // P1 proved the human table has no ATTACKS category at all.
+    // ⚠ std::string comparison, not strcmp: this file includes no <string.h>/<cstring> and uses
+    // no C string functions anywhere, and this probe is not the place to start.
+    static std::string lastChAnim;
+    if (chAnim[0] && lastChAnim != chAnim)
+    {
+        lastChAnim = chAnim;
+        AnimsListsManager*           mgr = AnimsListsManager::getSingleton();
+        AnimsListsManager::AnimList* own = rAnim ? rAnim->getAnimationDatasList() : NULL;
+        AnimsListsManager::AnimList* lst = own ? own : (mgr ? mgr->getCharacterList() : NULL);
+        // Same boost-layout self-check DumpHumanAnimTableImpl uses: if allAnims is not at 0xB8
+        // the map we would search is not the map the game has, so refuse rather than guess.
+        long allOff = lst ? (long)((char*)&lst->allAnims - (char*)lst) : -1;
+        if (!lst || allOff != 0xB8)
+            DebugLog(std::string("Riding:   P41D clip '") + chAnim + "' unresolved (no list)");
+        else
+        {
+            EngineAnimMap::const_iterator ci = lst->allAnims.find(std::string(chAnim));
+            if (ci == lst->allAnims.end())
+                DebugLog(std::string("Riding:   P41D clip '") + chAnim + "' ABSENT in allAnims");
+            else
+                LogAnimRow("P41D clip", chAnim, ci->second);
+        }
+    }
+
+    if (gAtkTries <= 0) return;
+
+    // Round-robin, but skip rungs an AV already disarmed (gRungDead[], set by the __except
+    // shell).  P4-1c burned the whole run on one bad rung: the SEH shell zeroed the budget, so
+    // 3 rungs / 4 reads happened instead of 20 / 60 and rung 4 was never reached.  Now one bad
+    // rung costs only itself.  If every rung is dead there is nothing left to try - stop.
+    int stage = -1;
+    for (int si = 0; si < kAtkStages; ++si)
+    {
+        int cand = (gAtkStage + si) % kAtkStages;
+        if (!gRungDead[cand]) { stage = cand; break; }
+    }
+    if (stage < 0)
+    {
+        DebugLog("Riding: P41D all rungs disarmed - ladder abandoned");
+        gAtkTries = 0;
+        return;
+    }
+    gAtkStage = (stage + 1) % kAtkStages;
+    --gAtkTries;
+
+    int icm = -1;   // _NV_initCombatMode's return value, -1 = not called this rung
+
+    // gAtkCurRung is what the __except shell reads to know WHICH rung faulted.  Set immediately
+    // before the switch and cleared immediately after, so an AV anywhere else stays attributed
+    // to "not a rung" and keeps the old abandon-everything behaviour.
+    gAtkCurRung = stage;
+    switch (stage)
+    {
+    case 0:
+        // The most boring explanation first: the weapon is simply never drawn (P4-1c: wpn=0 4/4
+        // with a weapon equipped, animation side reporting SKILL_UNARMED).  drawWeapon is pure
+        // virtual (vtable 0x3D8) and getThePreferredWeapon (0x3C8) picks the subject, so this
+        // rung needs no shim.  Weapon -> Item is offset-0 single inheritance all the way down
+        // (Gear.h annotates the base offsets), so reinterpret_cast is the sound cast here: both
+        // types are incomplete to the compiler, which makes a language-level upcast impossible.
+        if (pw) rider->drawWeapon(reinterpret_cast<Item*>(pw), std::string());
+        break;
+    case 1:
+        // The FOCUSED variant.  The unfocused one already runs every tick in the idempotent
+        // precondition above, so this rung tests only the difference the focus flag makes.
+        // ⚠ The dispatch target is CombatClassAI::_NV_initCombatMode @0x667A60, not the base's
+        // 0x665230: the rider, the mount and the enemy all read the same vptr (41DB5688) and two
+        // of those three are provably AI.  Offset-0 sibling, so no this-adjustment.
+        if (rcc && tgtH.getCharacter())
+            icm = reinterpret_cast<CombatClassAI*>(rcc)->_NV_initCombatMode(tgtH, 0, true) ? 1 : 0;
+        break;
+    case 2:
+        // Hand the already-turning state machine the one thing it lacks.  P4-1c's fired branch
+        // was "cma=1 but reach=0 => the missing piece is a technique", and tech was NULL in 4/4
+        // reads.  chTech comes from the read block's dry run, so if this rung swings, chooseAttack
+        // is the producer and the engine drives everything after it.
+        if (rcc && chTech) CcSetPtr(rcc, 0x150, chTech);
+        break;
+    case 3:
+        // The decisive rung: bypasses combat state, attack zone, reach and technique selection
+        // entirely and asks the animation layer to play the swing (@0x5B6E80).  If this is the
+        // only rung that produces act>1, P4-3 changes shape - we would have to drive every swing
+        // ourselves instead of just finding the clip.  Dismount() calls endCombatAnimation().
+        if (rAnim && chTech) rAnim->runCombatAnimation(chTech, 1.0f, "");
+        break;
+    default:
+        // Skips the engine's own preconditions, so it is last: if only this one swings we have
+        // a hack, not a fix.  P4-1c never reached it (the AV ate the budget); this time it runs
+        // with a technique installed by rung 2 rather than against tech=NULL.
+        if (rcc) rcc->changeState(CHOP_WEAPON, 0.0f);
+        break;
+    }
+    gAtkCurRung = -1;
+
+    // Same-frame readback.  The first six fields are unchanged from P41B on purpose: they are
+    // now a REGRESSION check that the two proven rungs still hold while the new ones fire.
+    // The rest are the outcome variables of the hypothesis chain, in engine order, so one line
+    // says how far down the chain this rung got: cma -> tech -> reach -> inZ -> nearZ.
+    Character* rt2 = rider->getAttackTarget().getCharacter();
+    Character* ct2 = rcc ? rcc->_getAttackTarget().getCharacter() : NULL;
+    Character* et2 = best->getAttackTarget().getCharacter();
+    Character* nz2 = rcc ? rcc->getNearestEnemyInAttackZone() : NULL;
+    char c[640];
+    _snprintf_s(c, 640, _TRUNCATE,
+        "Riding: P41D rung=%d tries_left=%d d=%.2f icm=%d | post rTgt=%d cTgt=%d eTgt=%d cm=%d "
+        "cmM=%d in=%d opp=%d | chain cma=%d tech=%d reach=%.2f inZ=%d nearZ=%d | cst=%d "
+        "aCM=%d wpn=%d",
+        stage, gAtkTries, bestD, icm,
+        !rt2 ? 0 : (rt2 == best ? 1 : 2),
+        !ct2 ? 0 : (ct2 == best ? 1 : 2),
+        !et2 ? 0 : (et2 == rider ? 1 : (et2 == mount ? 2 : 3)),
+        rider->isInCombatMode(true, true)  ? 1 : 0,
+        rider->isInCombatMode(true, false) ? 1 : 0,
+        rcc ? (rcc->_isInCombatMode() ? 1 : 0) : -1,
+        rcc ? rcc->getNumOpponents() : -1,
+        CcBool(rcc, 0x130), CcPtrSet(rcc, 0x150),
+        rcc ? rcc->weaponReach() : -1.0f,
+        rcc ? (rcc->isInAttackZone(best) ? 1 : 0) : -1,
+        !nz2 ? 0 : (nz2 == best ? 1 : 2),
+        CcInt(rcc, 0x1F0),
+        rAnim ? (int)rAnim->animationRequirements.isCombatMode.key : -1,
+        rider->getCurrentWeapon() ? 1 : 0);
+    DebugLog(std::string(c));
+}
+
+static void RiderCombatLever(Character* rider, Character* mount)
+{
+    __try { RiderCombatLeverImpl(rider, mount); }
+    __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION
+                  ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH)
+    {
+        // P4-1d: disarm only the rung that faulted, keep the budget.  P4-1c did the opposite and
+        // one bad rung (calculateTargetsInAttackZone, deleted) cost the whole run: 3 rungs and 4
+        // reads out of a 20/60 budget, with rung 4 never reached.  gAtkCurRung is only in range
+        // while the switch is executing, so an AV in the read block or the readback still
+        // abandons everything - that is a different kind of fault and worth stopping for.
+        // ⚠ Fixed char buffer, no operator+ chains: this handler lives in a function with __try,
+        // where every extra object needing unwinding is a C2712 risk.  One implicit std::string
+        // temporary at the DebugLog call is the shape that already compiles here.
+        int deadRung = gAtkCurRung;
+        gAtkCurRung = -1;
+        if (deadRung >= 0 && deadRung < kAtkStages)
+        {
+            gRungDead[deadRung] = true;
+            char av[128];
+            _snprintf_s(av, 128, _TRUNCATE,
+                "Riding: P41D access violation in rung %d - that rung disarmed, budget kept",
+                deadRung);
+            DebugLog(av);
+        }
+        else
+        {
+            DebugLog("Riding: P41D access violation outside a rung - combat lever abandoned");
+            gAtkTries = 0;
+            gAtkReads = 0;
+        }
+    }
+}
+
 // 1c) Mount combat + forced dismount.
 //     - Any mount that is down (KO'd) or dead force-dismounts its rider.
 //     - On NECK-mode (large) mounts the rider stays passive: their combat is
@@ -3653,6 +7156,11 @@ static void CombatAndForceDismountPass()
             if (sit != mountSeat.end() && IsBigMount(sit->second))
                 neckMount = true;
 
+            // Read the combat state BEFORE the neck branch below suppresses it, or the probe
+            // would only ever see our own endCombatMode().
+            if (debugContinuous && gCmbBudget > 0)
+                CombatProbe(rider, mount, neckMount);
+
             if (neckMount)
             {
                 // rider stays passive - never swings its tiny weapon from the back
@@ -3675,6 +7183,18 @@ static void CombatAndForceDismountPass()
                             mount->attackTarget(attacker);
                     }
                 }
+            }
+            else if (debugContinuous)
+            {
+                // P4-1e-2: the arm probe first, and with NO attacker requirement - mounting
+                // drops existing aggro, so gating it on a live attacker means it may never
+                // run.  It rations itself internally (kDrawTryGap / kArmBudget).
+                RiderArmProbe(rider, mount);
+
+                // P4-1b: small mount, so nothing of ours suppresses this rider.  Interrogate
+                // the engine's own combat bookkeeping about it, then walk the lever ladder.
+                if (gAtkTries > 0 || gAtkReads > 0)
+                    RiderCombatLever(rider, mount);
             }
             ++it;
         }

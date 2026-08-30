@@ -6,9 +6,12 @@
 # Internal dev notes (not for the public repo)
 CLAUDE.md
 RidingPlugin_HISTORY.md
+TASK.md
+TEST_REQUIRED.md
 
 # Backups, logs, personal helper scripts
 *.bak
+*.bak_*
 *.log
 dmp.py
 

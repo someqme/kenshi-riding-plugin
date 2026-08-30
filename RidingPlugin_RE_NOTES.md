@@ -340,3 +340,66 @@ CLAUDE.md 只留指针，需要 hook 新函数 / 直调新方法时查本节。
 - **派发不能用 `isKeyState(name)`**：对插件加的命令恒 false（详见 CLAUDE.md 关键机制）。我们不像先例那样再包一层 `OIS::KeyListener`（RE_Kenshi 已经包了一层），改成每 15 帧扫 `key->map` 反查每条命令**当前**的复合键码，再 OIS 轮询物理键 + 校验修饰位。
 
 仍未做：caption 只有英文（原版 `gettext` 不含我们的串，这也是先例那行 freecam 不翻译的原因），多语言＝自带 9 语言表（同 `kMountLabels[]`）为增强项。
+
+## 15. 人形动画表枚举（TASK.md P1，2026-08-29 游戏内实测一次通过）
+
+**目的**：`AnimsListsManager::getSingleton()->getCharacterList()->allAnims` ＝ 引擎真正认的全部人形动画记录。姿势重做与骑乘战斗都要先知道「表里有什么」。诊断代码在 `RidingPlugin.cpp`（`DumpHumanAnimTable*` / `LogAnimRow` / `AnimRowSnap`，`Mount()` 末尾一次性触发，`gAnimTableDumped` 预算 1／每次 DLL 加载）。
+
+**取表的路径与实锤**
+- 走 `AnimationClass::getAnimationDatasList()`（RVA 0x6DFF0，＝这个角色自己解析用的那张表）而不是直接用单例，再与 `getCharacterList()` **对照打指针**：实测 `own=charList=00000001741ABAA0 same=1` ⇒ **人类骑手确实解析人形表**，两条路等价。
+- `AnimsListsManager::getSingleton()` 0xB70A0、`getCharacterList()` 0x8AF50、`getAnimalList(GameData*,GameData*)` 0x5C5D60。全部有 KenshiLib 导出桩，直调即可。
+- 嵌套 `AnimList` 布局（`AnimationClass.h:265-305`）：`movementAnimsBase` 0x0 / `movementAnimsUpper` 0x18 / `idleAnims` 0x30 / `strafeAnims` 0x48 / `attacks` 0x60（`lektor<AnimationData*>`）、`actionAnims` 0x78 与 **`allAnims` 0xB8**（boost `unordered_map<string, AnimationData*>`）、`turningAnim` 0xF8 / `stumbleAnims` 0x100 / `weatherOverlayAnims` 0x140，`sizeof=384`。
+- **迭代引擎 boost 容器的两道保险都值得留着抄**：①把 map 类型**完整拼出来**成一个 typedef（`EngineAnimMap`，含 `Ogre::STLAllocator`）＝ 让「我们的 boost 1.60 与游戏同构」这个假设变成**编译期**检查；②运行时自检 `offsetof(actionAnims)==0x78 && offsetof(allAnims)==0xB8 && sizeof==384`，不符就拒绝迭代。实测打出 `sizeof=384 off(action)=120 off(all)=184` ＝ 完全吻合 ⇒ **boost 布局同构这件事现在是实测结论，不再是赌**。另配 4000 条上限（防坏桶链死循环）、每条 `AnimationData` 过 POD SEH 快照、整个 dump 外层再套 SEH 壳。
+
+**⚠️ `AnimationClass::getAnimationData(name)` 查不到会往 `allAnims` 里插一条 NULL——它会改表**
+- 实锤：counts 行（probe 之前）报 `all=119`，走表时数出 **122** 条，多出来的 3 条 key 正是那 3 个 probe 报 `absent` 的名字（`jog lower-7` / `jog upper-6` / `sitting_new`），`ptr=0000000000000000 UNREADABLE`。119+3=122，逐条对得上。我们自己的 `allAnims.find()` 不会插，**插的是 `getAnimationData()`**（典型 `operator[]` 语义）。
+- 另有 2 条 NULL key **不是我们造的**（`jog lower-6` / `jog upper-5` ＝ 本会话的 clip 名，没被 probe 过）⇒ **引擎自己也在拿 clip 名调 `getAnimationData()`**，同样在往表里下毒。
+- **两条硬约束**：①**任何名字在传给 `getAnimationData()` 之前先 `find()` 验存在**——否则一个拼错/mod 才有的名字就永久往引擎表里留一条 NULL，而别的引擎代码遍历 `allAnims` 时会踩空指针（我们每帧 `getAnimationData(poseAnim)` 目前安全只因为两个姿势名都真实存在）；②**读 counts 要注意先后**：`size()` 是 probe 之前的数，走表是之后的数，差值＝probe 制造的 NULL 数。
+
+**记录名 vs clip 名（钉法的地基）**
+- map 的**键 ＝ 记录名（`dataName`）**，`animName` 才是 clip 名，两者常常不同：`jog lower` → clip `jog lower-6`、`jog upper` → clip `jog upper-5`、`stealth idle` → `crouch idle`、`eat` → `cannibaleating`、`knockout` → `stealthKO`、`crouch walk lower`/`crouch walk upper` → `crouch walk`/`crouch walk-10`。
+- **clip 名的数字后缀不稳定**：同一条记录在 P0 那趟是 `jog lower-7`/`jog upper-6`，这趟是 `-6`/`-5` ⇒ 后缀是加载期分配的，**绝对不许拿 clip 名当键**。`runAnimation`/`getAnimationData`/我们每帧的钉法全部走记录名；只有 POSEDUMP 打的是 clip 名（它读的是 `SingleAnimation`），两边名字不一致是**正常**的。
+
+**表的形状（原版人形，未装动画 mod 的那份；117 条可读 + 5 条 NULL）**
+- 按层：**UPPER 79 / OVERLAY 21 / LOWER 17**。按 category：`NORMAL` 101 / `RANGED` 6 / `SWIM` 5 / `GROUND` 4 / `CARRIED` 1 —— **`ANIM_ATTACKS` 与 `ANIM_COMBAT` 各 0 条**，`ANIM_IMPRISONED`/`ANIM_SLEEPING` 也是 0。
+- **`attacks` lektor 是空的（`attacks=0`）**，`idle=23 / moveBase=17 / moveUpper=20 / strafe=7 / action=29`。⇒ 人类的挥砍**不在人形表里**（候选：per-combat-technique 数据、或 `getAnimalList()` 那条路），P4-3 的原料得另找。
+- 表里唯一像近战的是 6 条 `blow` 家族（`back blow high/light/low`、`mid blow`/`mid blow drop`/`mid blow light`），全部 `UPPER` + `whole,action,norm,reloc,restrict,Rarm,Larm`、spd `-999/0/999` ＝ 击倒类重击，不是普通武器攻击。
+- `weaponTypeFlags` 是能用的位掩码：`guard 1h`=0x04、`guard4 main`=0x03、`guard5`=0x12、`guard6`=0x08、`guard polearm`=0x100，大多数通用行是 0x13F。
+
+## 16. 手控腿骨 + blend mask（TASK.md P2-1b-1，2026-08-29 游戏内实测一次通过）
+
+**目的**：姿势 clip 压全身（UPPER + `wholeBodyAllLayer`）而 LOWER 层一条坐姿都没有 ⇒ 想做跨骑只能把腿**整体从动画系统里拿走**。一次上马分三段验两个杠杆。诊断代码在 `RidingPlugin.cpp`（`LegProbe*` / `DumpRiderSkeleton`，`HaltAndForceSitPass` 内、`debugContinuous` 门控、每段 900 帧、段 3 自复原、`Dismount()` 另带一份复原）。
+
+**杠杆 A（放一条 LOWER 静态 clip 当基底）＝ 死**
+- `crawl idle down` 确实存在（`allAnims.find()` 命中，`list=...E76E6830 off=184` 自检通过，`crawl idle up` 没用上）。
+- 每帧 `runAnimation(base,1,1)` 连跑 900 帧：`play=1 dw=1.000 layer=0`、`t01` **在推进**（0.01→0.51→0.33→0.62…），而 **`w` 恒 `0.000`、`ms` 0.000/-1.000** ⇒ 请求被接受、时间在跑，**实际权重永远起不来**，对骨架零贡献。
+- ⚠️ **两条判读更正**：①P1 记的「spd 0/0/0、play=0.00 时间不推进」是**表里的静态字段**，活体上时间是推进的；②原来担心的「`cat=GROUND` 被角色状态门掉」不成立——那会让请求根本进不去，实测是**进去了但权重被压在 0**。头号嫌疑＝被钉住的 `kRidePose` 带 `wholeBodyAllLayer`（跨层压制）；`cat=GROUND` 也压权重这条无法从本趟数据里排除，但**两者指向同一个结论**：只要那条 `whole` 姿势还钉着，别的层的 clip 就上不了台面。⇒ 这一条同时打到 P2-1c（自制 LOWER clip 若不先解决 `whole`，一样是 `w=0.000`）与 P4-3（攻击 clip 同理）。
+
+**杠杆 B（`setManuallyControlled` + 每帧写朝向）＝ 成立，但 blend mask 是必需件不是可选件**
+- **段 1（只写朝向）**：`kept` 稳定在 **0.7638 / 0.7656**（`kept = |dot(读回, 我们写的)|`，⇒ 2·acos ≈ **80°** 的污染），`had ≠ want`，小腿留在姿势的位置 ⇒ **姿势轨道每帧累加到手控骨上**（`Skeleton::reset(false)` 不碰手控骨，`NodeAnimationTrack::applyToNode` 随后 rotate 上去）。数值稳定不漂是因为**我们每帧覆写**，不是因为污染不存在。
+- **段 2（同样的写入 ＋ `mainState->setBlendMaskEntry(handle, 0.0f)`）**：`kept = 1.0000`、`had` 与 `want` **逐位相同**，f=1860…2640 共 14 个采样点无一例外（f=1800 仍读 0.7636 是因为 mask 在那一帧的写入**之后**才建）。`ms=1.000` 全程 ⇒ 屏蔽两根骨**没有**动摇姿势自己的总权重。⚠️ mask 建在**那条姿势自己的 `Ogre::AnimationState`** 上（`createBlendMask(numBones, 1.0f)` 后逐骨置 0），不是全局开关。
+- **父骨写入沿链传播**：只手控大腿，小腿 derived 位置从坐姿的 `(-0.47,5.51,3.10)` / `(-2.39,6.44,3.21)` 跳到 `(0.95,2.16,-0.73)` / `(-3.72,3.13,-0.74)`，而小腿**没有**被 mask ⇒ 它的**局部**膝弯仍由姿势轨道提供。**「大腿归我们、膝弯借 clip」是可行的分工。**
+- **清理路径实测**：段 3 `setManuallyControlled(false)` + `reset()` + `needUpdate()` + `destroyBlendMask()` 全过。不带 `Dismount()` 那份复原＝骑手带着手控大腿走掉、重载才恢复。
+- **副作用零**：同一趟 7868 个 DBG 帧姿势权重 **7857 帧恒 1.00**（11 个低值全是那一次上马的淡入斜坡、`[0.50,0.995)` 零帧）、`wn=(0,0,0)` 全帧、`aRag=0` 全程 ⇒ 请求那条基底 clip 与 mask 两根骨**都没有**扰动 v1.6 的钉权重与逐帧杀 ragdoll。
+
+**骨骼清单与轴向约定（实测，不用再猜）**
+- 骑手骨架 **30 根**：`Bip01 L Thigh`=**2** / `L Calf`=**3** / `L Foot`=4，`R Thigh`=**7** / `R Calf`=**8** / `R Foot`=9。
+- **骨局部 +X ＝ 沿骨指向子骨**：`L Calf` 在大腿局部 `(4.39,0,0)`、`L Foot` 在小腿局部 `(4.61,0,0)`；`L Thigh` 在骨盆局部 `(0,+0.99,0)`、`R Thigh` `(0,−0.99,0)`（⇒ 骨盆局部 ±Y 是左右）。
+- ⚠️ **两条大腿的绑定朝向几乎相同、不是镜像**：`(0.018,0.015,-0.001,1.000)` 对 `(-0.018,0.015,0.001,1.000)`（w,x,y,z，≈ 绕 Z 转 180°）⇒ **同一个 delta 会把两条腿甩向同一边，对称姿势必须自己镜像 delta。**
+- **绕大腿局部各轴的语义**（骨架空间实测 **+X=左 / +Y=上 / +Z=前**；髋 L `(0.95,6.33,−0.74)` / R `(−1.03,6.33,−0.74)`；绑定姿势髋→膝 ＝ 笔直向下、长 ~4.17）：
+  - **X ＝ 沿股骨扭转**：左腿 +40°X → 髋→膝 `(0.00,−4.17,+0.01)` ＝ **仍然笔直向下、膝一点没挪**（观感上的「小腿外八」来自扭转带着姿势提供的膝弯一起转）。
+  - **Z ＝ 外展/内收（额面摆动）**：右腿 +40°Z → 髋→膝 `(−2.69,−3.20,0.00)`，长 4.18、离竖直 **40.06°**、**前后分量 0** ＝ 纯外展（对右腿 +Z 是向外）。
+  - **Y ＝ 屈伸（前后摆动）**：唯一剩下的垂直轴（两个测过的轴都给出 0 前后分量）。**跨骑最需要的就是它，本趟没测。**
+- **用户观感与三段的对应**（决定性的另一半）：段 1「腿先向右偏」＝ 被污染的合成；段 2「大腿八字呈八字跪姿，小腿向后外八分开」＝ **绑定姿势（直腿向下）＋ 我们的 40°**，「小腿向后」＝ 姿势轨道留下的局部膝弯。三条数据流（`kept`／derived 位置／肉眼）互相独立且完全吻合。
+
+### 16.1 定型手法（P2-1b-2 符号定案 + P2-1b-3 出货，2026-08-29 两趟实测）
+**这一节是 §16 的收尾：把「能写骨」变成「写出一个能出货的跨骑姿势」还缺的四件手法。**
+
+- **屈伸轴与符号已实测，不再是推论**：大腿局部 **Y ＝ 纯屈伸，`+Y` 把膝盖甩向前**。证据是等幅翻转——同一幅度 ±45°Y 给出 `fore=+2.96` 对 `−2.95`，股骨长两边都 4.18（若 Y 混着别的分量，翻转不会等幅）。**外展绕局部 Z 完全不动前后分量**：4 个外展档（27.3° / 33.9° / 35.1° / 45.0°）下 `fore` 恒 2.96，`out` 单调 1.35→2.09、`down` 2.62→2.08、√(out²+fore²+down²) 恒 4.18 ⇒ **两个轴在绑定帧里正交**，可以各自独立调幅度。
+- **合成顺序必须让两个 delta 都活在绑定帧里**：`want = b->getInitialOrientation() * (qAbd * qFlx)`。这样 §16 里单轴量出来的语义才**直接适用**；反过来写（delta 在父帧、或先乘 initial 再叠第二个 delta）会让第二个轴的意义随第一个轴的幅度漂移。
+- ⚠️ **写入是从绑定姿势开始的，不是从当前姿势开始的** ⇒ 接管一条大腿就等于**丢掉坐姿 clip 那 ~90° 屈髋**，屈髋必须自己补回来（只给外展＝叉腿跪姿）。小腿只读不写，**局部**膝弯照旧由姿势轨道提供、跟着大腿一起搬。
+- **mask 每帧无条件重上**（`hasBlendMask()` 假时才 `createBlendMask(numBones, 1.0f)`，然后逐骨 `setBlendMaskEntry(handle, 0.0f)`）：`mainState` 可能被引擎换掉，而重建只在真丢了 mask 时发生 ⇒ 便宜且自愈。**handle 是索引不是名字**，写错一个就静默屏蔽了别人的骨头——所以每次接管打一行 `h=(2,7) bones=30` 存证（8 次上马八次全同）。
+- ⚠️ **mask 盖不住「正在淡出的另一条 clip」** —— 它挂在坐姿自己的 `Ogre::AnimationState` 上。上马后 ~14 帧站立待机还在承重，它的大腿轨道照旧往手控骨上 rotate ⇒ 那几帧写骨就是 §16 段 1 的 `kept=0.764` 污染重演。**手法：以姿势自己的 `SingleAnimation::weight ≥ 0.5` 当接管闸门**（没到就跳过、已武装就当场复原），与 `PoseLayerPin` 同一道门同一个数。代价是淡出末尾一次瞬切，藏在既有的交叉淡出里看不见。
+- **复原的三个触发点**（缺一个就有腿被落下）：闸门掉下去、`Dismount()`、SEH 捕到 AV。实测 8 次上马 / 8 次 `restored on dismount` / 0 次中途 released / 0 次 AV。
+- **副作用仍然为零**（第三趟确认）：`wn` 4128 帧全 `(0,0,0)`、姿势权重 4074/4128 恒 1.00、`rel.y` 恒 6.35/6.36 ⇒ 屏蔽两根骨没有动摇 v1.6 的钉权重、逐帧杀 ragdoll，也没有动 `boneLocal`（＝座位表不用搬）。
+- ⚠️ **`Character::getRadius()` 不是体宽**：狗族 9.8/9.9（`torsoLen` 8.4/8.5）＞ 野牛 6.7（`torsoLen` 10.3）。当「越大越张腿」的单调代理够用，**当体型闸门会判反**（见 TASK.md P4-0）。
