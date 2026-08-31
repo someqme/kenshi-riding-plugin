@@ -149,6 +149,7 @@ class Session(object):
         self.restored = 0        # LEGPOSE restored on dismount
         self.takeovers = []      # LEGPOSE takeover lines (dicts)
         self.released = []       # LEGPOSE released lines (grace=, f=, ts)
+        self.handback = []       # LEGPOSE handback audit lines (DLL 307712 B+)
         # Timestamp spans (merged, kDownGap tolerance) during which a P3CMB row
         # reported down=1.  2026-08-31: EVERY sub-1.0 kept sample and BOTH
         # grace-exhausted releases of that trip fell inside such a span, so this
@@ -262,6 +263,11 @@ def parse(path, s):
             if "Riding: force dismount (" in line:
                 why = line.split("force dismount (", 1)[1].split(")", 1)[0]
                 s.forced.append((why, ts(line)))
+                continue
+            if "LEGPOSE handback" in line:
+                d = kv(line)
+                d["_ts"] = ts(line)
+                s.handback.append(d)
                 continue
             if "LEGPOSE restored on dismount" in line:
                 s.restored += 1
@@ -824,6 +830,92 @@ def report_twist(s):
 
 
 
+def report_handback(s):
+    # The balance above (takeovers == restored + released) counts EVENTS.  It was
+    # perfectly balanced on the trip where the player reported "legs slightly
+    # stuck apart after dismount" (6/6/0, kept 82/82 = 1.0000), which is exactly
+    # why it cannot see that defect: it proves the handback RAN, not that it
+    # WORKED.  DLL 307712 B reads the state back afterwards and prints it.
+    #
+    #   man=      bitmask of our bones STILL isManuallyControlled() after the
+    #             clear.  Bit order = kLegPoseBones: 0/1 thighs, 2/3 calves,
+    #             4/5 spine.  Anything but 0x00 IS the stuck leg.
+    #   minDot=   worst |dot(orientation, initialOrientation)| after reset().
+    #             1.0000 = every bone sits at its binding pose.  Lower = reset()
+    #             did not take, i.e. the bone kept our 45 deg flex.
+    #   residue=  our bone entries still held below 1.0 by a blend mask on a LIVE
+    #             AnimationState.  Judge it WITH dropped=: residue>0 while
+    #             dropped=0 is somebody else's mask (every tracked state was
+    #             handled), so it is information, not our leak.
+    #   dropped=  tracked states that were untraceable at release, i.e. the
+    #             documented leak path (an unfindable pointer must never be
+    #             dereferenced, so its mask stays behind).  A leaked mask leaves
+    #             that clip permanently unable to drive the thigh, which renders
+    #             as the binding-pose straddle - the reported symptom.
+    #   states=   how many AnimationStates the ride ended up masking (cap 8).
+    print("")
+    print("  -- handback audit (LEGPOSE handback, DLL 307712 B+) --")
+    if not s.handback:
+        print("    no handback line: this log predates DLL 307712 B (or nothing"
+              " was ever handed")
+        print("    back).  The event balance above says the handback RAN; it"
+              " cannot say the bones")
+        print("    actually came home, so the reported stuck-leg defect is"
+              " UNMEASURED here.")
+        return
+    bad_man = [d for d in s.handback if str(d.get("man", "0x00")).lower()
+               not in ("0x00", "0")]
+    dots = []
+    for d in s.handback:
+        v = fnum(d, "minDot")
+        if v is not None:
+            dots.append(v)
+    bad_dot = [v for v in dots if v < 0.999]
+    drop = 0
+    resid = 0
+    for d in s.handback:
+        drop += int(fnum(d, "dropped", 0))
+        resid += int(fnum(d, "residue", 0))
+    print("    handbacks=%d  worst minDot=%s  man!=0: %d  residue total=%d "
+          " dropped total=%d"
+          % (len(s.handback),
+             ("%.4f" % min(dots)) if dots else "?",
+             len(bad_man), resid, drop))
+    print("    " + verdict(not bad_man,
+                           "every bone left manual control"
+                           " (man=0x00 on all handbacks)"))
+    if dots:
+        print("    " + verdict(not bad_dot,
+                               "every bone returned to its binding pose"
+                               " (minDot=1.0000)"))
+    else:
+        print("    CHECK minDot missing - cannot say the bones returned to the"
+              " binding pose")
+    print("    " + verdict(drop == 0,
+                           "no tracked mask was dropped untraceable"
+                           " (dropped=0)"))
+    if drop:
+        print("        => THIS is the leak: %d mask(s) outlived the ride."
+              "  The clip they sit on" % drop)
+        print("           can no longer drive the thigh, which renders as the"
+              " binding-pose straddle.")
+    if resid and not drop:
+        print("        NOTE residue=%d with dropped=0 = somebody else's blend"
+              " mask on our bones," % resid)
+        print("             not our leak.  Information only.")
+    for d in s.handback:
+        print("      %s man=%s minDot=%s residue=%s dropped=%s states=%s"
+              % (d.get("_ts", "?"), d.get("man", "?"), d.get("minDot", "?"),
+                 d.get("residue", "?"), d.get("dropped", "?"),
+                 d.get("states", "?")))
+    print("    NOTE all-clean here does NOT clear the report: this measures the"
+          " bones and the")
+    print("    masks, and a straddle that survives BOTH is engine-side (whatever"
+          " clip plays")
+    print("    after dismount simply not driving the thighs).  That half is"
+          " eyes-only.")
+
+
 def report_legs(s):
     print("")
     print("== straddle regression (must not have moved) ==")
@@ -842,6 +934,7 @@ def report_legs(s):
                          "every takeover was handed back"
                          " (restored + released must equal takeovers;"
                          " a shortfall = a leg left at 45 deg)"))
+    report_handback(s)
     # Split the releases by reason before judging them.  Since DLL 301056 B a
     # "(rider down)" release is the isDown()/isDead() guard collecting its own
     # bones on purpose - the FIX firing, and the expected shape for any trip

@@ -4311,6 +4311,12 @@ static Ogre::AnimationState* gLegMasked[kLegMaskMax];
 static bool                  gLegMaskedMine[kLegMaskMax];  // we created that mask
 static int                   gLegMaskedCount = 0;
 static bool                  gLegMaskOverflow = false;  // said once, then stop nagging
+// Tracked states that were untraceable at release time, i.e. the documented leak path in
+// LegMaskRelease.  Counted rather than acted on: a pointer we cannot find in either live list
+// must never be dereferenced, so the only honest thing to do is drop it AND say we did.  Read
+// it in the LEGPOSE handback line - a non-zero value is the one mechanism that could leave a
+// clip permanently unable to drive the thighs, which is what "legs stuck apart" would look like.
+static int                   gLegMaskDropped = 0;
 static bool              gLegCalfHave[2];   // knee bend captured this ride
 static Ogre::Quaternion gLegCalfSnap[2];
 static bool             gLegCalfManual = false;  // we are replaying the bend right now
@@ -4495,6 +4501,7 @@ static int LegMaskApply(AnimationClass* rAnim, unsigned short nb, bool calfMask,
 // why gLegMaskOverflow above is worth logging).
 static void LegMaskRelease(AnimationClass* rAnim, unsigned short nb)
 {
+    gLegMaskDropped = 0;
     for (int t = 0; t < gLegMaskedCount; ++t)
     {
         Ogre::AnimationState* st = gLegMasked[t];
@@ -4526,7 +4533,7 @@ static void LegMaskRelease(AnimationClass* rAnim, unsigned short nb)
                 }
             }
         }
-        if (!live) continue;
+        if (!live) { ++gLegMaskDropped; continue; }
         if (gLegMaskedMine[t])
         {
             if (st->hasBlendMask()) st->destroyBlendMask();
@@ -4541,6 +4548,57 @@ static void LegMaskRelease(AnimationClass* rAnim, unsigned short nb)
     gLegMaskedCount = 0;
 }
 
+// Post-release audit: how many of our bone entries are STILL held below 1.0 on a live
+// AnimationState.  Zero is the only healthy answer - anything else means a mask outlived the
+// ride and that clip can no longer drive the thigh (which renders as the binding-pose straddle:
+// legs slightly apart, forever).  Scans the live lists fresh instead of the tracked table on
+// purpose: the leak we are hunting is exactly the case where the tracked pointer was already
+// untraceable, so the table is the wrong place to look.  Reads are size-guarded twice over -
+// getBlendMaskEntry() asserts on an out-of-range handle, and an engine-owned mask need not have
+// been created with this skeleton's bone count.
+//
+// Judging it needs the dropped= counter beside it, because an engine-owned mask is allowed to
+// hold one of our bones down for its own reasons: residue>0 with dropped=0 means somebody
+// else's mask (not our leak - every tracked state was handled), while dropped>0 is our leak
+// and is the value to act on.
+static int LegMaskResidueCount(AnimationClass* rAnim)
+{
+    if (!rAnim || !rAnim->layer.valid()) return 0;
+    unsigned int nl = rAnim->layer.size();
+    if (nl == 0 || nl > 32) return 0;
+    int residue = 0;
+    for (unsigned int li = 0; li < nl; ++li)
+    {
+        AnimationClassBase::AnimationLayer* lay = rAnim->layer[li];
+        if (!lay) continue;
+        for (int pass = 0; pass < 2; ++pass)
+        {
+            lektor<AnimationClassBase::SingleAnimation*>* lst =
+                (pass == 0) ? &lay->addList : &lay->removeList;
+            if (!lst->valid()) continue;
+            unsigned int n = lst->size();
+            if (n > 64) continue;
+            for (unsigned int ai = 0; ai < n; ++ai)
+            {
+                AnimationClassBase::SingleAnimation* sa = (*lst)[ai];
+                if (!sa || !sa->mainState) continue;
+                if (!sa->mainState->hasBlendMask()) continue;
+                const Ogre::AnimationState::BoneBlendMask* bm = sa->mainState->getBlendMask();
+                if (!bm) continue;
+                size_t bmn = bm->size();
+                for (int i = 0; i < kLegPoseBoneCount; ++i)
+                {
+                    if (!gLegPoseHas[i]) continue;
+                    if ((size_t)gLegPoseHandle[i] >= bmn) continue;
+                    if (sa->mainState->getBlendMaskEntry((size_t)gLegPoseHandle[i]) < 0.999f)
+                        ++residue;
+                }
+            }
+        }
+    }
+    return residue;
+}
+
 // Hand the legs back: clear the manual flags, return the bones to the binding pose and
 // drop the blend mask.  Must run on dismount and whenever the pose stops carrying the
 // skeleton, or the rider walks away with a leg stuck at 40 degrees for the rest of the
@@ -4550,6 +4608,9 @@ static void LegMaskRelease(AnimationClass* rAnim, unsigned short nb)
 static void LegPoseRestoreImpl(AnimationClass* rAnim, AnimationData* poseData)
 {
     if (!rAnim) return;
+    int   man    = 0;       // bones STILL manually controlled after we cleared them
+    float minDot = -1.0f;   // worst |dot(orientation, initialOrientation)| after reset()
+    int   seen   = 0;
     for (int i = 0; i < kLegPoseBoneCount; ++i)
     {
         if (!gLegPoseHas[i]) continue;
@@ -4560,6 +4621,16 @@ static void LegPoseRestoreImpl(AnimationClass* rAnim, AnimationData* poseData)
         b->setManuallyControlled(false);
         b->reset();
         b->needUpdate();
+        // Read the flag and the orientation back rather than assuming the two calls above
+        // landed.  This is the only place that can prove the bone left our custody: a bone
+        // still manual, or still sitting away from its binding pose, IS the reported
+        // "legs stuck slightly apart after dismount" - and neither shows up in the kept=
+        // samples or in the takeover/restored balance, both of which were clean on the
+        // trip that produced that report.
+        if (b->isManuallyControlled()) man |= (1 << i);
+        float d = Ogre::Math::Abs(b->getOrientation().Dot(b->getInitialOrientation()));
+        if (seen == 0 || d < minDot) minDot = d;
+        ++seen;
     }
     gLegCalfManual = false;
     gLegTwistManual = false;
@@ -4568,7 +4639,17 @@ static void LegPoseRestoreImpl(AnimationClass* rAnim, AnimationData* poseData)
     // pose's own AnimationState is just one of the tracked entries now, so the old
     // pose-only destroyBlendMask() is gone - it would have destroyed a mask the engine
     // owned in the case where the clip already had one.
+    int states = gLegMaskedCount;
     LegMaskRelease(rAnim, rAnim->skeleton ? rAnim->skeleton->getNumBones() : 0);
+    // Ungated on purpose: one line per handback (bounded by dismounts and mid-ride releases),
+    // and the defect it measures was reported from a trip whose diagnostics were OFF.
+    {
+        char hb[192];
+        _snprintf_s(hb, 192, _TRUNCATE,
+            "Riding: LEGPOSE handback man=0x%02X minDot=%.4f residue=%d dropped=%d states=%d",
+            man, minDot, LegMaskResidueCount(rAnim), gLegMaskDropped, states);
+        DebugLog(std::string(hb));
+    }
     (void)poseData;
 }
 
