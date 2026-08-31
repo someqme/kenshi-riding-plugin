@@ -7445,6 +7445,7 @@ static void RiderCombatLever(Character* rider, Character* mount)
 
 // 1c) Mount combat + forced dismount.
 //     - Any mount that is down (KO'd) or dead force-dismounts its rider.
+//     - Any RIDER that is down (KO'd) or dead force-dismounts too (P4-4, see below).
 //     - Outside the P4-0 SIZE gate (big tier) the rider stays passive: their combat is
 //       suppressed every frame and the mount fights back with its native animal combat,
 //       defending the rider against the rider's attackers.
@@ -7469,11 +7470,35 @@ static void CombatAndForceDismountPass()
             Character* rider = it->first;
             Character* mount = it->second;
 
-            if (!rider || !mount || mount->isDown() || mount->isDead())
+            // Why this ride ends.  The MOUNT half is the original rule (a KO'd or dead animal
+            // cannot carry anyone).  The RIDER half is P4-4 (2026-08-31, user ruling 「骑手被击倒
+            // 就下马」): until now nothing ended the ride when the rider went down, and the
+            // fourth trip showed what that looked like - the rider sat in the saddle with
+            // down=1 from 156 s to the manual dismount at 260.972 s (~105 s unconscious in the
+            // saddle), legs handed back to the fall-over clip by LegPosePass's isDown() guard.
+            //
+            // ⚠️ Do NOT fold this into that guard.  The guard answers "who owns the thigh bones
+            // this frame" and must keep working on its own (it is what stops the mask pollution
+            // this pass cannot: the release has to happen the same frame, before render, while
+            // Dismount() is a whole-ride teardown).  Both now fire on a KO'd rider - the guard
+            // first, this pass right after - which is exactly the 「takeover ＝ restored + 中途
+            // released」 accounting the fourth trip established.
+            const char* dropWhy = NULL;
+            if (!rider || !mount)                        dropWhy = "stale";
+            else if (mount->isDown() || mount->isDead()) dropWhy = "mount down";
+            else if (rider->isDown() || rider->isDead()) dropWhy = "rider down";
+
+            if (dropWhy)
             {
                 Character* r = rider;
                 ++it; // Dismount erases from the map, advance first
-                if (r) Dismount(r);
+                if (r)
+                {
+                    // ungated, one line per event - the same discipline as LEGPOSE takeover,
+                    // and the only record of WHICH half ended the ride.
+                    DebugLog(std::string("Riding: force dismount (") + dropWhy + ")");
+                    Dismount(r);
+                }
                 continue;
             }
 

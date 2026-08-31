@@ -141,6 +141,11 @@ class Session(object):
     def __init__(self):
         self.rides = []          # one dict per "mounted" line
         self.dismounts = 0
+        # P4-4 (DLL 305664 B and later): "Riding: force dismount (<why>)", ungated,
+        # one line per event.  why is one of "mount down" / "rider down" / "stale",
+        # so this list is the only record of WHICH half ended a ride - the plain
+        # "Riding: dismounted" that follows looks identical to a manual 「放倒」.
+        self.forced = []         # (why, ts)
         self.restored = 0        # LEGPOSE restored on dismount
         self.takeovers = []      # LEGPOSE takeover lines (dicts)
         self.released = []       # LEGPOSE released lines (grace=, f=, ts)
@@ -253,6 +258,10 @@ def parse(path, s):
                 continue
             if "Riding: dismounted" in line:
                 s.dismounts += 1
+                continue
+            if "Riding: force dismount (" in line:
+                why = line.split("force dismount (", 1)[1].split(")", 1)[0]
+                s.forced.append((why, ts(line)))
                 continue
             if "LEGPOSE restored on dismount" in line:
                 s.restored += 1
@@ -504,6 +513,121 @@ def report_rides(s):
           " must be")
     print("   held out by rad=, not torso= - a rad of 0 there means the read"
           " failed.)")
+
+
+def report_forced(s):
+    """P4-4: 「骑手被击倒就下马」 - did the rider-down branch actually end the ride?
+
+    The plain "Riding: dismounted" that follows a forced dismount is
+    indistinguishable from a manual 「放倒」, so the reason word on the force
+    dismount line is the only record of WHICH half fired.  Judged here:
+      - "rider down" events at all (this is the P4-4 branch receiving load),
+      - each one should sit inside a P3CMB down=1 window (it is the same
+        predicate, so a rider-down dismount OUTSIDE every window means the two
+        readings of "down" disagree - go look at the probe throttle first),
+      - the window it sits in must END there (~one sampling gap).  P3CMB only
+        prints while mounted, so down=1 rows continuing well past the event
+        mean the ride did NOT actually end,
+      - a "LEGPOSE released (rider down)" at ~the same timestamp: both fire on
+        the same frame off the same predicate.  Absent is only a finding if the
+        legs were armed at all.
+    ⚠️ The rider's own landing (does he end up on the ground, not stuck or
+    floating?) is NOT in the log - getDropped() on an already-KO'd character is
+    the unverified half, see TEST_REQUIRED.md T7.
+    """
+    print("")
+    print("== P4-4 - forced dismount (rider down / mount down) ==")
+    if not s.forced:
+        print("  no 'force dismount' line.")
+        print("  Two readings: this log predates DLL 305664 B (the P4-4 build),")
+        print("  or nothing forced a dismount this trip (no KO'd rider, no KO'd")
+        print("  mount).  down=1 rows below tell them apart: %d P3CMB row(s) said"
+              % s.cmb_down)
+        print("  the rider was down.")
+        if s.cmb_down:
+            print("  " + verdict(False, "rider WAS down (%d row(s)) yet nothing forced"
+                                 " a dismount" % s.cmb_down))
+            print("        => either an older DLL, or the new branch never ran.")
+        return
+
+    by_why = {}
+    for why, t in s.forced:
+        by_why[why] = by_why.get(why, 0) + 1
+    print("  " + "  ".join("%s=%d" % kv2 for kv2 in sorted(by_why.items())))
+    for why, t in s.forced:
+        print("    %-10s @%s" % (why, t))
+    if by_why.get("stale"):
+        print("  " + verdict(False, "%d 'stale' dismount(s) = a NULL rider or mount"
+                             " sat in riderToMount" % by_why["stale"]))
+        print("        That is the dangling-pointer path, not P4-4.  Look for a"
+              " load")
+        print("        during the ride (CharacterLooksLive / the mainLoop"
+              " sentinel).")
+
+    rider = [t for why, t in s.forced if why == "rider down"]
+    if not rider:
+        print("  NOTE  no 'rider down' event: the P4-4 branch was not exercised"
+              " this trip.")
+        print("        (%d 'mount down' event(s) = the ORIGINAL rule, unchanged.)"
+              % by_why.get("mount down", 0))
+        return
+
+    for t in rider:
+        if t == "?":
+            print("  CHECK  a 'rider down' line carries no timestamp - cannot be"
+                  " correlated.")
+            continue
+        tv = float(t)
+        span = None
+        for a, b in s.down_spans:
+            if a - kDownGap <= tv <= b + kDownGap:
+                span = (a, b)
+                break
+        if span is None:
+            print("  " + verdict(False, "rider down @%s falls in NO P3CMB down=1"
+                                 " window" % t))
+            print("        The pass and the probe read the same isDown(), so this"
+                  " means the")
+            print("        probe never sampled that knockdown (it is throttled) -"
+                  " check its")
+            print("        gap before doubting the branch.")
+        else:
+            tail = span[1] - tv
+            print("  " + verdict(tail <= kDownGap,
+                                 "rider down @%s ends its down window (%.3f-%.3f,"
+                                 " last down=1 row %+.3f s)" % (t, span[0], span[1], tail)))
+            if tail > kDownGap:
+                print("        down=1 rows kept coming %.1f s AFTER the forced"
+                      " dismount, and" % tail)
+                print("        P3CMB only prints while mounted => the ride did not"
+                      " end.  Look at")
+                print("        Dismount()'s early returns and at whether"
+                      " riderToMount lost the row.")
+        near = [d for d in s.released
+                if d.get("_why") == "down" and d.get("_ts") != "?"
+                and abs(float(d["_ts"]) - tv) <= 1.0]
+        if near:
+            print("        + LEGPOSE released (rider down) @%s = the leg guard"
+                  " collected its" % near[0]["_ts"])
+            print("          own bones the same frame, as designed.")
+        elif s.takeovers:
+            print("        NOTE no 'LEGPOSE released (rider down)' within 1.0 s."
+                  "  The legs")
+            print("          WERE armed this trip (%d takeover(s)), so either the"
+                  " guard did not" % len(s.takeovers))
+            print("          fire or Dismount()'s unconditional restore beat it"
+                  " to the bones -")
+            print("          check for 'LEGPOSE restored on dismount' at the same"
+                  " timestamp.")
+        else:
+            print("        (no LEGPOSE takeover this trip at all => nothing for"
+                  " the guard to")
+            print("         release; not a finding.)")
+    print("  NOTE  The landing itself is not in the log: whether a KO'd rider ends"
+          " up on")
+    print("        the ground (and not stuck or floating) can only be seen in"
+          " game -")
+    print("        TEST_REQUIRED.md T7.")
 
 
 def report_stance(s):
@@ -1240,6 +1364,7 @@ def main(argv):
     lines = parse(path, s)
     report_rides(s)
     report_combat(s)
+    report_forced(s)
     report_stance(s)
     report_twist(s)
     report_input(s)
