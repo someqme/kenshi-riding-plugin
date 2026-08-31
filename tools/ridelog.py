@@ -324,7 +324,14 @@ def parse(path, s):
             m = TUNED.match(line.strip()) or TUNED.search(line)
             if m:
                 d = kv(line)
-                s.tuned.append((m.group("sp"), d.get("key")))
+                # up=/fwd= are the STORED (reference-frame) values x100, live= is
+                # what the live animal actually gets.  Keeping them lets the report
+                # answer the question the player's X-4 report really asked: not
+                # "did a key fire" but "did the seat MOVE".  A key that fires while
+                # the value is pinned at SeatTuneLimitRef looks identical in the
+                # log line count and completely different on screen.
+                s.tuned.append((m.group("sp"), d.get("key"),
+                                d.get("up"), d.get("fwd"), d.get("live")))
                 continue
             if "Riding: DBG" in line:
                 s.dbg += 1
@@ -827,6 +834,27 @@ def report_input(s):
              "" if not s.fired else ":  " + ", ".join(
                  "%s x%d" % (n, s.fired.count(n))
                  for n in sorted(set(s.fired)))))
+    # ⚠️ fired=0 next to a pile of `tuned` lines is the EXPECTED shape of a trip
+    # taken without diagnostics, NOT a contradiction.  Verified in the source:
+    # both the RAWKEY sniffer and the `input '<name>' fired` trace sit behind
+    # `if (debugContinuous)`, while the `tuned` DebugLog is unconditional.  So
+    # `tuned` is the load-bearing evidence and the two gated families prove
+    # nothing by their absence.
+    if s.tuned and not s.fired:
+        print("    (fired= is debugContinuous-gated, `tuned` is not - so this"
+              " pairing is")
+        print("     normal for a trip without diagnostics.  `tuned` carries the"
+              " proof.)")
+    if s.tuned:
+        print("  " + verdict(True, "X-4 does not reproduce - %d press(es) reached"
+                                   " TuneSeat, so the whole chain (OIS -> modifier"
+                                   " mask -> KeyEdge -> HotkeyPass -> TuneSeat)"
+                                   " ran" % len(s.tuned)))
+    elif not s.rawkeys and not s.fired and not s.rejects:
+        print("  " + verdict(False, "no evidence of ANY press this trip - and with"
+                                    " diagnostics off that is not proof of"
+                                    " absence either; re-run with Ctrl+Numpad."
+                                    " ON"))
     if s.rejects:
         print("  tune gate rejections:")
         for why, n in sorted(s.rejects.items(), key=lambda x: -x[1]):
@@ -846,8 +874,8 @@ def report_tuned(s, cfg):
     else:
         nokey = [t for t in s.tuned if not t[1]]
         seen = {}
-        for sp, key in s.tuned:
-            seen.setdefault(sp, key)
+        for t in s.tuned:
+            seen.setdefault(t[0], t[1])
         for sp, key in sorted(seen.items()):
             print("  %-18s -> %s" % (sp[:18], key or "NO key= (NAME ROW!)"))
         print("  tune presses=%d  without key=: %d" % (len(s.tuned), len(nokey)))
@@ -855,11 +883,50 @@ def report_tuned(s, cfg):
                              "every tune landed on a race row"
                              " (a missing key= means getRaceKey() came back"
                              " empty - check race= on the mount line)"))
+        report_tune_travel(s)
     if cfg:
         print("  riding.cfg now: %d race row(s), %d name row(s)%s"
               % (cfg[0], cfg[1], "" if not cfg[2] else "  -> " + ", ".join(cfg[2])))
         print("  " + verdict(cfg[1] == 0,
                              "cfg holds race rows only"))
+
+
+def report_tune_travel(s):
+    """Did the seat MOVE, not just "did a key fire".  These are two different
+    outcomes with the same log line count: a press that lands on
+    SeatTuneLimitRef still logs a `tuned` line, with the value unchanged.
+    That is the shape a player would report as "I pressed it, nothing moved",
+    so the script has to separate it out rather than leave it to the eye.
+
+    ⚠️ Values are the STORED reference-frame numbers x100 (source: the printf
+    multiplies userOffset by 100).  A step is nominally kTuneStep(0.1)/k, so at
+    k=1.0 consecutive presses should differ by ~10 in these units."""
+    vals = []
+    for t in s.tuned:
+        if len(t) < 5:
+            return                          # older parse, no values captured
+        try:
+            vals.append((int(t[2]), int(t[3])))
+        except (TypeError, ValueError):
+            return                          # pre-301056 B line shape
+    if not vals:
+        return
+    moves = sum(1 for a, b in zip(vals, vals[1:]) if a != b)
+    span_up = max(v[0] for v in vals) - min(v[0] for v in vals)
+    span_fw = max(v[1] for v in vals) - min(v[1] for v in vals)
+    print("  stored value travel: up %.2f..%.2f (span %.2f), fwd %.2f..%.2f"
+          " (span %.2f)"
+          % (min(v[0] for v in vals) / 100.0, max(v[0] for v in vals) / 100.0,
+             span_up / 100.0,
+             min(v[1] for v in vals) / 100.0, max(v[1] for v in vals) / 100.0,
+             span_fw / 100.0))
+    print("  presses that changed the value: %d of %d transition(s)"
+          % (moves, max(0, len(vals) - 1)))
+    print("  " + verdict(moves > 0,
+                         "the seat value actually moved (a press that only"
+                         " re-logs the same number = clamped at"
+                         " SeatTuneLimitRef, which on screen IS"
+                         " \"nothing happened\")"))
 
 
 CFG_ROW = re.compile(r"^\d+-[A-Za-z_0-9]+\.(?:base|mod)$")
