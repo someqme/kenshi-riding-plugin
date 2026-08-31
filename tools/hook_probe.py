@@ -46,6 +46,20 @@ CONTROLS = [
     ('CharacterHuman::sheatheWeapon', 0x5CC0A0),
     ('CharacterHuman::dropWeaponInHands', 0x5CBFE0),
     ('CharacterHuman::leaveSheathEquipped', 0x5D1D30),
+    ('CharacterHuman::drawWeapon', 0x5DB800),
+    # P4-3 step 2: Appearance attach family.  attachItem is OVERLOADED and the
+    # two overloads are separate functions - hooking the wrong one turns a real
+    # call into silence, and this probe reads silence as "never called".
+    #   drawWeapon(0x5DBF80) -> 0x535E50  = the 3-arg form  <== probe target
+    #   sheathe-side re-attach(0x5DBD80) + 0x5D0BC7 -> 0x535D50 = the 2-arg form
+    # (established with `callers.py --calls`, not guessed; see RE_NOTES 18.8)
+    ('Appearance::attachItem 2-arg (item,slot)', 0x5355D0),
+    ('Appearance::attachItem 3-arg (item,mesh,slot)', 0x5356D0),
+    ('Appearance::detachItem(slot)', 0x52D970),
+    ('Appearance::detachItem(Item*)', 0x52DB10),
+    ('Appearance::getAttachedEntity(slot)', 0x52D1E0),
+    ('Appearance::createAttachedObject', 0x535120),
+    ('Appearance::createPhysicsAttachment', 0x5357A0),
 ]
 
 

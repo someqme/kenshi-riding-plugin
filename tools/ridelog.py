@@ -213,6 +213,17 @@ class Session(object):
         self.sh_lines = 0
         self.sh_dump = None      # last "sites=.. lines=.. over=.." payload
         self.sh_hookfail = False # "Could not hook CharacterHuman::sheatheWeapon!"
+        # P4-3 step 2: the attachItem naming probe (DLL 312832 B and later).  The
+        # question is narrower than step 1's: is attachItem(..., "hands") called
+        # AT ALL while the rider sits in the carried state?  Two hooks (the two
+        # overloads are separate functions), tagged ov=2/3, and the per-ride dump
+        # prints even with zero sites - so unlike P43SH, silence here has exactly
+        # one reading as long as the dump line is present.
+        self.at_sites = {}       # site -> {"ov":n,"hands":n,"other":n,"slots":set()}
+        self.at_lines = 0
+        self.at_hands = 0        # logged lines whose slot was "hands"
+        self.at_dump = None      # last "sites=.. hands=.. over=.. hk=.. app=.." payload
+        self.at_hookfail = []    # "Could not hook AppearanceBase::attachItem (N-arg)!"
 
 
 MOUNTED = re.compile(r"Riding: mounted \[(?P<sp>[^\]]*)\]")
@@ -244,6 +255,11 @@ def parse(path, s):
             # on whether the hook installed (see report_sheathe).
             if "Could not hook CharacterHuman::sheatheWeapon" in line:
                 s.sh_hookfail = True
+                continue
+            # Same trap, same reason: these are ErrorLogs ("RidingPlugin:"), and
+            # "hands=0" only means "never called" if the hooks actually went on.
+            if "Could not hook AppearanceBase::attachItem" in line:
+                s.at_hookfail.append(line.strip())
                 continue
             if "Riding:" not in line:
                 continue
@@ -444,6 +460,32 @@ def parse(path, s):
                     g = 0
                 if g > 0:
                     e["gaps"].append(g)
+                continue
+            if "P43AT" in line:
+                if "sites=" in line:
+                    s.at_dump = line.strip()
+                    continue
+                d = kv(line)
+                site = d.get("site")
+                if not site:
+                    continue
+                s.at_lines += 1
+                try:
+                    ov = int(d.get("ov", "0"))
+                except ValueError:
+                    ov = 0
+                e = s.at_sites.setdefault(site, {"ov": ov, "hands": 0, "other": 0,
+                                                "slots": set()})
+                slot = (d.get("slot") or "").strip("'")
+                if slot:
+                    e["slots"].add(slot)
+                # hands= is the probe's own comparison, so trust it over re-parsing
+                # the quoted slot name here.
+                if d.get("hands") == "1":
+                    e["hands"] += 1
+                    s.at_hands += 1
+                else:
+                    e["other"] += 1
                 continue
             if "POSEDUMP" in line:
                 s.posedump += 1
@@ -1421,6 +1463,144 @@ def report_sheathe(s):
     print("        drawing) and never write 're-draw every frame' - HISTORY §B.")
 
 
+def report_attach(s):
+    """P4-3 step 2: is attachItem(..., "hands") called at all while carried?"""
+    print("")
+    print("== P4-3 step 2 - is the weapon re-attached to the HAND slot (P43AT) ==")
+    if s.at_hookfail:
+        print("  " + verdict(False, "at least one attachItem hook did NOT"
+                                    " install:"))
+        for line in s.at_hookfail[:4]:
+            print("             " + line[:150])
+        print("             Nothing below means anything.  attachItem is"
+              " OVERLOADED and the two")
+        print("             overloads are separate functions - with one hook"
+              " missing, a real call")
+        print("             through it is indistinguishable from 'never"
+              " called'.")
+        return
+    if not s.at_dump and not s.at_sites:
+        print("  no P43AT line at all, and no hook-failure ErrorLog.  Unlike"
+              " P43SH this has")
+        print("  only ONE reading: the code never ran.  The dump prints"
+              " unconditionally once a")
+        print("  ride has happened, so either this log predates DLL 312832 B"
+              " or no Mount()")
+        print("  completed this session.")
+        print("  NOT MEASURED - not a pass.")
+        return
+
+    # Same module test as P43SH, same reason, same insistence on the .exe:
+    # "kenshi" alone would let KenshiLib.dll through, and a return address
+    # inside the hook engine voids every RVA below it.
+    foreign = [k for k in s.at_sites
+               if not re.match(r"(?i)^kenshi[^+]*\.exe\+0x", k)]
+    if s.at_sites:
+        print("  " + verdict(not foreign,
+                             "all %d site(s) resolve inside the kenshi module"
+                             % len(s.at_sites) if not foreign else
+                             "%d site(s) resolve OUTSIDE the kenshi module ->"
+                             " the return address is not" % len(foreign)))
+        for k in foreign[:6]:
+            print("             " + k)
+        if foreign:
+            print("             the caller's.  Every RVA below is void until"
+                  " that is explained.")
+
+    print("  %d P43AT line(s), %d distinct site(s), %d of the logged lines had"
+          " slot='hands'." % (s.at_lines, len(s.at_sites), s.at_hands))
+    if s.at_sites:
+        print("  %-34s %3s %6s %6s %s" % ("site", "ov", "hands", "other",
+                                          "slots seen"))
+        # hands first: everything else is bookkeeping for this question.
+        for site, e in sorted(s.at_sites.items(),
+                              key=lambda kv2: (-kv2[1]["hands"], kv2[0])):
+            print("  %-34s %3d %6d %6d %s" % (
+                site[:34], e["ov"], e["hands"], e["other"],
+                ",".join(sorted(e["slots"]))[:40] or "-"))
+
+    hk = app = None
+    over = 0
+    dump_hands = None
+    bad_app = True          # stays True while we have no app= to judge
+    if s.at_dump:
+        print("  dismount table: " + s.at_dump[:220])
+        m = re.search(r"\bhk=(\d+)", s.at_dump)
+        hk = int(m.group(1)) if m else None
+        m = re.search(r"\bapp=(\S+)", s.at_dump)
+        app = m.group(1) if m else None
+        m = re.search(r"\bover=(\d+)", s.at_dump)
+        over = int(m.group(1)) if m else 0
+        m = re.search(r"\bhands=(\d+)", s.at_dump)
+        dump_hands = int(m.group(1)) if m else None
+    else:
+        print("  no dismount summary line (the ride never reached Dismount())"
+              " - the counters")
+        print("  below are only the logged lines, which have per-site budgets.")
+
+    # hk= is what turns "hands=0" from a shrug into a verdict.  Bit 0 = 2-arg
+    # hook, bit 1 = 3-arg; 3 = both, which is the only state that makes silence
+    # meaningful.
+    if hk is not None:
+        print("  " + verdict(hk == 3,
+                             "hk=3 - both overloads hooked, so silence is"
+                             " informative" if hk == 3 else
+                             "hk=%d - only %s hooked; a call through the other"
+                             " overload would be" % (hk, {0: "neither", 1: "the"
+                             " 2-arg form", 2: "the 3-arg form"}.get(hk, "?"))))
+        if hk != 3:
+            print("             invisible, so 'hands=0' below cannot be"
+                  " trusted.")
+    if app is not None:
+        bad_app = app.strip("'") in ("0", "0000000000000000", "(null)",
+                                     "00000000")
+        print("  " + verdict(not bad_app,
+                             "app=%s - the ride captured an AppearanceBase* to"
+                             " filter on" % app if not bad_app else
+                             "app=%s - getAppearance() returned NULL, so the"
+                             " filter rejected" % app))
+        if bad_app:
+            print("             every call and hands=0 says nothing about the"
+                  " engine.")
+    if over:
+        # NOT len(at_sites): that is how many rows we SAW, while over= counts
+        # the callers that arrived after the fixed kAtSites table was already
+        # full.  Printing the seen count here would read like the table is
+        # tiny when it is simply saturated.
+        print("  " + verdict(False, "over=%d - the site table (kAtSites) filled"
+                                    " up, so that many calls never got" % over))
+        print("             a row of their own.  Raise kAtSites and ride"
+              " again; the sites listed")
+        print("             above are still real, just incomplete.")
+
+    # The verdict itself.  Prefer the dump's counter (unbudgeted) over the
+    # logged-line count (per-site budgets can hide repeats).
+    hands = dump_hands if dump_hands is not None else s.at_hands
+    trustworthy = (hk == 3) and (app is not None) and not bad_app
+    if hands > 0:
+        print("  ANSWER  attachItem(..., \"hands\") WAS called %d time(s) while"
+              " the rider was" % hands)
+        print("          carried => the attachment point really was refreshed,"
+              " so an empty-handed")
+        print("          rider on screen has ANOTHER cause (look at the mesh"
+              " name and at whether")
+        print("          something detaches it again afterwards).")
+    else:
+        print("  ANSWER  attachItem was never called with slot=\"hands\" this"
+              " ride"
+              + ("" if trustworthy else " (BUT see the checks above)"))
+        print("          => drawWeapon cannot reach the attach step in the"
+              " carried state.")
+        if not trustworthy:
+            print("          Not a clean verdict until hk=3 and app!=0.")
+    print("  NOTE  naming only.  Neither answer may become 'so we call"
+          " attachItem ourselves")
+    print("        every frame' - that is compensating an absolute overwrite at"
+          " the writing")
+    print("        end, i.e. HISTORY §B's three rounds of servo.  Go kill the"
+          " writer.")
+
+
 def report_trailer(s, lines):
     print("")
     print("== leftovers ==")
@@ -1465,6 +1645,7 @@ def main(argv):
     report_legs(s)
     report_pose(s)
     report_sheathe(s)
+    report_attach(s)
     report_trailer(s, lines)
     print("")
     print("Every CHECK above is a log-side fact only.  The eyeball half of")
