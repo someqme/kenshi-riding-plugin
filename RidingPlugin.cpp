@@ -57,6 +57,7 @@
 
 #include <windows.h>
 #include <stdio.h>
+#include <intrin.h>     // P4-3-1: _ReturnAddress() - names the caller inside a jmp-detour hook
 
 // ---- minimal CombatClass shim (RE_NOTES §13 technique, second use) -------------------
 // P4-1b needs the engine's OWN combat bookkeeping to EXPLAIN why a mounted rider is not a
@@ -1029,6 +1030,170 @@ static Weapon* RiderWeaponInHands(Character* rider, const char** sheathOut)
     if (!h) { if (sheathOut) *sheathOut = "?"; return NULL; }
     if (sheathOut) *sheathOut = h->weaponInHandsSheathLocation.c_str();
     return h->weaponInHands;
+}
+
+// ---- P4-3 step 1: name the writer that puts the weapon back on the back ----------------
+// P4-1f left exactly one question standing: drawWeapon is NOT refused while mounted (12/12
+// post=1), yet the weapon returns to the back after ~14 frames with cma=1 for the whole ride.
+// "combat ended -> auto-sheathe" explains the FIRST sheathe and nothing after it => there is a
+// second writer, and it is bound to the carried state rather than to combat.  Static analysis
+// cannot finish this: sheatheWeapon is a PURE virtual call (vtable +0x2D0, base slot 0x641500
+// = `ret 0`), and `callers.py --vcall 0x2D0` finds 38 sites in 33 distinct host functions with
+// no way to type the receiver.  So hook the human override and print the CALLER's return
+// address.  KenshiLib::AddHook is a 5-byte jmp detour with no trampoline of its own, so the
+// detour is entered with the caller's return address still on the stack => _ReturnAddress()
+// names the call site.  Prologue gate already passed offline: real RVA 0x5CC820 (= header
+// 0x5CC0A0 + 0x780) is a .pdata exact entry, prolog=30, `40 53 48 83 EC 60` - the same shape
+// as the shipping _NV_update hook.
+// ⚠️ USE STOPS AT NAMING.  Calling sheatheWeapon ourselves is SHEATHING, not drawing, and
+// "re-draw every frame" stays banned (HISTORY §B: never compensate an absolute overwrite at the
+// writing end - go kill the writer).
+static const int kShSites     = 12;   // distinct call sites tracked per ride
+static const int kShLinesRide = 40;   // log lines per ride, all sites together
+static const int kShLinesSite = 4;    // per site: first sighting + 3 repeats, so the ~14-frame
+                                      // CADENCE reads off the log instead of a single line
+
+struct ShSite
+{
+    uintptr_t    ra;       // caller return address, absolute
+    int          nReal;    // calls that really took a weapon out of the hands (wih != 0)
+    int          nNoop;    // calls that had nothing to sheathe
+    int          lines;    // log lines already spent on this site this ride
+    unsigned int lastF;
+};
+static ShSite gShSites[kShSites];
+static int    gShCount = 0;    // sites in use this ride
+static int    gShLines = 0;    // lines spent this ride
+static int    gShOver  = 0;    // calls dropped because the site table filled up
+
+static void ShProbeArm()
+{
+    for (int i = 0; i < kShSites; ++i)
+    {
+        gShSites[i].ra    = 0;
+        gShSites[i].nReal = 0;
+        gShSites[i].nNoop = 0;
+        gShSites[i].lines = 0;
+        gShSites[i].lastF = 0;
+    }
+    gShCount = 0;
+    gShLines = 0;
+    gShOver  = 0;
+}
+
+// "<module>+0x<rva>" for an absolute code address.  The MODULE NAME is printed on purpose: if
+// AddHook ever hands us something other than the caller's own frame, the return address lands in
+// KenshiLib/MinHook and says so, instead of being reported as a meaningless kenshi RVA.
+static void ShDescribeAddr(uintptr_t a, char* out, int n)
+{
+    HMODULE m = NULL;
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
+                             | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           (LPCSTR)a, &m) && m)
+    {
+        char path[MAX_PATH];
+        path[0] = 0;
+        const char* nm = "?";
+        if (GetModuleFileNameA(m, path, MAX_PATH))
+        {
+            nm = path;
+            for (const char* p = path; *p; ++p)
+                if (*p == '\\' || *p == '/') nm = p + 1;
+        }
+        _snprintf_s(out, n, _TRUNCATE, "%s+0x%X", nm, (unsigned int)(a - (uintptr_t)m));
+    }
+    else
+        _snprintf_s(out, n, _TRUNCATE, "?@%p", (void*)a);
+}
+
+// One sheathe call on a TRACKED rider (every human sheathes weapons, so the map lookup is what
+// keeps this probe inert in normal play).  Runs BEFORE the engine's own body, so wih= is the
+// pre-state: wih=1 means this call really did take a drawn weapon away, wih=0 means it was a
+// no-op and that site is not the writer we are hunting.
+static void ShNoteImpl(CharacterHuman* h, uintptr_t ra)
+{
+    Character* rider = (Character*)h;             // CharacterHuman: Character offset = 0x0
+    if (!rider || riderToMount.find(rider) == riderToMount.end()) return;   // not ours: silent
+
+    const char* sh = "?";
+    Weapon* wih = RiderWeaponInHands(rider, &sh);
+    char shBuf[64];
+    _snprintf_s(shBuf, 64, _TRUNCATE, "%s", sh ? sh : "");  // copy: aliases the engine's string
+
+    int idx = -1;
+    for (int i = 0; i < gShCount; ++i)
+        if (gShSites[i].ra == ra) { idx = i; break; }
+    bool firstSight = (idx < 0);
+    if (firstSight)
+    {
+        if (gShCount >= kShSites) { ++gShOver; return; }
+        idx = gShCount++;
+        gShSites[idx].ra    = ra;
+        gShSites[idx].nReal = 0;
+        gShSites[idx].nNoop = 0;
+        gShSites[idx].lines = 0;
+        gShSites[idx].lastF = gP3Frames;
+    }
+    ShSite& s = gShSites[idx];
+    unsigned int gap = firstSight ? 0u : (gP3Frames - s.lastF);
+    s.lastF = gP3Frames;
+    if (wih) ++s.nReal; else ++s.nNoop;
+
+    if (s.lines >= kShLinesSite || gShLines >= kShLinesRide) return;
+    ++s.lines;
+    ++gShLines;
+
+    char site[192];
+    ShDescribeAddr(ra, site, 192);
+    char b[448];
+    _snprintf_s(b, 448, _TRUNCATE,
+        "Riding: P43SH %s site=%s wih=%d sh='%s' cm=%d bc=%d st=%d gap=%u n=%d/%d f=%u",
+        firstSight ? "first" : "rep", site,
+        wih ? 1 : 0, shBuf,
+        rider->isInCombatMode(true, true) ? 1 : 0,
+        rider->_isBeingCarried            ? 1 : 0,
+        gRideStanceOn                     ? 1 : 0,
+        gap, s.nReal, s.nNoop, gP3Frames);
+    DebugLog(std::string(b));
+}
+
+// One line per ride at dismount: the whole site table, so the verdict is a single grep even when
+// the per-site line budget ran out mid-ride.
+static void ShProbeDumpImpl()
+{
+    if (gShCount == 0 && gShOver == 0) return;
+    char b[1024];
+    int w = _snprintf_s(b, 1024, _TRUNCATE, "Riding: P43SH sites=%d lines=%d over=%d",
+                        gShCount, gShLines, gShOver);
+    if (w < 0) return;
+    for (int i = 0; i < gShCount && w < 880; ++i)
+    {
+        char site[192];
+        ShDescribeAddr(gShSites[i].ra, site, 192);
+        int k = _snprintf_s(b + w, 1024 - w, _TRUNCATE, " | %s real=%d noop=%d",
+                            site, gShSites[i].nReal, gShSites[i].nNoop);
+        if (k < 0) break;
+        w += k;
+    }
+    DebugLog(std::string(b));
+}
+
+// SEH shells, separate functions for the same C2712 reason as the P3 probes above (the bodies
+// hold std::string temporaries).  A probe must never be able to take the game down.
+static void ShNote(CharacterHuman* h, uintptr_t ra)
+{
+    __try { ShNoteImpl(h, ra); }
+    __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION
+                  ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH)
+    { DebugLog("Riding: P43SH access violation - sheathe probe abandoned"); }
+}
+
+static void ShProbeDump()
+{
+    __try { ShProbeDumpImpl(); }
+    __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION
+                  ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH)
+    { }
 }
 
 static void DumpRiderAnimLayers(Character* rider, AnimationClass* rAnim, const char* tag)
@@ -5013,6 +5178,7 @@ void Mount(Character* rider, Character* mount)
     gRideStanceWho     = NULL;
     gRideStanceTick    = 0;                  // and no stale wall-clock baseline either
     gP41kResolved      = false;              // P4-1k: re-resolve + re-log the probe clips
+    ShProbeArm();                            // P4-3-1: fresh sheathe-caller table per ride
     // Route A straddle bookkeeping, per ride.  gLegCalfSnap holds a knee bend captured from
     // whoever rode last, gLegHostLast would swallow the first host line, and a stale mask
     // table would have LegMaskRelease pointer-validating against a dead AnimationClass - so
@@ -5103,6 +5269,11 @@ void Mount(Character* rider, Character* mount)
 void Dismount(Character* rider)
 {
     if (!rider) return;
+
+    // P4-3-1: print the ride's sheathe-caller table before any state is torn down.  Placed here
+    // rather than at the end so a dismount path that bails out early still leaves the verdict in
+    // the log; ShProbeArm() at the next Mount() is what clears it.
+    ShProbeDump();
 
     // P2-1b: hand the legs back before anything else.  If the straddle is armed when the ride
     // ends, the rider walks away with manually-controlled thighs (Skeleton::reset() will not
@@ -5275,6 +5446,7 @@ void RestoreRideAfterLoad(Character* rider, Character* mount)
     gRideStanceWho     = NULL;
     gRideStanceTick    = 0;                  // and no stale wall-clock baseline either
     gP41kResolved      = false;              // P4-1k: re-resolve + re-log the probe clips
+    ShProbeArm();                            // P4-3-1: fresh sheathe-caller table per ride
     // Route A straddle bookkeeping, per ride.  gLegCalfSnap holds a knee bend captured from
     // whoever rode last, gLegHostLast would swallow the first host line, and a stale mask
     // table would have LegMaskRelease pointer-validating against a dead AnimationClass - so
@@ -8131,6 +8303,21 @@ void contextMenu_show_hook(ContextMenuGUI* thisptr, const lektor<int>& ordersLis
     } catch(...) {}
 }
 
+// ---- P4-3-1 hook: CharacterHuman::sheatheWeapon -------------------------------------------
+// Naming probe only - see the P4-3 block above ShNoteImpl for why this is the only tool that can
+// answer "who is the second writer".  _ReturnAddress() is taken as the very first statement,
+// while the frame is still exactly as the caller left it, and the SEH shell lives in ShNote so
+// this function holds nothing that needs unwinding.  The engine body always runs afterwards: the
+// probe observes, it never changes what the game does.
+void (*sheatheWeapon_orig)(CharacterHuman* thisptr) = NULL;
+
+void sheatheWeapon_hook(CharacterHuman* thisptr)
+{
+    uintptr_t ra = (uintptr_t)_ReturnAddress();
+    ShNote(thisptr, ra);
+    if (sheatheWeapon_orig) sheatheWeapon_orig(thisptr);
+}
+
 __declspec(dllexport) void startPlugin()
 {
     DebugLog("RidingPlugin: start");
@@ -8156,6 +8343,14 @@ __declspec(dllexport) void startPlugin()
     void* humanUpdateOrig = NULL;
     if (KenshiLib::SUCCESS != KenshiLib::AddHook(KenshiLib::GetRealAddress(&AnimationClassHuman::_NV_update), (void*)&animUpdate_hook, (void**)&humanUpdateOrig))
         ErrorLog("RidingPlugin: Could not hook AnimationClassHuman::update!");
+
+    // P4-3-1 naming probe: who re-sheathes a mounted rider's weapon?  sheatheWeapon is a pure
+    // virtual call, so GetRealAddress needs the _NV_ stub (core/Functions.h says twice that it
+    // "doesn't work with virtual functions") - and a rider of dynamic type CharacterHuman always
+    // lands on this override anyway (the Character base slot 0x2D0 is `ret 0`).  The prologue
+    // gate was cleared offline: real RVA 0x5CC820 is a .pdata exact entry, prolog=30.
+    if (KenshiLib::SUCCESS != KenshiLib::AddHook(KenshiLib::GetRealAddress(&CharacterHuman::_NV_sheatheWeapon), (void*)&sheatheWeapon_hook, (void**)&sheatheWeapon_orig))
+        ErrorLog("RidingPlugin: Could not hook CharacterHuman::sheatheWeapon!");
 
     // ---- DISABLED HOOKS (safety fix) ----------------------------------------
     // Two hooks are deliberately NOT installed.  Disassembly (see

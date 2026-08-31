@@ -198,6 +198,15 @@ class Session(object):
         self.av = []             # access violation / rejection lines
         self.notes = []          # other one-off lines worth surfacing
         self.posedump = 0
+        # P4-3 step 1: the sheatheWeapon naming probe (DLL 305152 B and later).
+        # Per-site accounting, keyed by the "<module>+0x<rva>" the probe prints.
+        # The verdict is NOT "how many lines" - it is "which site has real>0 and
+        # repeats on a ~14-frame cadence"; a wih=0 call sheathed nothing and can
+        # never be the writer we are hunting.
+        self.sh_sites = {}       # site -> {"real":n,"noop":n,"gaps":[..],"first_ts":ts}
+        self.sh_lines = 0
+        self.sh_dump = None      # last "sites=.. lines=.. over=.." payload
+        self.sh_hookfail = False # "Could not hook CharacterHuman::sheatheWeapon!"
 
 
 MOUNTED = re.compile(r"Riding: mounted \[(?P<sp>[^\]]*)\]")
@@ -223,6 +232,13 @@ def parse(path, s):
             # The log is UTF-8 but species names have been seen mangled; never
             # let one bad byte abort the whole read.
             line = raw.decode("utf-8", "replace").rstrip("\r\n")
+            # This one is an ErrorLog, so it says "RidingPlugin:" and would be
+            # dropped by the "Riding:" filter below.  It has to be caught: "no
+            # P43SH line at all" means two completely different things depending
+            # on whether the hook installed (see report_sheathe).
+            if "Could not hook CharacterHuman::sheatheWeapon" in line:
+                s.sh_hookfail = True
+                continue
             if "Riding:" not in line:
                 continue
             if "access violation" in line or "AV" == line[-2:]:
@@ -388,6 +404,31 @@ def parse(path, s):
                     s.wn_nonzero += 1
                 if tuple_nonzero(d.get("mvW")):
                     s.mvw_nonzero += 1
+                continue
+            if "P43SH" in line:
+                if "sites=" in line:
+                    s.sh_dump = line.strip()
+                    continue
+                d = kv(line)
+                site = d.get("site")
+                if not site:
+                    continue
+                s.sh_lines += 1
+                e = s.sh_sites.setdefault(site, {"real": 0, "noop": 0,
+                                                 "gaps": [], "first_ts": ts(line)})
+                # wih= is the PRE-call state (the probe runs before the engine
+                # body), so wih=1 is the only kind of call that actually took a
+                # drawn weapon out of the rider's hands.
+                if d.get("wih") == "1":
+                    e["real"] += 1
+                else:
+                    e["noop"] += 1
+                try:
+                    g = int(d.get("gap", "0"))
+                except ValueError:
+                    g = 0
+                if g > 0:
+                    e["gaps"].append(g)
                 continue
             if "POSEDUMP" in line:
                 s.posedump += 1
@@ -1063,6 +1104,106 @@ DEFAULT_CFG = (r"D:\steam\steamapps\common\Kenshi\mods"
                r"\RidingPlugin\riding.cfg")
 
 
+def report_sheathe(s):
+    """T6 / P4-3 step 1: name the second writer that re-sheathes the weapon."""
+    print("")
+    print("== P4-3 step 1 - who re-sheathes the rider's weapon (P43SH) ==")
+    if s.sh_hookfail:
+        print("  " + verdict(False, "the hook did NOT install ('Could not hook"
+                                    " CharacterHuman::sheatheWeapon!')."))
+        print("             Nothing below means anything - fix the hook first"
+              " (prologue / GetRealAddress).")
+        return
+    if not s.sh_sites and not s.sh_dump:
+        print("  no P43SH line at all.  TWO different readings, and the hook"
+              " error line above")
+        print("  did NOT appear, so the hook installed:")
+        print("    - this log predates DLL 305152 B (the probe build), or")
+        print("    - sheatheWeapon was never called on a tracked rider this"
+              " session, which is")
+        print("      itself a finding: the re-sheathe goes through some other"
+              " API (look at")
+        print("      dropWeaponInHands@0x5CC760's family).")
+        print("  NOT MEASURED - not a pass.")
+        return
+
+    # The module name is printed by the probe on purpose: if AddHook ever hands
+    # us something other than the caller's own frame, the return address lands in
+    # KenshiLib/MinHook and every RVA below is void.  NOTE the test insists on
+    # the .exe: "kenshi" alone would happily accept KenshiLib.dll, which is one
+    # of the two shapes T6 criterion 1 is there to catch.
+    foreign = [k for k in s.sh_sites
+               if not re.match(r"(?i)^kenshi[^+]*\.exe\+0x", k)]
+    print("  " + verdict(not foreign,
+                         "all %d site(s) resolve inside the kenshi module"
+                         % len(s.sh_sites) if not foreign else
+                         "%d site(s) resolve OUTSIDE the kenshi module -> the"
+                         " return address is not the" % len(foreign)))
+    if foreign:
+        for k in foreign[:6]:
+            print("             " + k)
+        print("             caller's.  Every RVA below is void until that is"
+              " explained.")
+
+    print("  %d P43SH line(s), %d distinct site(s)."
+          % (s.sh_lines, len(s.sh_sites)))
+    print("  %-34s %5s %5s %s" % ("site", "real", "noop", "gaps (frames)"))
+    # real>0 first: a wih=0 call sheathed nothing and cannot be the writer.
+    for site, e in sorted(s.sh_sites.items(),
+                          key=lambda kv2: (-kv2[1]["real"], kv2[0])):
+        g = e["gaps"]
+        gs = ("n=%d min=%d med=%d max=%d"
+              % (len(g), min(g), sorted(g)[len(g) // 2], max(g))) if g else "-"
+        print("  %-34s %5d %5d %s" % (site[:34], e["real"], e["noop"], gs))
+
+    real = {k: e for k, e in s.sh_sites.items() if e["real"] > 0}
+    print("  " + verdict(bool(real),
+                         "%d site(s) really took a drawn weapon away (wih=1)"
+                         % len(real) if real else
+                         "every call was a no-op (wih=0) - none of these sites"
+                         " is the writer;"))
+    if not real:
+        print("             the rider's hands were empty every time, so force a"
+              " real draw")
+        print("             (get into a fight on an elig=1 mount) and ride"
+              " again.")
+    else:
+        # The second writer is defined by a REPEAT, not by a single call: one
+        # sheathe is explained by "combat ended -> auto-sheathe".
+        rep = {k: e for k, e in real.items() if (e["real"] + e["noop"]) > 1}
+        print("  " + verdict(bool(rep),
+                             "%d of them repeat (>1 call) -> that is the"
+                             " candidate set" % len(rep) if rep else
+                             "none of them repeats - a single sheathe is"
+                             " already explained by"))
+        if not rep:
+            print("             'combat ended -> auto-sheathe'; the SECOND"
+                  " writer needs a repeat.")
+            print("             Ride longer / fight twice before dismounting.")
+        else:
+            for k, e in sorted(rep.items(), key=lambda kv2: -kv2[1]["real"]):
+                g = e["gaps"]
+                print("             %s  real=%d  cadence=%s" % (
+                    k, e["real"],
+                    ("median %d frames" % sorted(g)[len(g) // 2]) if g else "?"))
+            print("             Copy that <module>+0x<rva> back into TASK.md"
+                  " P4-3 step 1.")
+    if s.sh_dump:
+        print("  dismount table: " + s.sh_dump[:220])
+        mo = re.search(r"\bover=(\d+)", s.sh_dump)
+        if mo and int(mo.group(1)) > 0:
+            print("  " + verdict(False, "over=%s - the %d-slot site table filled"
+                                        " up, so some caller never got its own"
+                                        % (mo.group(1), len(s.sh_sites))))
+            print("             row.  Raise kShSites and ride again before"
+                  " trusting the table above.")
+    else:
+        print("  no dismount summary line (the ride never reached Dismount()).")
+    print("  NOTE  naming only.  Never call sheatheWeapon as a fix (that is"
+          " SHEATHING, not")
+    print("        drawing) and never write 're-draw every frame' - HISTORY §B.")
+
+
 def report_trailer(s, lines):
     print("")
     print("== leftovers ==")
@@ -1105,6 +1246,7 @@ def main(argv):
     report_tuned(s, cfg)
     report_legs(s)
     report_pose(s)
+    report_sheathe(s)
     report_trailer(s, lines)
     print("")
     print("Every CHECK above is a log-side fact only.  The eyeball half of")
