@@ -224,6 +224,23 @@ class Session(object):
         self.at_hands = 0        # logged lines whose slot was "hands"
         self.at_dump = None      # last "sites=.. hands=.. over=.. hk=.. app=.." payload
         self.at_hookfail = []    # "Could not hook AppearanceBase::attachItem (N-arg)!"
+        # P4-3 step 3, naming half: the P41D combat lever.  Its ONE question here is
+        # "does chooseAttack hand back a technique, and what is that clip called" -
+        # everything else on those lines is the ladder's own bookkeeping.
+        # WARNING for whoever extends this: the "P41D read" line carries DUPLICATE
+        # keys - cma=/tech=/cst= appear in both the `raw` and the `e` (enemy
+        # positive control) sections, and reach= in both `api` and `e`.  kv() builds
+        # a dict, so a naive kv(line) silently returns the ENEMY's values for those
+        # four.  Everything below splits the line at " | e " first.
+        self.p41d_ai = 0         # "P41D ai" lines (the P41B-era AI-layer view)
+        self.p41d_read = []      # dicts of the rider half of each "P41D read" line
+        self.p41d_precond = []   # "P41D precond tgt= atk= icm=" lines
+        self.p41d_rungs = {}     # rung -> count, from "P41D rung=" readbacks
+        self.p41d_rung_rows = [] # dicts of each "P41D rung=" line (rider half)
+        self.p41d_clip_absent = []    # names reported ABSENT in allAnims
+        self.p41d_clip_unres = []     # names that could not even be looked up
+        self.p41d_clip_rows = []      # LogAnimRow("P41D clip", ..) rows, verbatim
+        self.p41d_abandoned = False   # "all rungs disarmed - ladder abandoned"
 
 
 MOUNTED = re.compile(r"Riding: mounted \[(?P<sp>[^\]]*)\]")
@@ -486,6 +503,49 @@ def parse(path, s):
                     s.at_hands += 1
                 else:
                     e["other"] += 1
+                continue
+            if "P41D" in line:
+                # Order matters: the three "P41D access violation .." lines never
+                # arrive here - the generic "access violation" catch above already
+                # put them in s.av - so report_p41d() scans s.av for a disarmed rung.
+                if "all rungs disarmed" in line:
+                    s.p41d_abandoned = True
+                    continue
+                if "P41D clip" in line:
+                    m = re.search(r"P41D clip '([^']*)' (ABSENT|unresolved)", line)
+                    if m:
+                        if m.group(2) == "ABSENT":
+                            s.p41d_clip_absent.append(m.group(1))
+                        else:
+                            s.p41d_clip_unres.append(m.group(1))
+                    else:
+                        # LogAnimRow's own shape: key='..' data='..' clip='..' lay=..
+                        s.p41d_clip_rows.append(line.strip())
+                    continue
+                if "P41D precond" in line:
+                    s.p41d_precond.append(kv(line))
+                    continue
+                if "P41D ai" in line:
+                    s.p41d_ai += 1
+                    continue
+                # Both remaining shapes duplicate keys across their sections, so cut
+                # the enemy control half off before kv() can overwrite the rider's.
+                head = line.split(" | e ")[0]
+                if "P41D read" in line:
+                    d = kv(head)
+                    d["_ts"] = ts(line)
+                    d["_anim"] = (d.get("anim") or "").strip("'")
+                    s.p41d_read.append(d)
+                    continue
+                if "P41D rung=" in line:
+                    d = kv(head)
+                    d["_ts"] = ts(line)
+                    s.p41d_rung_rows.append(d)
+                    try:
+                        r = int(d.get("rung", "-1"))
+                    except ValueError:
+                        r = -1
+                    s.p41d_rungs[r] = s.p41d_rungs.get(r, 0) + 1
                 continue
             if "POSEDUMP" in line:
                 s.posedump += 1
@@ -1601,6 +1661,266 @@ def report_attach(s):
           " writer.")
 
 
+def report_p41d(s):
+    """P4-3 step 3, naming half: does chooseAttack yield a technique, and what is
+    that clip called?  Everything the P41D lever prints is secondary to that one
+    question, so the ladder bookkeeping is summarised, not expanded."""
+    print("")
+    print("== P4-3 step 3 (naming half) - does chooseAttack yield a clip name"
+          " (P41D) ==")
+    total = (s.p41d_ai + len(s.p41d_read) + len(s.p41d_rung_rows)
+             + len(s.p41d_precond) + len(s.p41d_clip_absent)
+             + len(s.p41d_clip_unres) + len(s.p41d_clip_rows))
+    if not total:
+        print("  no P41D line at all - NOT MEASURED, and that has five innocent"
+              " readings:")
+        print("    1. diagnostics were off.  The whole lever sits inside"
+              " `else if (debugContinuous)`")
+        print("       -> Ctrl+NUM. must be ON for the ride (same requirement as"
+              " T9).")
+        print("    2. the mount was big-tier.  The lever is the small-tier half"
+              " of that if;")
+        print("       the big half calls endCombatMode()+halt() instead"
+              " (elig=1 in the ride table).")
+        print("    3. no attacker came within kAtkTryRange=40.0u"
+              " (both attacker lists empty, or")
+        print("       the nearest was farther - that range gate is P4-1a's fix"
+              " for an order at d=971).")
+        print("    4. the per-ride budget was already spent"
+              " (kAtkTryBudget=20 tries / kAtkReadBudget=60 reads).")
+        print("    5. this log predates the P41D build.")
+        print("  => none of the five is a probe failure.  Re-ride with"
+              " diagnostics on, small mount,")
+        print("    and stay in a fight: one full rung cycle needs >= 5 rungs x"
+              " kAtkTryGap 75 frames")
+        print("    = 375 frames with a target inside 40u.")
+        return
+    print("  lines: ai=%d read=%d rung=%d precond=%d | clip rows=%d absent=%d"
+          " unresolved=%d"
+          % (s.p41d_ai, len(s.p41d_read), len(s.p41d_rung_rows),
+             len(s.p41d_precond), len(s.p41d_clip_rows),
+             len(s.p41d_clip_absent), len(s.p41d_clip_unres)))
+    print("")
+    print("  -- did chooseAttack yield? (the one question) --")
+    yields = [d for d in s.p41d_read if d.get("ch") == "1"]
+    names = {}
+    for d in yields:
+        nm = d.get("_anim") or "(empty)"
+        names[nm] = names.get(nm, 0) + 1
+    if s.p41d_read:
+        print("     read lines=%d   ch=1 on %d of them"
+              % (len(s.p41d_read), len(yields)))
+        first = s.p41d_read[0]
+        last = s.p41d_read[-1]
+        print("     window: %s .. %s" % (first.get("_ts"), last.get("_ts")))
+        print("     rider state on the last read: wpn=%s aCW=%s pWpn=%s pCat=%s"
+              " cTech=%s"
+              % (last.get("wpn"), last.get("aCW"), last.get("pWpn"),
+                 last.get("pCat"), last.get("cTech")))
+        print("     rider combat:  raw cma=%s tech=%s cst=%s | api in=%s gcs=%s"
+              " reach=%s | sR=%s"
+              % (last.get("cma"), last.get("tech"), last.get("cst"),
+                 last.get("in"), last.get("gcs"), last.get("reach"),
+                 last.get("sR")))
+    if names:
+        for nm in sorted(names, key=lambda k: -names[k]):
+            print("     anim='%s'  x%d" % (nm, names[nm]))
+        ex = yields[-1]
+        print(verdict(True, "chooseAttack DOES yield a technique (ch=1)."
+                            " init=%s minS=%s d=%s"
+                            % (ex.get("init"), ex.get("minS"), ex.get("d"))))
+        print("          => the naming half is answered: that string is the"
+              " attack clip's name.")
+    elif s.p41d_read:
+        print(verdict(False, "every read has ch=0 - chooseAttack refused,"
+                             " anim='' on all %d." % len(s.p41d_read)))
+        print("          => NOT a probe failure.  RE_NOTES :480 already records"
+              " ch=0 43/43 for an")
+        print("            unarmed rider, i.e. a consequence, not a mystery:"
+              " no weapon in hand => no")
+        print("            weapon techniques to choose from.  The fix order"
+              " stays 先把武器放回手里")
+        print("            (P4-3 steps 1-2), not 'make chooseAttack talk'.")
+        armed = [d for d in s.p41d_read if d.get("wpn") == "1"]
+        print("          cross-check: wpn=1 on %d of %d reads, pWpn=1 on %d"
+              % (len(armed), len(s.p41d_read),
+                 len([d for d in s.p41d_read if d.get("pWpn") == "1"])))
+        if armed:
+            print("          !! ch=0 WITH wpn=1 is the interesting case:"
+                  " the weapon is in hand and")
+            print("            chooseAttack still refuses => the blocker is"
+                  " past the weapon, look at")
+            print("            cst=/reach= and at aCW= (SKILL_UNARMED=5 while"
+                  " wpn=1 => the anim layer")
+            print("            never learned about the weapon).")
+    print("")
+    print("  -- the weapon gate (whether ch could ever be 1) --")
+    if not s.p41d_read:
+        print("     no read lines - gate not measured.")
+    else:
+        n = len(s.p41d_read)
+        n_wpn = len([d for d in s.p41d_read if d.get("wpn") == "1"])
+        n_pw = len([d for d in s.p41d_read if d.get("pWpn") == "1"])
+        n_unarmed = len([d for d in s.p41d_read if d.get("aCW") == "5"])
+        cats = sorted(set(d.get("pCat") for d in s.p41d_read
+                          if d.get("pWpn") == "1"))
+        print("     wpn=1 (getCurrentWeapon) %d/%d | pWpn=1"
+              " (getThePreferredWeapon) %d/%d" % (n_wpn, n, n_pw, n))
+        print("     aCW=5 (SKILL_UNARMED, the anim layer's view) %d/%d"
+              "  | pCat seen on pWpn=1: %s"
+              % (n_unarmed, n, ",".join(str(c) for c in cats) or "-"))
+        if n_pw and n_unarmed == n and not n_wpn:
+            print(verdict(True, "pWpn=1 with a real pCat while aCW stays"
+                                " SKILL_UNARMED(5) and wpn=0"))
+            print("          => the rider OWNS a weapon that is not in his hands."
+                  "  The whole reach=0")
+            print("            chain is just a sheathed weapon => rung 0"
+                  " (drawWeapon) is the whole fix,")
+            print("            and that is the same answer P4-3 steps 1-2 are"
+                  " chasing (who re-sheathes /")
+            print("            does the HAND slot ever get refreshed).")
+        elif n_wpn:
+            print(verdict(False, "wpn=1 on %d reads - the weapon IS in hand at"
+                                 " least sometimes" % n_wpn))
+            print("          => so 'sheathed weapon' does not explain those"
+                  " reads.  Compare ch= on exactly")
+            print("            those lines: ch=0 while wpn=1 moves the blocker"
+                  " past the weapon entirely.")
+        else:
+            print(verdict(False, "no weapon on either accessor (wpn=0 pWpn=0)"))
+            print("          => this rider is genuinely unarmed; ch=0 is then"
+                  " arithmetic, not a finding.")
+            print("            Give the rider a weapon and re-ride before"
+                  " reading anything into ch=.")
+    print("")
+    print("  -- the clip line (premise 2: is that name a record?) --")
+    if s.p41d_clip_absent:
+        for nm in sorted(set(s.p41d_clip_absent)):
+            print("     '%s' ABSENT in allAnims" % nm)
+        print(verdict(True, "ABSENT confirms the offline finding in-engine"))
+        print("          => tools\\gamedata.py found NO ANIMATION/ANIMAL ANIM"
+              " record for 43 of the 44")
+        print("            COMBAT TECHNIQUE clip names; allAnims.find() missing"
+              " it is the runtime half")
+        print("            of the same fact.  !! HARD CONSEQUENCE: such a name"
+              " must NEVER be handed to")
+        print("            getAnimationData() - that is operator[] semantics and"
+              " a miss plants a")
+        print("            permanent NULL in the engine's own allAnims."
+              "  FindAnimData() only.")
+        print("          => and 'layer'/'wholeBodyAllLayer' are RECORD fields, so"
+              " for these clips those")
+        print("            two bits do not exist anywhere in data\\ =>"
+              " 判层只能钉上去实测.")
+    if s.p41d_clip_unres:
+        for nm in sorted(set(s.p41d_clip_unres)):
+            print("     '%s' unresolved (no list)" % nm)
+        print(verdict(False, "the human anim list itself was unreachable -"
+                             " says nothing about the clip"))
+    if s.p41d_clip_rows:
+        for ln in s.p41d_clip_rows[:6]:
+            print("     %s" % ln)
+        print(verdict(True, "the name RESOLVED to a record - read lay= and"
+                            " flags= off that row"))
+        print("          => that answers the layer question directly:"
+              " lay=UPPER + no 'whole' would be")
+        print("            pinnable beside the hand-controlled legs;"
+              " 'whole' means it presses the")
+        print("            whole skeleton and P4-3 has to fight it"
+              " (see CLAUDE.md 人形动画表).")
+        print("          !! still 静态字段: it predicts nothing about runtime"
+              " weight - pin it and look.")
+    if not (s.p41d_clip_absent or s.p41d_clip_unres or s.p41d_clip_rows):
+        print("     no clip line at all.")
+        if not yields:
+            print("     => EXPECTED, not a failure: the clip line is guarded by"
+                  " `if (chAnim[0] && ...)`,")
+            print("       i.e. it only prints when chooseAttack actually"
+                  " returned a technique (ch=1),")
+            print("       and every read above has ch=0.")
+        else:
+            print("     !! ch=1 was seen but no clip line printed => its second"
+                  " guard, `lastChAnim !=")
+            print("       chAnim`, was already satisfied.  That static is"
+                  " FUNCTION-LOCAL and neither")
+            print("       per-ride reset block clears it => one line per distinct"
+                  " name PER DLL LOAD.")
+            print("       'Ride twice to be sure' will NOT reproduce it -"
+                  " restart the game instead,")
+            print("       and never read this silence as failure.")
+    print("")
+    print("  -- the ladder (bookkeeping only; rung attribution) --")
+    RUNGS = {0: "drawWeapon",
+             1: "focused _NV_initCombatMode(tgt,0,true)",
+             2: "CcSetPtr(rcc,0x150,chTech)",
+             3: "runCombatAnimation(chTech,1.0,'')",
+             4: "changeState(CHOP_WEAPON,0.0)"}
+    dead = {}
+    for ln in s.av:
+        m = re.search(r"access violation in rung (\d+)", ln)
+        if m:
+            r = int(m.group(1))
+            dead[r] = dead.get(r, 0) + 1
+    for r in sorted(RUNGS):
+        n = s.p41d_rungs.get(r, 0)
+        tag = ""
+        if r in dead:
+            tag = "  <- DISARMED by AV x%d (gRungDead[%d]) => untried after that" \
+                  % (dead[r], r)
+        elif not n:
+            tag = "  <- never reached (budget/cycle, NOT a result)"
+        print("     rung %d  x%-4d %-38s%s" % (r, n, RUNGS[r], tag))
+    if s.p41d_abandoned:
+        print(verdict(False, "'all rungs disarmed - ladder abandoned' was"
+                             " printed"))
+        print("          => every rung took an AV; nothing about P4-3 was tested"
+              " after that point.")
+    if s.p41d_precond:
+        last = s.p41d_precond[-1]
+        print("     precond x%d (last: tgt=%s atk=%s icm=%s)"
+              % (len(s.p41d_precond), last.get("tgt"), last.get("atk"),
+                 last.get("icm")))
+    if s.p41d_ai:
+        print("     ai x%d (the P41B-era AI-layer view, kept as a regression"
+              " check)" % s.p41d_ai)
+    if s.p41d_rung_rows:
+        last = s.p41d_rung_rows[-1]
+        print("     last rung readback: rung=%s %s"
+              % (last.get("rung"),
+                 " ".join("%s=%s" % (k, last[k]) for k in
+                          ("tries_left", "d", "cma", "tech", "reach", "inZ",
+                           "nearZ", "cst", "wpn")
+                          if k in last)))
+    for ln in s.av:
+        if "P41D access violation outside a rung" in ln:
+            print(verdict(False, "an AV landed OUTSIDE a rung (read block or"
+                                 " readback)"))
+            print("          => that zeroes gAtkTries/gAtkReads => the lever"
+                  " stopped for the rest of the")
+            print("            ride.  Unlike a per-rung AV this one is worth"
+                  " stopping for (source note")
+            print("            at the __except handler says so) - find the bad"
+                  " offset before re-riding.")
+            break
+    print("")
+    print("  NOTE  sR= is a SYNTHETIC reach handed to chooseAttack as an"
+          " argument (its own reach")
+    print("        when non-zero, else the enemy's, else 9.0), and the returned"
+          " pointer is")
+    print("        deliberately NOT installed here.  So ch=1 does NOT prove the"
+          " engine would pick")
+    print("        a technique unaided - installing it is rung 2's job, kept"
+          " separate so the")
+    print("        ladder stays attributable.")
+    print("  NOTE  naming only.  A clip name is not a fix: 判层的字段对这 43 条"
+          " 根本不存在, so the")
+    print("        remaining half of step 3 is 钉上去实测 (does the skeleton"
+          " move, how does it press")
+    print("        against guard 1h and the hand-controlled thighs) - not"
+          " 'drive every swing")
+    print("        ourselves', which is HISTORY §B's servo road.")
+
+
 def report_trailer(s, lines):
     print("")
     print("== leftovers ==")
@@ -1646,6 +1966,7 @@ def main(argv):
     report_pose(s)
     report_sheathe(s)
     report_attach(s)
+    report_p41d(s)
     report_trailer(s, lines)
     print("")
     print("Every CHECK above is a log-side fact only.  The eyeball half of")
