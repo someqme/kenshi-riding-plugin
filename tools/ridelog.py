@@ -33,6 +33,53 @@ def kv(line):
     return dict(KV.findall(line))
 
 
+def ts(line):
+    """The RE_Kenshi timestamp, i.e. the first token ("561.454").
+
+    Frame counters cannot be cross-compared between line kinds (TWIST/LEGPOSE
+    print gLegPoseFrames, STANCE prints the global frame), so the timestamp is
+    the only way to line two kinds of line up against each other.
+    """
+    head = line.split(None, 1)[0] if line.strip() else ""
+    return head if re.match(r"^\d+\.\d+$", head) else "?"
+
+
+# Two P3CMB rows closer together than this belong to one knockdown window.  The
+# probe is throttled, so consecutive samples of ONE knockdown are seconds apart.
+kDownGap = 3.0
+
+
+def add_down(s, line):
+    """Fold this down=1 row's timestamp into s.down_spans."""
+    t = ts(line)
+    if t == "?":
+        return
+    t = float(t)
+    if s.down_spans and 0.0 <= t - s.down_spans[-1][1] <= kDownGap:
+        s.down_spans[-1][1] = t
+    else:
+        s.down_spans.append([t, t])
+
+
+def in_down(s, t, pad=1.5):
+    """Does timestamp t fall inside a knockdown window?
+
+    pad widens the window by the sampling gap on each side: the spans are built
+    from throttled samples, so the rider was already down a little before the
+    first one and still down a little after the last.
+    """
+    if t is None or t == "?":
+        return False
+    try:
+        t = float(t)
+    except (TypeError, ValueError):
+        return False
+    for a, b in s.down_spans:
+        if a - pad <= t <= b + pad:
+            return True
+    return False
+
+
 def fnum(d, k, default=None):
     """Parse d[k] as float; tolerate the int-scaled fields and junk."""
     v = d.get(k)
@@ -42,6 +89,26 @@ def fnum(d, k, default=None):
         return float(v)
     except ValueError:
         return default
+
+
+def fnum_flagged(d, k, default=None):
+    """Parse a "<float>/<flag>" field, e.g. TWIST's sh=%.1f/%d.
+
+    Returns (value, flag).  value is None unless the flag half is 1 - the
+    source prints sh=0.0/0 when it could not read both UpperArm bones, and a
+    zero with the flag clear is NOT a measurement.  bare float() on the whole
+    token raises, which used to silently drop EVERY sample and report the
+    sign criterion as "never exercised" (a tool bug, not a code failure).
+    """
+    v = d.get(k)
+    if v is None:
+        return (default, False)
+    head, _, flag = v.partition("/")
+    ok = (flag == "1")
+    try:
+        return (float(head) if ok else default, ok)
+    except ValueError:
+        return (default, ok)
 
 
 class Stat(object):
@@ -76,12 +143,29 @@ class Session(object):
         self.dismounts = 0
         self.restored = 0        # LEGPOSE restored on dismount
         self.takeovers = []      # LEGPOSE takeover lines (dicts)
-        self.released = []       # LEGPOSE released lines (grace=, f=)
+        self.released = []       # LEGPOSE released lines (grace=, f=, ts)
+        # Timestamp spans (merged, kDownGap tolerance) during which a P3CMB row
+        # reported down=1.  2026-08-31: EVERY sub-1.0 kept sample and BOTH
+        # grace-exhausted releases of that trip fell inside such a span, so this
+        # correlation is the whole diagnosis of the straddle defect - the tool
+        # now computes it instead of leaving it to hand-greps.
+        self.down_spans = []     # [start_ts, end_ts]
         self.kept = Stat()
         self.kept_bad = 0        # samples not 1.0000
+        self.kept_bad_rows = []  # (f, bone, kept, abd, flx, ts) for the bad ones
         self.stance = []         # (state, f, cm, d, hold) in order
-        self.twist = []          # (want, sh, d, on, msk, host)
+        self.twist = []          # (want, sh, d, on, msk, host, shok, f)
         self.tuned = []          # (species, key or None)
+        # P3CMB combat probe.  WARNING: this line's rAtk=/mAtk= are ATTACKER
+        # COUNTS (getAllAttackers), nothing to do with the mount line's mAtk=
+        # (the per-race attacks lektor).  Same spelling, unrelated meanings.
+        self.cmb = 0
+        self.cmb_ratk = 0        # rows where enemies are attacking the RIDER
+        self.cmb_matk = 0        # rows where enemies are attacking the MOUNT
+        self.cmb_rtgt = 0        # rider holds an attack target
+        self.cmb_mtgt = 0        # mount holds an attack target (= 坐骑护主 fired)
+        self.cmb_down = 0        # rider knocked down while mounted
+        self.cmb_dr3 = Stat()    # nearest attacker to the rider's logical pos
         self.pose_w = Stat()
         self.pose_1 = 0          # weight >= 0.995
         self.pose_dip = 0        # 0.94 <= weight < 0.995  (the v1.5 residue)
@@ -139,16 +223,30 @@ def parse(path, s):
                 s.restored += 1
                 continue
             if "LEGPOSE takeover" in line:
-                s.takeovers.append(kv(line))
+                d = kv(line)
+                d["_ts"] = ts(line)
+                s.takeovers.append(d)
                 continue
             if "LEGPOSE released" in line:
-                s.released.append(kv(line))
+                d = kv(line)
+                d["_ts"] = ts(line)
+                s.released.append(d)
                 continue
             if "kept=" in line:
-                k = fnum(kv(line), "kept")
+                d = kv(line)
+                k = fnum(d, "kept")
                 s.kept.add(k)
                 if k is not None and abs(k - 1.0) > 0.0005:
                     s.kept_bad += 1
+                    # Keep the identity of the bad ones.  Without f= and the bone
+                    # name these samples cannot be lined up against the LEGPOSE
+                    # released / STANCE lines, and that correlation is the whole
+                    # diagnosis when the mask misses somebody.
+                    m = re.search(r"'([^']*)'", line)
+                    if len(s.kept_bad_rows) < 24:
+                        s.kept_bad_rows.append(
+                            (fnum(d, "f"), m.group(1) if m else "?", k,
+                             d.get("abd"), d.get("flx"), ts(line)))
                 continue
 
             if "Riding: STANCE" in line:
@@ -159,8 +257,33 @@ def parse(path, s):
                 continue
             if "Riding: TWIST" in line:
                 d = kv(line)
-                s.twist.append((fnum(d, "want"), fnum(d, "sh"), fnum(d, "d"),
-                                d.get("on"), d.get("msk"), d.get("host")))
+                # sh is "<deg>/<haveSh>" - split it, and keep the flag so a
+                # bone-read failure never masquerades as a 0-degree shoulder.
+                sh, shok = fnum_flagged(d, "sh")
+                s.twist.append((fnum(d, "want"), sh, fnum(d, "d"),
+                                d.get("on"), d.get("msk"), d.get("host"), shok,
+                                fnum(d, "f")))
+                continue
+            if "Riding: P3CMB" in line:
+                if "access violation" in line:
+                    s.av.append(line.strip())
+                    continue
+                d = kv(line)
+                s.cmb += 1
+                if fnum(d, "rAtk", 0) > 0:
+                    s.cmb_ratk += 1
+                if fnum(d, "mAtk", 0) > 0:
+                    s.cmb_matk += 1
+                if d.get("rTgt") == "1":
+                    s.cmb_rtgt += 1
+                if d.get("mTgt") == "1":
+                    s.cmb_mtgt += 1
+                if d.get("down") == "1":
+                    s.cmb_down += 1
+                    add_down(s, line)
+                dr = fnum(d, "dR3")
+                if dr is not None and dr >= 0.0:
+                    s.cmb_dr3.add(dr)
                 continue
             m = TUNED.match(line.strip()) or TUNED.search(line)
             if m:
@@ -225,8 +348,10 @@ def report_rides(s):
             d.get("h", "-")))
     print("  mounts=%d dismounts=%d" % (len(s.rides), s.dismounts))
     # mAtk: absent means the log predates the P4-2 build (the field was added
-    # there); -1 means unreadable (three guards); 0 means the species cannot
-    # swing.  Absent is NOT the same as readable - never PASS on it.
+    # there); -1 means unreadable (three guards).  0 means the per-race
+    # AnimList::attacks lektor is EMPTY - which offline data says it is for
+    # every species, so 0 says nothing about whether the animal can swing.
+    # See the NOTE below before acting on it.
     gone = [d for d in s.rides if "mAtk" not in d]
     bad = [d for d in s.rides if d.get("mAtk") == "-1"]
     zero = [d for d in s.rides if d.get("mAtk") == "0"]
@@ -240,11 +365,25 @@ def report_rides(s):
         print("  " + verdict(not bad, "mAtk readable on every mount"
                              + (" - %d unreadable(-1)" % len(bad) if bad else "")))
     if zero:
-        print("  NOTE  %d mount(s) report mAtk=0 = that species physically cannot"
+        print("  NOTE  %d mount(s) report mAtk=0.  That does NOT mean the species"
               % len(zero))
-        print("        swing; both-sides degrades to rider-only FOR THOSE."
-              "  This is the")
-        print("        only evidence that justifies a per-species fallback.")
+        print("        cannot swing - AnimList::attacks is empty for EVERYONE."
+              "  Evidence:")
+        print("        gamedata.py --type 5 finds no attack among any ANIMAL ANIM"
+              " record,")
+        print("        P1 read attacks=0 off the HUMAN list (humans obviously"
+              " swing), and")
+        print("        animal attacks actually live in COMBAT TECHNIQUE records"
+              " ('gar")
+        print("        attack long', 'insect spider attack', ...) whose clips have"
+              " no")
+        print("        ANIMATION record at all (RE_NOTES 19).  So mAtk= reads a"
+              " container")
+        print("        nobody populates.  DO NOT write a per-species fallback off"
+              " it -")
+        print("        check P3CMB mTgt= instead: mTgt=1 means the mount did take"
+              " the")
+        print("        attack order.")
 
     elig = [(d.get("species", "?"), d.get("elig"), d.get("size")) for d in s.rides]
     print("  elig by mount: " + ", ".join("%s=%s(size %s)" % e for e in elig))
@@ -293,6 +432,84 @@ def report_stance(s):
         print("                HaltAndForceSitPass passes advance=true)")
 
 
+def report_combat(s):
+    print("")
+    print("== T4 - who actually engages (P3CMB probe) ==")
+    if not s.cmb:
+        print("  no P3CMB line - the probe is budgeted and gated on Ctrl+NUM.,"
+              " so this")
+        print("  is unmeasured, not clean.")
+        return
+    print("  rows=%d   enemies attacking rider(rAtk>0)=%d   attacking mount"
+          "(mAtk>0)=%d" % (s.cmb, s.cmb_ratk, s.cmb_matk))
+    print("  rider holds a target(rTgt=1)=%d   mount holds a target(mTgt=1)=%d"
+          % (s.cmb_rtgt, s.cmb_mtgt))
+    print("  rider knocked down while mounted(down=1)=%d" % s.cmb_down)
+    print("  nearest attacker to the rider's logical pos: dR3 %s" % s.cmb_dr3)
+    print("  WARNING  this line's rAtk=/mAtk= are ATTACKER COUNTS."
+          "  The mount line's")
+    print("           mAtk= is a different quantity (the per-race attacks"
+          " lektor).")
+    print("  " + verdict(s.cmb_mtgt > 0,
+                         "the mount took an attack order at least once"
+                         " (坐骑护主 fired; mTgt=0 everywhere => look at"
+                         " getAllAttackers on the mount)"))
+    print("  " + verdict(s.cmb_ratk > 0,
+                         "enemies registered the RIDER as a target"
+                         " (log-side half of 「骑手会掉血」; the damage itself"
+                         " is eyeball-only)"))
+    print("  NOTE  a small dR3 is the point of leaving rMove on the ground -"
+          " melee reach")
+    print("        is a 3D distance, so lifting it to saddle height is what"
+          " would make the")
+    print("        rider untouchable.  Do not 'fix' dR3.")
+
+
+def wrap180(a):
+    while a > 180.0:
+        a -= 360.0
+    while a < -180.0:
+        a += 360.0
+    return a
+
+
+def twist_sign_test(s):
+    """Decide kRideTwistSign without knowing the rider's world facing.
+
+    sh= is an ABSOLUTE world angle - ATan2 of (L UpperArm - R UpperArm), i.e.
+    the rider's lateral axis, whose baseline is whatever direction the mount is
+    heading.  So sign(sh) alone says nothing: this log has sh at 170, -146,
+    3.8 ... all in one fight.  (The older "112/112 opposite" reading came from
+    a fight where the mount happened to hold one heading; that was luck.)
+
+    Baseline removal instead: if the sign is right, sh = base - want, so
+    (sh + want) is the slowly varying base; if the sign is flipped,
+    (sh - want) is.  Compare the frame-to-frame jitter of both candidates on
+    ADJACENT samples only, and use the median - the mean is dominated by the
+    pairs where the mount really did turn between two samples.
+    """
+    rows = [(f, w, sh) for (w, sh, d, on, msk, host, ok, f) in s.twist
+            if ok and w is not None and sh is not None and f is not None]
+    rows.sort()
+    if len(rows) < 8:
+        return None
+    gaps = [b[0] - a[0] for a, b in zip(rows, rows[1:]) if b[0] > a[0]]
+    if not gaps:
+        return None
+    step = min(gaps)                      # = kRideTwistLogGap
+    plus, minus = [], []
+    for (f0, w0, s0), (f1, w1, s1) in zip(rows, rows[1:]):
+        if f1 - f0 != step:
+            continue
+        plus.append(abs(wrap180((s1 + w1) - (s0 + w0))))
+        minus.append(abs(wrap180((s1 - w1) - (s0 - w0))))
+    if len(plus) < 8:
+        return None
+    med = lambda v: sorted(v)[len(v) // 2]
+    return (len(plus), med(plus), med(minus),
+            sum(1 for a, b in zip(plus, minus) if a < b), step)
+
+
 def report_twist(s):
     print("")
     print("== T1 - twist sign and target distance ==")
@@ -304,7 +521,8 @@ def report_twist(s):
     scored = 0
     far = 0
     notgt = 0
-    for want, sh, d, on, msk, host in s.twist:
+    noread = 0
+    for want, sh, d, on, msk, host, shok, f in s.twist:
         # d = -1.0 is the "no target at all" sentinel, not a distance.
         if d is not None and d < 0.0:
             notgt += 1
@@ -312,21 +530,51 @@ def report_twist(s):
             dstat.add(d)
             if d is not None and d > 60.0:
                 far += 1
+        if not shok:
+            noread += 1
+            continue
         if want is not None and sh is not None and abs(want) > 5.0:
             scored += 1
             if (want > 0) == (sh > 0):
                 same_sign += 1
     print("  samples=%d   d= %s   d>60: %d   no-target(d=-1): %d"
           % (len(s.twist), dstat, far, notgt))
-    print("  |want|>5 samples=%d, same-sign as sh=%d" % (scored, same_sign))
-    if not scored:
-        print("  CHECK no |want|>5 sample - the twist sign was never exercised")
-        print("        (the fight stayed in front of the rider).  This is not a"
-              " pass.")
+    print("  NOTE  want= is the APPLIED (low-passed) twist, raw= is the raw"
+          " target.")
+    print("        TWIST f= counts gLegPoseFrames; STANCE f= is the global frame."
+          "  Two")
+    print("        different counters - line them up by timestamp, never by f=.")
+    if noread and noread == len(s.twist):
+        print("  CHECK every sample has sh=<x>/0 = both UpperArm bones failed to"
+              " read.")
+        print("        The sign criterion is unmeasured, not passed.")
+        return
+    res = twist_sign_test(s)
+    if res is None:
+        print("  CHECK too few adjacent sh samples to test the sign"
+              " (|want|>5 rows: %d)." % scored)
+        print("        Unmeasured, not passed.")
     else:
-        print("  " + verdict(same_sign == 0,
-                             "want and sh stay opposite in sign"
-                             " (same sign => flip kRideTwistSign, one constant)"))
+        n, mp, mm, wins, step = res
+        print("  sign test (baseline removed, %d adjacent pairs %d frames apart):"
+              % (n, step))
+        print("    median jitter of sh+want = %.1f deg   <- the rider's facing if"
+              " the sign is RIGHT" % mp)
+        print("    median jitter of sh-want = %.1f deg   <- the rider's facing if"
+              " it is FLIPPED" % mm)
+        print("    sh+want is the smoother one on %d of %d pairs" % (wins, n))
+        print("  " + verdict(mp < mm,
+                             "the applied twist opposes the shoulder line"
+                             " (kRideTwistSign is correct; if sh-want were the"
+                             " smooth one, flip that one constant)"))
+    print("  raw sign tally, INFORMATIONAL ONLY: |want|>5 samples=%d, same sign"
+          " as sh=%d" % (scored, same_sign))
+    print("        sh is an ABSOLUTE world angle (the rider's lateral axis"
+          " follows the")
+    print("        mount's heading), so a same-sign row is not a fault by"
+          " itself - it")
+    print("        just means the baseline was past +-90 there.  Judge by the"
+          " test above.")
 
 
 
@@ -341,14 +589,23 @@ def report_legs(s):
         return
     print("  takeovers=%d  restored-on-dismount=%d  released mid-ride=%d"
           % (len(s.takeovers), s.restored, len(s.released)))
-    print("  " + verdict(len(s.takeovers) == s.restored,
-                         "every takeover was handed back on dismount"
-                         " (a mismatch = a leg left at 45 deg)"))
+    # A mid-ride release IS a handback (setManuallyControlled(false) + reset),
+    # so the balance to check is takeovers == restored + released.  Comparing
+    # takeovers against restored alone reports a balanced run as broken.
+    print("  " + verdict(len(s.takeovers) == s.restored + len(s.released),
+                         "every takeover was handed back"
+                         " (restored + released must equal takeovers;"
+                         " a shortfall = a leg left at 45 deg)"))
     print("  " + verdict(not s.released,
                          "no mid-ride release"
                          + ("" if not s.released else
-                            " - grace values: " + ", ".join(
-                                r.get("grace", "?") for r in s.released[:8]))))
+                            " - grace/f: " + ", ".join(
+                                "t=%s grace=%s f=%s%s"
+                                % (r.get("_ts", "?"),
+                                   r.get("grace", "?").rstrip(")"),
+                                   r.get("f", "?").rstrip(")"),
+                                   " DOWN" if in_down(s, r.get("_ts")) else "")
+                                for r in s.released[:8]))))
     print("  kept: %s   not-1.0000 samples=%d" % (s.kept, s.kept_bad))
     if not s.kept.n:
         print("  CHECK no kept= sample - that row is budgeted AND gated on"
@@ -360,12 +617,76 @@ def report_legs(s):
                              " (anything less = the blend mask missed a"
                              " contributor; compare msk=)"))
 
+    # The bad samples themselves.  These used to be invisible, and the takeover
+    # dump below sat right under the CHECK where it read as if IT were the list
+    # of bad samples - it is not, it is one row per mount.
+    if s.kept_bad_rows:
+        print("  the not-1.0000 samples (t= lines these up against STANCE,"
+              " 'released' and down=):")
+        for f, bone, k, abd, flx, t in s.kept_bad_rows:
+            print("    t=%s f=%s %-16s kept=%.4f abd=%s flx=%s%s"
+                  % (t, "?" if f is None else "%d" % f, bone, k, abd, flx,
+                     "   <- rider DOWN" if in_down(s, t) else ""))
+
+    # 2026-08-31: the knockdown correlation.  This is the diagnosis, and it is
+    # computed rather than asserted, because the first (wrong) reading of the
+    # same data blamed the route-A stance handover - the stance drops merely
+    # happened to be nearby.
+    if s.down_spans and (s.kept_bad_rows or s.released):
+        print("  knockdown windows (P3CMB down=1, merged): "
+              + ", ".join("%.0f-%.0f" % (a, b) for a, b in s.down_spans[:12]))
+        bad_in = sum(1 for r in s.kept_bad_rows if in_down(s, r[5]))
+        rel_in = sum(1 for r in s.released if in_down(s, r.get("_ts")))
+        allin = (bad_in == len(s.kept_bad_rows)
+                 and rel_in == len(s.released)
+                 and (s.kept_bad_rows or s.released))
+        print("        bad kept inside a window: %d/%d   releases inside one:"
+              " %d/%d" % (bad_in, len(s.kept_bad_rows),
+                          rel_in, len(s.released)))
+        if allin:
+            print("        => CAUSE IS THE RIDER BEING KNOCKED OUT, not the"
+                  " stance/pose handover.")
+            print("           LegPosePass has no isDown()/isDead() guard: the"
+                  " knockdown clips take")
+            print("           the skeleton, our maskable host disappears, and"
+                  " the grace branch's")
+            print("           bare return skips LegMaskApply - so an UNMASKED"
+                  " clip rotates our")
+            print("           manually controlled thighs (a manual bone"
+                  " survives Skeleton::reset()")
+            print("           but still receives NodeAnimationTrack::applyToNode)."
+                  "  12 such frames")
+            print("           exhaust the grace and release.  Fix belongs in the"
+                  " NEXT build: bail")
+            print("           cleanly on isDown()||isDead() and re-arm on"
+                  " stand-up.")
+        elif bad_in or rel_in:
+            print("        => PARTIAL correlation.  The ones outside a window"
+                  " need their own")
+            print("           explanation - do not fold them into the knockdown"
+                  " story.")
+        else:
+            print("        => NO correlation with knockdowns.  This is a"
+                  " different defect from the")
+            print("           2026-08-31 one; go read POSEDUMP and the host="
+                  " field before concluding.")
+    elif s.kept_bad_rows or s.released:
+        print("  no P3CMB down=1 row at all, so the knockdown correlation could"
+              " not be tested")
+        print("        (that probe is gated on Ctrl+NUM. too) - absence here is"
+              " unmeasured, not clean.")
+
+    print("  takeover rows - ONE PER MOUNT, not the kept samples above:")
     for t in s.takeovers:
         print("    abd=%s flx=%s rad=%s torso=%s host=%s hw=%s msk=%s calf=%s"
               " stance=%s twist=%s" % (
                   t.get("abd"), t.get("flx"), t.get("rad"), t.get("torso"),
                   t.get("host"), t.get("hw"), t.get("msk"), t.get("calf"),
                   t.get("stance"), t.get("twist")))
+    print("        msk= is how many weighted clips got a mask this frame."
+          "  It is NOT a")
+    print("        defect marker: a plain ride has 2 (pose + whatever is fading)."
+          "  Judge by kept.")
 
 
 def report_pose(s):
@@ -498,6 +819,7 @@ def main(argv):
     s = Session()
     lines = parse(path, s)
     report_rides(s)
+    report_combat(s)
     report_stance(s)
     report_twist(s)
     report_tuned(s, cfg)

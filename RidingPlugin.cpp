@@ -3791,10 +3791,16 @@ static AnimationData* FindAnimData(AnimationClass* rAnim, const char* name)
 }
 
 // P4-2: how many ATTACK rows the animal's own animation list holds.  The mount's list is a
-// per-race one (getAnimationDatasList()), NOT the character list P1 enumerated - P1 found the
-// HUMAN list's `attacks` empty, which says nothing about animals.  "Does the small tier have
-// attack material at all" is a precondition for 「坐骑也出手」: if this reads 0 the mount cannot
-// swing no matter what we order it to do, and the both-sides ruling collapses to rider-only.
+// per-race one (getAnimationDatasList()), NOT the character list P1 enumerated.
+// ⚠️ 2026-08-31, three independent facts: `attacks` IS EMPTY FOR EVERY SPECIES, so 0 here is
+// NOT evidence that the animal cannot swing, and must NEVER trigger a per-species fallback.
+//   1. tools\gamedata.py --type 5: no ANIMAL ANIM record carries attack rows for anybody.
+//   2. --tech: 加鲁兽 itself owns `gar attack legs` / `gar attack long`, i.e. the attack material
+//      exists as COMBAT TECHNIQUE + bare skeleton tracks, in a container this lektor never sees.
+//   3. 43/44 techniques name a clip that has no ANIMATION record at all (see RE_NOTES §19).
+// The 2026-08-31 trip confirmed the behaviour side too: `mAtk=0` on all 7 mounts while P3CMB
+// logged mTgt=1 on 178 rows - 坐骑护主 fired regardless.  So this stays a pure diagnostic field:
+// it tells you which container you are reading, not what the animal can do.
 // Returns -1 for "could not read" so a failed read never looks like a real zero.
 static int AnimListAttackCount(AnimationClass* anim)
 {
@@ -4015,9 +4021,18 @@ static const float kRideTwistLerp     = 0.12f;  // per-frame low pass, see below
 // coefficient stops meaning anything).  This one lives in LegPosePassImpl, which runs exactly
 // once per frame from HaltAndForceSitPass.  It exists because the target can change instantly -
 // without it a target swap snaps the head and sword across in one frame.
-// ✅ SIGN MEASURED AND CORRECT (2026-08-30, P4-1M in game): 115 TWIST samples, of the 112 with
-// |want| > 5 deg, want and sh had OPPOSITE signs on **112 of 112** - exactly the reading rule
-// below.  Player confirmed "上半身侧向敌人（可以侧前方砍）".  Do not flip this.
+// ✅ SIGN MEASURED AND CORRECT - but NOT by the sign-comparison rule this comment used to cite.
+// ⚠️ sh= is an ABSOLUTE world-space angle (ATan2 of the L-R UpperArm vector), NOT a twist delta,
+// and its baseline is the rider's world facing, which ApplyRiderOrientation slaves to the mount's
+// heading.  So "want and sh have opposite signs" only holds while the mount happens to hold one
+// heading; the 2026-08-30 「112/112 反号」 was a single constant-heading fight and is NOT a rule.
+// THE VALID TEST IS BASELINE REMOVAL: if the sign is right then sh = base - want, so sh+want is
+// the slowly varying baseline and sh-want is the jumpy one (and vice versa if it is wrong).
+// 2026-08-31, 280 samples with |want| > 5 across several fights and headings, adjacent pairs
+// wrapped to +-180: median jitter sh+want 3.9 deg vs sh-want 41.6 deg, and sh+want was the
+// smoother of the two on 172/280 pairs => this sign is CORRECT.  Player confirmed
+// "上半身侧向敌人（可以侧前方砍）".  Do not flip it, and do not re-derive it from raw sign pairs;
+// tools\ridelog.py runs the baseline-removal test for you.
 static const float kRideTwistSign     = 1.0f;
 // TWIST sampling is deliberately DENSER than the leg sampling (300 frames): the sign question
 // only has an answer while a fight is actually running, and a fight is a few seconds long.
@@ -4486,6 +4501,23 @@ static void LegPosePassImpl(AnimationClass* rAnim, AnimationData* poseData, Char
         // bone survives Skeleton::reset(), so the pose we wrote last frame simply stays.  We
         // must not WRITE either - without a mask a write renders as "ours o theirs"
         // (kept=0.764) - hence a bare return rather than falling through.
+        //
+        // ⚠️ NEXT-BUILD ITEM (2026-08-31 measured, P4-1N trip; do not "fix" this by widening the
+        // grace).  The bare return above is only safe against a MISSING host.  It is NOT safe
+        // when a host exists but is a KNOCKDOWN clip: this pass has no isDown()/isDead() guard,
+        // so while the rider is out cold the fall/prone clips own the skeleton, our thighs stay
+        // manually controlled, and - because we returned early - LegMaskApply never ran, so those
+        // clips are UNMASKED.  A manual bone survives Skeleton::reset() but still receives
+        // NodeAnimationTrack::applyToNode, so they rotate our thighs anyway.
+        // Evidence: ALL 12 sub-1.0 kept samples (worst 0.8900 ~ 54 deg, one raw row rendering the
+        // thigh backwards at out=-1.80 fore=-2.98) AND BOTH grace-exhausted releases
+        // (f=48286, f=56710) fall inside the three P3CMB down=1 windows 537-554 / 561-570 /
+        // 677-705; the other five rides of that trip were kept=1.0000 throughout.
+        // ridelog.py computes this correlation now, so do not re-derive it by hand.
+        // Intended fix: bail CLEANLY on rider->isDown() || isDead() (restore at once, then re-arm
+        // on stand-up) instead of rendering up to kLegHostGraceFrames contaminated frames.
+        // The competing reading - "releasing a downed rider is already right, only the
+        // contaminated frames are the defect" - reaches the same code change.
         if (gLegPoseArmed && gLegHostGrace < kLegHostGraceFrames)
         {
             ++gLegHostGrace;
@@ -4672,9 +4704,10 @@ static void LegPosePassImpl(AnimationClass* rAnim, AnimationData* poseData, Char
         // so the back renders as bind o yaw - straight. Capture-and-replay (the calf trick)
         // was deliberately NOT used here: the spine's interesting frames are mid-crossfade,
         // and a snapshot taken then bakes a blend into a frozen pose.
-        // ⚠️ The rotation SIGN about local +X is the one unmeasured fact in this build; the
-        // TWIST line below prints the requested angle next to the shoulder-line rotation it
-        // actually produced, and kRideTwistSign flips it in one constant if they disagree.
+        // ✅ The rotation SIGN about local +X is now MEASURED (2026-08-31, baseline-removal test
+        // on 280 samples - see kRideTwistSign): it is correct.  ⚠️ Do NOT re-check it by comparing
+        // the signs of want= and sh= frame by frame; sh= is an absolute world angle, so that
+        // comparison only means anything while the mount holds one heading.
         if (twistOn)
         {
             // Refill the log budget on the edge, i.e. once per fight rather than once per
@@ -4717,10 +4750,15 @@ static void LegPosePassImpl(AnimationClass* rAnim, AnimationData* poseData, Char
         // v = L shoulder - R shoulder points along skeleton +X (= the rider's LEFT) at rest,
         // so sh = atan2(v.z, v.x) is 0 when squared up.  A yaw of +phi about +Y (which takes
         // forward +Z toward +X) rotates that line to (cos phi, 0, -sin phi) => sh = -phi.
-        // ⚠️ READ IT LIKE THIS: want=+30 (target on the rider's left) should come with
-        // sh ~= -30.  Same sign on both => we are turning AWAY from the target; flip
-        // kRideTwistSign.  |sh| far below |want| => the mask is not covering some contributor
-        // that still owns the spine (cross-check msk= on the takeover line).
+        // ⚠️ READ IT LIKE THIS - and NOT by comparing signs: sh is an ABSOLUTE WORLD angle, so
+        // it carries the rider's own facing (= the mount's heading) as a baseline, and
+        // sh = baseline - want.  Opposite signs therefore prove nothing on their own: they only
+        // appear when the baseline happens to sit near 0, and the 2026-08-30 「112/112 反号」 was
+        // one constant-heading fight.  The valid criterion is BASELINE REMOVAL: sh+want should be
+        // the slowly varying series and sh-want the jumpy one.  tools\ridelog.py runs that test
+        // (adjacent samples, wrapped to +-180) and reported 3.9 vs 41.6 deg median jitter on
+        // 2026-08-31 => the sign is right.  |sh| far below |want| still means what it did: the
+        // mask is not covering some contributor that owns the spine (cross-check msk=).
         if (debugContinuous && gLegTwistBudget > 0
             && (gLegPoseFrames % kRideTwistLogGap) == 0)
         {
