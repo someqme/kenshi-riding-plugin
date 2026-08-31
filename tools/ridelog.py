@@ -153,6 +153,13 @@ class Session(object):
         self.kept = Stat()
         self.kept_bad = 0        # samples not 1.0000
         self.kept_bad_rows = []  # (f, bone, kept, abd, flx, ts) for the bad ones
+        # First/last timestamp a kept= sample was taken at.  Needed to tell a
+        # real "no bad kept inside the knockdown window" from a VACUOUS one: the
+        # kept row is budgeted, so on the 2026-08-31 fourth trip the sampling
+        # stopped at 100.756 s while the knockdown happened at 156 s - an empty
+        # set, not evidence.
+        self.kept_t0 = None
+        self.kept_t1 = None
         self.stance = []         # (state, f, cm, d, hold) in order
         self.twist = []          # (want, sh, d, on, msk, host, shok, f)
         self.tuned = []          # (species, key or None)
@@ -175,6 +182,8 @@ class Session(object):
         self.cmb_rtgt = 0        # rider holds an attack target
         self.cmb_mtgt = 0        # mount holds an attack target (= 坐骑护主 fired)
         self.cmb_down = 0        # rider knocked down while mounted
+        self.cmb_up = 0          # P3CMB rows that explicitly said down=0
+        self.up_ts = []          # their timestamps (to test "did he stand up?")
         self.cmb_dr3 = Stat()    # nearest attacker to the rider's logical pos
         self.pose_w = Stat()
         self.pose_1 = 0          # weight >= 0.995
@@ -240,12 +249,25 @@ def parse(path, s):
             if "LEGPOSE released" in line:
                 d = kv(line)
                 d["_ts"] = ts(line)
+                # Two completely different events share this line.  "(rider down)"
+                # is the isDown()/isDead() guard of DLL 301056 B collecting its
+                # own bones on purpose - it is the FIX firing, not a fault.  A
+                # grace= release is the host-lost branch giving up after 12
+                # frames, which is the one worth chasing.  Never judge them as
+                # one bucket.
+                d["_why"] = "down" if "(rider down)" in line else "grace"
                 s.released.append(d)
                 continue
             if "kept=" in line:
                 d = kv(line)
                 k = fnum(d, "kept")
                 s.kept.add(k)
+                kt = ts(line)
+                if kt != "?":
+                    kt = float(kt)
+                    if s.kept_t0 is None:
+                        s.kept_t0 = kt
+                    s.kept_t1 = kt
                 if k is not None and abs(k - 1.0) > 0.0005:
                     s.kept_bad += 1
                     # Keep the identity of the bad ones.  Without f= and the bone
@@ -298,6 +320,13 @@ def parse(path, s):
                 if d.get("down") == "1":
                     s.cmb_down += 1
                     add_down(s, line)
+                elif d.get("down") == "0":
+                    # Counted so the merged-window printer can tell "the rider
+                    # stood up" from "the probe simply did not log for a while".
+                    s.cmb_up += 1
+                    t = ts(line)
+                    if t != "?":           # ts() returns "?", never None
+                        s.up_ts.append(float(t))
                 dr = fnum(d, "dR3")
                 if dr is not None and dr >= 0.0:
                     s.cmb_dr3.add(dr)
@@ -648,16 +677,35 @@ def report_legs(s):
                          "every takeover was handed back"
                          " (restored + released must equal takeovers;"
                          " a shortfall = a leg left at 45 deg)"))
-    print("  " + verdict(not s.released,
-                         "no mid-ride release"
-                         + ("" if not s.released else
+    # Split the releases by reason before judging them.  Since DLL 301056 B a
+    # "(rider down)" release is the isDown()/isDead() guard collecting its own
+    # bones on purpose - the FIX firing, and the expected shape for any trip
+    # where the rider gets knocked out.  Only a grace= release (host lost for
+    # 12 straight frames) is a fault.  Judging them as one bucket reports a
+    # correct guard as a defect.
+    rel_down = [r for r in s.released if r.get("_why") == "down"]
+    rel_grace = [r for r in s.released if r.get("_why") != "down"]
+    print("  " + verdict(not rel_grace,
+                         "no host-lost (grace=) release"
+                         + ("" if not rel_grace else
                             " - grace/f: " + ", ".join(
                                 "t=%s grace=%s f=%s%s"
                                 % (r.get("_ts", "?"),
                                    r.get("grace", "?").rstrip(")"),
                                    r.get("f", "?").rstrip(")"),
                                    " DOWN" if in_down(s, r.get("_ts")) else "")
-                                for r in s.released[:8]))))
+                                for r in rel_grace[:8]))))
+    if rel_down:
+        print("  INFO %d release(s) read '(rider down)' = the 301056 B"
+              " isDown()/isDead() guard" % len(rel_down))
+        print("       firing as designed, at t=%s."
+              % ", ".join(str(r.get("_ts", "?")) for r in rel_down[:8]))
+        print("       That is a PASS, not a fault: the alternative is unmasked"
+              " knockdown clips")
+        print("       rotating our manually controlled thighs.  Expect the"
+              " matching re-arm on")
+        print("       stand-up (or the next mount) and no bad kept in that"
+              " window.")
     print("  kept: %s   not-1.0000 samples=%d" % (s.kept, s.kept_bad))
     if not s.kept.n:
         print("  CHECK no kept= sample - that row is budgeted AND gated on"
@@ -680,48 +728,103 @@ def report_legs(s):
                   % (t, "?" if f is None else "%d" % f, bone, k, abd, flx,
                      "   <- rider DOWN" if in_down(s, t) else ""))
 
-    # 2026-08-31: the knockdown correlation.  This is the diagnosis, and it is
-    # computed rather than asserted, because the first (wrong) reading of the
-    # same data blamed the route-A stance handover - the stance drops merely
-    # happened to be nearby.
+    # 2026-08-31: the knockdown correlation.  Computed rather than asserted,
+    # because the first (wrong) reading of the same data blamed the route-A
+    # stance handover - the stance drops merely happened to be nearby.  Since
+    # DLL 301056 B the EXPECTED shape inside a knockdown window changed: one
+    # "released (rider down)" line and NO bad kept, because the guard hands the
+    # thighs back before an unmasked knockdown clip can rotate them.
     if s.down_spans and (s.kept_bad_rows or s.released):
         print("  knockdown windows (P3CMB down=1, merged): "
               + ", ".join("%.0f-%.0f" % (a, b) for a, b in s.down_spans[:12]))
+        # A gap between two merged spans is NOT a stand-up unless a down=0 row
+        # actually sits in it.  The probe is throttled and can simply stop
+        # logging for a while: on the 2026-08-31 fourth trip the 242-253 gap
+        # held 3 rows and all 3 said down=1.
+        for i in range(len(s.down_spans) - 1):
+            g0, g1 = s.down_spans[i][1], s.down_spans[i + 1][0]
+            ups = [t for t in s.up_ts if g0 < t < g1]
+            print("        gap %.0f-%.0f: %s"
+                  % (g0, g1,
+                     ("%d down=0 row(s) in it -> he really stood up here"
+                      % len(ups)) if ups else
+                     "no down=0 row in it -> ROW GAP, not a stand-up"))
+        # "Did he ever get back up?" is asked about the time AFTER the first
+        # knockdown began - down=0 rows from before it only say he started the
+        # ride on his feet.  On the fourth trip 121/121 rows from 160 s to the
+        # 260.972 s dismount said down=1, so re-arm-after-stand-up went
+        # unexercised (which is fine: re-arm is the ordinary takeover
+        # fall-through, takeover = !gLegPoseArmed, not new code).
+        if not [t for t in s.up_ts if t > s.down_spans[0][0]]:
+            print("        no P3CMB down=0 row after the first knockdown:"
+                  " nothing here shows him")
+            print("        getting back up, so 're-arm after stand-up' is"
+                  " UNEXERCISED (not failed -")
+            print("        re-arm is the ordinary takeover fall-through, not new"
+                  " code).")
         bad_in = sum(1 for r in s.kept_bad_rows if in_down(s, r[5]))
-        rel_in = sum(1 for r in s.released if in_down(s, r.get("_ts")))
-        allin = (bad_in == len(s.kept_bad_rows)
-                 and rel_in == len(s.released)
-                 and (s.kept_bad_rows or s.released))
-        print("        bad kept inside a window: %d/%d   releases inside one:"
-              " %d/%d" % (bad_in, len(s.kept_bad_rows),
-                          rel_in, len(s.released)))
-        if allin:
-            print("        => CAUSE IS THE RIDER BEING KNOCKED OUT, not the"
-                  " stance/pose handover.")
-            print("           LegPosePass has no isDown()/isDead() guard: the"
-                  " knockdown clips take")
-            print("           the skeleton, our maskable host disappears, and"
-                  " the grace branch's")
-            print("           bare return skips LegMaskApply - so an UNMASKED"
-                  " clip rotates our")
-            print("           manually controlled thighs (a manual bone"
-                  " survives Skeleton::reset()")
-            print("           but still receives NodeAnimationTrack::applyToNode)."
-                  "  12 such frames")
-            print("           exhaust the grace and release.  Fix belongs in the"
-                  " NEXT build: bail")
-            print("           cleanly on isDown()||isDead() and re-arm on"
-                  " stand-up.")
-        elif bad_in or rel_in:
-            print("        => PARTIAL correlation.  The ones outside a window"
-                  " need their own")
-            print("           explanation - do not fold them into the knockdown"
-                  " story.")
+        gr_in = sum(1 for r in rel_grace if in_down(s, r.get("_ts")))
+        dn_in = sum(1 for r in rel_down if in_down(s, r.get("_ts")))
+        print("        inside a window: bad kept %d/%d   grace= releases %d/%d"
+              "   (rider down) releases %d/%d"
+              % (bad_in, len(s.kept_bad_rows), gr_in, len(rel_grace),
+                 dn_in, len(rel_down)))
+        # Vacuity check.  kept= is budgeted, so "0 bad kept in a window" can be
+        # an empty set instead of a result - exactly what happened on the fourth
+        # trip (sampling ended 100.756 s, knockdown at 156 s).
+        kept_over = True
+        if s.kept_t0 is not None:
+            over = [1 for a, b in s.down_spans
+                    if not (b < s.kept_t0 or a > s.kept_t1)]
+            kept_over = bool(over)
+            print("        kept sampling ran %.3f-%.3f s and %s a knockdown"
+                  " window"
+                  % (s.kept_t0, s.kept_t1,
+                     "overlaps" if over else "NEVER overlaps"))
+            if not over:
+                print("        => the bad-kept count above is an EMPTY SET, not"
+                      " evidence: the budget ran")
+                print("           out before the knockdown.  Judge the guard by"
+                      " the released line plus")
+                print("           'nothing writes those bones after a release'.")
+        if bad_in or gr_in:
+            if bad_in == len(s.kept_bad_rows) and gr_in == len(rel_grace):
+                print("        => KNOCKDOWN-CORRELATED, and with DLL 301056 B"
+                      " that means the")
+                print("           isDown()/isDead() guard did NOT hold.  Do NOT"
+                      " widen the grace - that")
+                print("           only buys more polluted frames.  Check that"
+                      " the riderDown branch really")
+                print("           sits BEFORE '---- gate + mask ----' and that"
+                      " isDown() is read on the")
+                print("           rider (an unmasked knockdown clip rotates our"
+                      " manual thighs: a manual")
+                print("           bone survives Skeleton::reset() but still"
+                      " receives applyToNode).")
+            else:
+                print("        => PARTIAL correlation.  The ones outside a"
+                      " window need their own")
+                print("           explanation - do not fold them into the"
+                      " knockdown story.")
         else:
-            print("        => NO correlation with knockdowns.  This is a"
-                  " different defect from the")
-            print("           2026-08-31 one; go read POSEDUMP and the host="
-                  " field before concluding.")
+            print("        => clean inside the windows.  With DLL 301056 B that"
+                  " is the DESIGNED shape:")
+            print("           the guard releases the thighs the moment the rider"
+                  " goes down, so no")
+            print("           unmasked knockdown clip ever gets to rotate them,"
+                  " and the '(rider down)'")
+            print("           release above is the fix firing - not a fault.")
+            if not kept_over:
+                print("           (Resting on the release line alone - see the"
+                      " EMPTY SET note: kept was")
+                print("            not being sampled during the knockdown.)")
+            if s.kept_bad_rows or rel_grace:
+                print("        NOTE every bad kept / grace= release in this log"
+                      " sits OUTSIDE the")
+                print("             knockdown windows, so they need their own"
+                      " explanation: go read")
+                print("             POSEDUMP and the host= field before"
+                      " concluding.")
     elif s.kept_bad_rows or s.released:
         print("  no P3CMB down=1 row at all, so the knockdown correlation could"
               " not be tested")
