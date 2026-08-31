@@ -156,6 +156,16 @@ class Session(object):
         self.stance = []         # (state, f, cm, d, hold) in order
         self.twist = []          # (want, sh, d, on, msk, host, shok, f)
         self.tuned = []          # (species, key or None)
+        # Input-chain diagnostics (DLL 301056 B and later).  The 2026-08-31 trip
+        # reported "pressed the tune keys, the seat did not move" with a log that
+        # said NOTHING: no 'input ... fired', no 'tuned', not even the tune gate's
+        # own rejection line.  These four fields turn the next trip's answer into
+        # a table instead of a hand-grep.
+        self.rawkeys = []        # (kc, mask, ce, cmd) one per fresh press
+        self.fired = []          # command names from "input '<name>' fired"
+        self.ce = []             # controlEnabled transitions, in order
+        self.rejects = {}        # rejection reason -> count
+        self.bindings = None     # last "bindings resolved [...]" payload
         # P3CMB combat probe.  WARNING: this line's rAtk=/mAtk= are ATTACKER
         # COUNTS (getAllAttackers), nothing to do with the mount line's mAtk=
         # (the per-race attacks lektor).  Same spelling, unrelated meanings.
@@ -253,7 +263,14 @@ def parse(path, s):
                 d = kv(line)
                 st = line.split("STANCE", 1)[1].strip().split()[0]
                 s.stance.append((st, d.get("f", "?"), d.get("cm", "?"),
-                                 fnum(d, "d"), d.get("hold", "?")))
+                                 fnum(d, "d"),
+                                 # holdms= is wall-clock ms (DLL 301056 B and later);
+                                 # hold= was frames up to and including 297472 B.  Echoed
+                                 # either way - the tool never compares it to a threshold,
+                                 # and the acceptance test is "1 -> 0 was observed", never
+                                 # a number of seconds.
+                                 d.get("holdms", d.get("hold", "?")),
+                                 "ms" if "holdms" in d else "f"))
                 continue
             if "Riding: TWIST" in line:
                 d = kv(line)
@@ -284,6 +301,25 @@ def parse(path, s):
                 dr = fnum(d, "dR3")
                 if dr is not None and dr >= 0.0:
                     s.cmb_dr3.add(dr)
+                continue
+            if "Riding: RAWKEY" in line:
+                d = kv(line)
+                s.rawkeys.append((d.get("kc", "?"), d.get("mask", "?"),
+                                  d.get("ce", "?"), d.get("cmd", "-")))
+                continue
+            if "Riding: input '" in line:
+                s.fired.append(line.split("input '", 1)[1].split("'", 1)[0])
+                continue
+            if "Riding: controlEnabled ->" in line:
+                s.ce.append(line.rsplit(">", 1)[1].strip())
+                continue
+            if "Riding: seat-tuning key ignored" in line:
+                why = line.split("ignored", 1)[1].strip(" -")
+                s.rejects[why] = s.rejects.get(why, 0) + 1
+                continue
+            if "Riding: bindings resolved" in line:
+                if "[" in line and "]" in line:
+                    s.bindings = line.split("[", 1)[1].rsplit("]", 1)[0].strip()
                 continue
             m = TUNED.match(line.strip()) or TUNED.search(line)
             if m:
@@ -401,14 +437,20 @@ def report_stance(s):
         return
     trans = []
     prev = None
-    for st, f, cm, d, hold in s.stance:
+    for st, f, cm, d, hold, unit in s.stance:
         if st != prev:
-            trans.append((prev, st, f, cm, d, hold))
+            trans.append((prev, st, f, cm, d, hold, unit))
             prev = st
-    for a, b, f, cm, dd, hold in trans:
-        print("  %s -> %s  at f=%s  cm=%s d=%s hold=%s" % (
+    for a, b, f, cm, dd, hold, unit in trans:
+        print("  %s -> %s  at f=%s  cm=%s d=%s %s=%s" % (
             a if a is not None else "start", b, f, cm,
-            "-" if dd is None else "%.1f" % dd, hold))
+            "-" if dd is None else "%.1f" % dd,
+            "holdms" if unit == "ms" else "hold(frames)", hold))
+    units = set(t[6] for t in trans)
+    if units == set(["f"]):
+        print("        (hold= is FRAMES here => this log predates DLL 301056 B;"
+              " the tail")
+        print("         was 150 frames = 150/fps seconds, so ~5 s at 30 fps.)")
     down = [t for t in trans if t[0] == "1" and t[1] == "0"]
     up = [t for t in trans if t[1] == "1"]
     print("  STANCE lines=%d  entries(->1)=%d  exits(1->0)=%d"
@@ -427,9 +469,12 @@ def report_stance(s):
         print("  FIRST THING TO LOOK AT: the d= on the stuck line above.")
         print("    small d  -> RideNearestThreat is counting a body"
               " (isDown/isDead miss)")
-        print("    large d  -> kRideStanceHoldFrames is not being decremented"
-              " (only")
-        print("                HaltAndForceSitPass passes advance=true)")
+        print("    large d  -> the hold budget is not being drained (only"
+              " HaltAndForceSitPass")
+        print("                passes advance=true; since 301056 B it drains by"
+              " GetTickCount")
+        print("                deltas, and a paused game deliberately drains"
+              " nothing)")
 
 
 def report_combat(s):
@@ -728,6 +773,70 @@ def report_pose(s):
               " ramp unless you skip it" % s.posedump)
 
 
+def report_input(s):
+    """Why a hotkey did nothing.  Added after the 2026-08-31 trip, where the
+    player pressed the seat keys and the log held no evidence of any press at
+    all - the per-press trace is debugContinuous-gated AND is evaluated before
+    the debug toggle, and the tune gate logged only one of its three rejections.
+    The DLL now emits RAWKEY / controlEnabled / an explicit rejection reason."""
+    print("")
+    print("== input chain - only meaningful on DLL 301056 B or later ==")
+    if s.bindings is not None:
+        vals = s.bindings.split()
+        print("  bindings resolved: [%s]" % s.bindings)
+        if all(v == "0" for v in vals):
+            print("  " + verdict(False, "every binding is 0 = the map scan found"
+                                        " nothing (registration failed)"))
+    else:
+        print("  no 'bindings resolved' line - it only prints on CHANGE, so one"
+              " per trip")
+        print("  is normal and none at all means HotkeyPass never got that far.")
+    if s.ce:
+        print("  controlEnabled transitions: %s" % " ".join(s.ce))
+        if s.ce[-1] == "0":
+            print("  " + verdict(False, "it ended at 0 = a UI owned the keyboard;"
+                                        " every hotkey was gated off"))
+    if not s.rawkeys:
+        print("  no RAWKEY line.")
+        print("    Either this DLL predates the sniffer, or diagnostics were off"
+              " (it is")
+        print("    debugContinuous-gated), or the window received no key at all"
+              " - and")
+        print("    that last one is exactly the case the sniffer exists to prove.")
+    else:
+        seen = {}
+        for kc, mask, ce, cmd in s.rawkeys:
+            k = (kc, mask)
+            e = seen.setdefault(k, [0, ce, cmd])
+            e[0] += 1
+            e[2] = cmd
+        print("  distinct keys seen=%d, presses=%d (budget 400)"
+              % (len(seen), len(s.rawkeys)))
+        for (kc, mask), (n, ce, cmd) in sorted(seen.items(),
+                                               key=lambda x: -x[1][0])[:24]:
+            print("    kc=%-4s mask=%-5s x%-4d ce=%s cmd=%s"
+                  % (kc, mask, n, ce, cmd))
+        nomap = [k for k, v in seen.items() if v[2] == "-"]
+        print("  " + verdict(not nomap,
+                             "every key pressed resolved to one of our commands"
+                             " (cmd=- means that physical key is bound to"
+                             " nothing of ours - THE answer to 'I pressed it and"
+                             " nothing happened')"))
+    print("  commands fired=%d%s"
+          % (len(s.fired),
+             "" if not s.fired else ":  " + ", ".join(
+                 "%s x%d" % (n, s.fired.count(n))
+                 for n in sorted(set(s.fired)))))
+    if s.rejects:
+        print("  tune gate rejections:")
+        for why, n in sorted(s.rejects.items(), key=lambda x: -x[1]):
+            print("    x%-4d %s" % (n, why[:96]))
+        print("        (a rejection means the KEY WORKED and the selection or the"
+              " seat row")
+        print("         was the problem - a completely different fix from a"
+              " missing RAWKEY.)")
+
+
 def report_tuned(s, cfg):
     print("")
     print("== T3 - X-2: tuning must write to a race row, never a name row ==")
@@ -822,6 +931,7 @@ def main(argv):
     report_combat(s)
     report_stance(s)
     report_twist(s)
+    report_input(s)
     report_tuned(s, cfg)
     report_legs(s)
     report_pose(s)

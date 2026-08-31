@@ -2789,16 +2789,29 @@ static Character* RideNearestThreat(Character* rider, float* distOut)
 //   kRideThreatDist - a live threat must be at least this close.  Generous on purpose (a mounted
 //     fighter circles and re-approaches; getAllAttackers() itself registers out to ~1000u, so
 //     with no distance term at all the list is effectively "has ever fought anyone").
-//   kRideStanceHoldFrames - tail after the last raw frame, so the stance does not flicker in the
-//     gaps between swings or while the target is briefly unresolvable.  ≈1.2 s at 130 fps.
-static const float kRideThreatDist       = 60.0f;
-static const int   kRideStanceHoldFrames = 150;
+//   kRideStanceHoldMs - tail after the last raw frame, so the stance does not flicker in the
+//     gaps between swings or while the target is briefly unresolvable.
+// ⚠️ This tail used to be kRideStanceHoldFrames = 150 DECREMENTED ONCE PER FRAME, i.e. its real
+// length was 150 ÷ framerate: ≈1.15 s on the 130 fps machine it was tuned on, but 2.5 s at 60 fps
+// and ~5 s at 30 fps - and dropping into that range mid-fight is completely normal.  It is a
+// wall-clock budget now (GetTickCount delta, see RideCombatStance), so every machine gets the same
+// 1.2 s.  ⚠️ The acceptance test does NOT become "it went back within N seconds" - it stays
+// "STANCE was observed going 1 -> 0" (TASK.md P4-1N / TEST_REQUIRED.md T1); a seconds threshold
+// just re-imports the framerate dependency into the judging instead of the code.
+static const float kRideThreatDist   = 60.0f;
+static const int   kRideStanceHoldMs = 1200;
+// One frame may never contribute more than this to draining the tail.  A load hitch or an alt-tab
+// hands us a multi-second delta; without the clamp one such frame empties the whole budget and the
+// stance snaps back to the seat pose mid-fight.  A genuinely long stall therefore takes a few
+// frames to drain, which is invisible (no frames were rendered during the stall anyway).
+static const int   kRideStanceStepMaxMs = 250;
 
 // Single-rider state, consistent with the rest of the P4-1 subsystem (gLegPoseArmed,
 // gLegTwistDeg, gLegCalfSnap are all globals too).  gRideStanceWho keeps one rider's tail from
 // leaking into another's - pointer compare only, never dereferenced, so a stale value is safe.
-static int        gRideStanceHold = 0;
+static int        gRideStanceHold = 0;      // MILLISECONDS of tail left (was: frames)
 static Character* gRideStanceWho  = NULL;
+static DWORD      gRideStanceTick = 0;      // GetTickCount() at the last advance=true call
 
 // The raw, stateless predicate.  True => the rider gives the pose channel back and holds a combat
 // stance instead, with the straddle carried entirely by LegPosePass's manual bones.  ⚠️ NO
@@ -2830,9 +2843,31 @@ static bool RideCombatStance(Character* rider, Character* mount, const SeatInfo&
     bool raw = RideStanceRaw(rider, mount, seat);
     bool mine = (rider == gRideStanceWho);
     if (!advance) return raw || (mine && gRideStanceHold > 0);
-    if (!mine) { gRideStanceWho = rider; gRideStanceHold = 0; }
-    if (raw) gRideStanceHold = kRideStanceHoldFrames;
-    else if (gRideStanceHold > 0) --gRideStanceHold;
+    if (!mine) { gRideStanceWho = rider; gRideStanceHold = 0; gRideStanceTick = 0; }
+
+    // Wall-clock step.  DWORD subtraction is wrap-safe, so the 49.7-day GetTickCount rollover
+    // needs no special case (the one tick that lands exactly on 0 just contributes nothing).
+    DWORD now = GetTickCount();
+    int   dt  = 0;
+    if (gRideStanceTick != 0)
+    {
+        DWORD elapsed = now - gRideStanceTick;
+        if (elapsed > (DWORD)kRideStanceStepMaxMs) elapsed = (DWORD)kRideStanceStepMaxMs;
+        dt = (int)elapsed;
+    }
+    gRideStanceTick = now;
+    // ⚠️ A paused game must not drain the tail: same discipline as the capture state machine and
+    // ServicePendingMounts (a pause freezes exactly what this budget is measuring).  The tick is
+    // still refreshed above, so unpausing resumes with a normal-sized delta instead of the whole
+    // pause duration.
+    if (ou && ou->isPaused()) dt = 0;
+
+    if (raw) gRideStanceHold = kRideStanceHoldMs;
+    else if (gRideStanceHold > 0)
+    {
+        gRideStanceHold -= dt;
+        if (gRideStanceHold < 0) gRideStanceHold = 0;
+    }
     return raw || gRideStanceHold > 0;
 }
 
@@ -4417,7 +4452,7 @@ static float RideTwistTargetDeg(Character* rider, AnimationClass* rAnim, bool st
 
     // In stance but nobody identifiable: still twist, by a fixed amount.  A mounted fighter who
     // is squared up dead ahead is exactly the pose the player rejected, and this is also the
-    // normal state during the kRideStanceHoldFrames tail, where a snap back to square-on would
+    // normal state during the kRideStanceHoldMs tail, where a snap back to square-on would
     // be worse than a held twist that then decays.
     if (!tgt) return kRideTwistNoTgtDeg * kRideTwistSign;
 
@@ -4479,6 +4514,32 @@ static void LegPosePassImpl(AnimationClass* rAnim, AnimationData* poseData, Char
         }
     }
 
+    // ---- knocked-out rider: hand the legs back at once -------------------------------
+    // Measured 2026-08-31 (P4-1N trip): every one of the 12 sub-1.0 kept samples (worst
+    // 0.8900 ~ 54 deg of contamination, one row rendering the thigh backwards at
+    // out=-1.80 fore=-2.98) and BOTH grace-exhausted releases landed inside the three
+    // P3CMB down=1 windows; the other five rides were kept=1.0000 throughout.  While the
+    // rider is out cold the fall/prone clips own the skeleton, and the grace branch below
+    // returns BEFORE LegMaskApply -> those clips are unmasked, and a manually controlled
+    // bone survives Skeleton::reset() but still receives NodeAnimationTrack::applyToNode.
+    // So the straddle must not merely be skipped, it must be UNARMED: restore now, re-arm
+    // when the rider stands back up (the normal path re-arms by itself).
+    // ⚠️ Do NOT "fix" this by widening kLegHostGraceFrames - that only renders more
+    // contaminated frames.  A downed rider has no business holding a straddle anyway.
+    bool riderDown = false;
+    try { riderDown = (rider && (rider->isDown() || rider->isDead())); } catch (...) { riderDown = false; }
+    if (riderDown)
+    {
+        if (gLegPoseArmed)
+        {
+            LegPoseRestoreImpl(rAnim, poseData);
+            gLegPoseArmed = false;
+            gLegHostGrace = 0;
+            DebugLog("Riding: LEGPOSE released (rider down) f=" + IntToStr((int)gLegPoseFrames));
+        }
+        return;
+    }
+
     // ---- gate + mask ----------------------------------------------------------------
     // The gate asks "is SOMETHING driving the skeleton", not "is the ride pose weighted"
     // (see LegPoseFindHost): keying it off kRidePose released the legs the moment a combat
@@ -4502,22 +4563,12 @@ static void LegPosePassImpl(AnimationClass* rAnim, AnimationData* poseData, Char
         // must not WRITE either - without a mask a write renders as "ours o theirs"
         // (kept=0.764) - hence a bare return rather than falling through.
         //
-        // ⚠️ NEXT-BUILD ITEM (2026-08-31 measured, P4-1N trip; do not "fix" this by widening the
-        // grace).  The bare return above is only safe against a MISSING host.  It is NOT safe
-        // when a host exists but is a KNOCKDOWN clip: this pass has no isDown()/isDead() guard,
-        // so while the rider is out cold the fall/prone clips own the skeleton, our thighs stay
-        // manually controlled, and - because we returned early - LegMaskApply never ran, so those
-        // clips are UNMASKED.  A manual bone survives Skeleton::reset() but still receives
-        // NodeAnimationTrack::applyToNode, so they rotate our thighs anyway.
-        // Evidence: ALL 12 sub-1.0 kept samples (worst 0.8900 ~ 54 deg, one raw row rendering the
-        // thigh backwards at out=-1.80 fore=-2.98) AND BOTH grace-exhausted releases
-        // (f=48286, f=56710) fall inside the three P3CMB down=1 windows 537-554 / 561-570 /
-        // 677-705; the other five rides of that trip were kept=1.0000 throughout.
-        // ridelog.py computes this correlation now, so do not re-derive it by hand.
-        // Intended fix: bail CLEANLY on rider->isDown() || isDead() (restore at once, then re-arm
-        // on stand-up) instead of rendering up to kLegHostGraceFrames contaminated frames.
-        // The competing reading - "releasing a downed rider is already right, only the
-        // contaminated frames are the defect" - reaches the same code change.
+        // The knockdown case that used to be listed here as a NEXT-BUILD item is handled
+        // ABOVE now (see the riderDown block): a bare return is only safe against a MISSING
+        // host, never against a host that is a knockdown clip, because returning early skips
+        // LegMaskApply and an unmasked clip still reaches our manual bones through
+        // NodeAnimationTrack::applyToNode.  ridelog.py computes the down-window correlation,
+        // so do not re-derive it by hand.
         if (gLegPoseArmed && gLegHostGrace < kLegHostGraceFrames)
         {
             ++gLegHostGrace;
@@ -4779,7 +4830,7 @@ static void LegPosePassImpl(AnimationClass* rAnim, AnimationData* poseData, Char
             char tw[288];
             _snprintf_s(tw, 288, _TRUNCATE,
                 "Riding: TWIST f=%u want=%.1f raw=%.1f on=%d tgt=%d d=%.1f sh=%.1f/%d "
-                "host='%s' msk=%d hold=%d",
+                "host='%s' msk=%d holdms=%d",
                 gLegPoseFrames, gLegTwistDeg, twistWant, twistOn ? 1 : 0,
                 twistTgt ? 1 : 0, twistDist, sh, haveSh ? 1 : 0,
                 host->animName.c_str(), msk, gRideStanceHold);
@@ -4960,6 +5011,7 @@ void Mount(Character* rider, Character* mount)
     gRideStanceOn      = false;
     gRideStanceHold    = 0;                  // P4-1N: no release tail into a new ride
     gRideStanceWho     = NULL;
+    gRideStanceTick    = 0;                  // and no stale wall-clock baseline either
     gP41kResolved      = false;              // P4-1k: re-resolve + re-log the probe clips
     // Route A straddle bookkeeping, per ride.  gLegCalfSnap holds a knee bend captured from
     // whoever rode last, gLegHostLast would swallow the first host line, and a stale mask
@@ -5221,6 +5273,7 @@ void RestoreRideAfterLoad(Character* rider, Character* mount)
     gRideStanceOn      = false;
     gRideStanceHold    = 0;                  // P4-1N: no release tail into a new ride
     gRideStanceWho     = NULL;
+    gRideStanceTick    = 0;                  // and no stale wall-clock baseline either
     gP41kResolved      = false;              // P4-1k: re-resolve + re-log the probe clips
     // Route A straddle bookkeeping, per ride.  gLegCalfSnap holds a knee bend captured from
     // whoever rode last, gLegHostLast would swallow the first host line, and a stale mask
@@ -6111,15 +6164,17 @@ static void HaltAndForceSitPass()
                         if (debugContinuous && (stance ? 1 : 0) != gRideStanceLast)
                         {
                             gRideStanceLast = stance ? 1 : 0;
-                            // d= / hold= are how a stuck stance is diagnosed now: cm=1 with no
+                            // d= / holdms= are how a stuck stance is diagnosed now: cm=1 with no
                             // threat (d=-1) is the engine flag lingering and OUR term doing its
                             // job; cm=1 with a real d beyond kRideThreatDist is a fight that
-                            // moved away; hold= counting down is the tail, not a fault.
+                            // moved away; holdms= counting down is the tail, not a fault.
+                            // ⚠️ holdms is WALL-CLOCK MILLISECONDS since this build (it was
+                            // frames, printed as hold=, up to and including 297472 B).
                             float td = -1.0f;
                             RideNearestThreat(rider, &td);
                             char pl[160];
                             _snprintf_s(pl, 160, _TRUNCATE,
-                                "Riding: STANCE %d f=%u cm=%d d=%.1f hold=%d",
+                                "Riding: STANCE %d f=%u cm=%d d=%.1f holdms=%d",
                                 stance ? 1 : 0, gP3Frames,
                                 rider->isInCombatMode(true, true) ? 1 : 0, td, gRideStanceHold);
                             DebugLog(std::string(pl));
@@ -7589,6 +7644,76 @@ static void HotkeyPass()
                  + " registered=" + IntToStr(gRidingCommandsRegistered ? 1 : 0));
     }
 
+    // ---- raw keyboard sniffer + guard trace (diagnostics only, 2026-08-31) -------------
+    // The player reported "pressed the seat-tuning keys, the seat did not move" and the log was
+    // SILENT: zero `input '...' fired`, zero `tuned` (that one is an UNCONDITIONAL DebugLog, so
+    // TuneSeat truly never ran), and not even the "select the rider first" line the tune gate
+    // prints when an edge fires with nobody suitable selected.  Yet the same session logged
+    // `debug continuous ON` exactly once, which proves the entire chain - map scan ->
+    // RidingCmdDown -> OIS isKeyDown -> modifier check -> KeyEdge -> per-frame HotkeyPass - worked
+    // for Ctrl+Numpad. minutes before the first mount, with all ten bindings resolved non-zero.
+    // So no command edge ever happened, and the remaining candidates are all environmental and
+    // invisible offline: the physical keys pressed were not the bound ones (NumLock, a laptop
+    // keypad, a remap), the window never received them, or controlEnabled was 0 at that moment.
+    // These two blocks make the next trip say which, out loud.
+    //
+    // ⚠️ The sniffer sits BEFORE the controlEnabled guard on purpose - a stuck guard is one of the
+    // candidates, and it must not be able to hide itself.  ⚠️ It is debugContinuous-gated and
+    // budgeted; it is a DIAGNOSTIC, never a dispatch path (nothing here can fire a command).
+    if (debugContinuous)
+    {
+        static bool rawPrev[0x100] = { false };
+        static int  rawBudget      = 400;
+        bool ctrlNow  = false, shiftNow = false, altNow = false;
+        try {
+            ctrlNow  = key->keyboard->isKeyDown(OIS::KC_LCONTROL) || key->keyboard->isKeyDown(OIS::KC_RCONTROL);
+            shiftNow = key->keyboard->isKeyDown(OIS::KC_LSHIFT)   || key->keyboard->isKeyDown(OIS::KC_RSHIFT);
+            altNow   = key->keyboard->isKeyDown(OIS::KC_LMENU)    || key->keyboard->isKeyDown(OIS::KC_RMENU);
+        } catch (...) {}
+        int mask = (ctrlNow ? InputHandler::CTRL_MASK : 0)
+                 | (shiftNow ? InputHandler::SHIFT_MASK : 0)
+                 | (altNow ? InputHandler::ALT_MASK : 0);
+        for (int kc = 1; kc <= 0xED; ++kc)
+        {
+            bool dn = false;
+            try { dn = key->keyboard->isKeyDown((OIS::KeyCode)kc); } catch (...) { dn = false; }
+            if (dn && !rawPrev[kc] && rawBudget > 0)
+            {
+                --rawBudget;
+                // Name the command this press would resolve to, if any: "the key I pressed maps to
+                // nothing" and "it maps to the wrong command" are different bugs with different
+                // fixes, and only this comparison can tell them apart.
+                const char* cmd = "-";
+                for (int i = 0; i < RCMD_COUNT; ++i)
+                    if (gRidingBound[i] == (kc | mask))
+                    { cmd = gRidingCommands[i].name; break; }
+                char rb[160];
+                _snprintf_s(rb, 160, _TRUNCATE,
+                    "Riding: RAWKEY kc=%d(0x%02X) mask=0x%X ce=%d cmd=%s",
+                    kc, kc, mask, key->controlEnabled ? 1 : 0, cmd);
+                DebugLog(std::string(rb));
+            }
+            rawPrev[kc] = dn;          // tracked even with the budget spent, so no state desync
+        }
+    }
+
+    // controlEnabled transitions, bounded and NOT diagnostics-gated (a stuck-0 guard has to be
+    // visible in a plain log too).  A UI opening/closing flips this, hence the budget.
+    {
+        static int ceLast   = -1;
+        static int ceBudget = 40;
+        int ceNow = key->controlEnabled ? 1 : 0;
+        if (ceNow != ceLast)
+        {
+            if (ceBudget > 0)
+            {
+                --ceBudget;
+                DebugLog("Riding: controlEnabled -> " + IntToStr(ceNow));
+            }
+            ceLast = ceNow;
+        }
+    }
+
     // Don't act while a UI owns the keyboard (typing in a rename/search box).
     // controlEnabled (InputHandler+0xD0) is the vanilla "gameplay input is live"
     // flag; the old OIS-polling scheme ignored it and fired mid-typing.
@@ -7673,8 +7798,12 @@ static void HotkeyPass()
             {
                 PlayerInterface* player = ou->player;
                 Character* rider = NULL;
+                bool haveSel = false;
                 if (player->selectedCharacter)
+                {
                     rider = player->selectedCharacter.getCharacter();
+                    haveSel = (rider != NULL);
+                }
                 // if the mount itself is selected, resolve to its rider
                 if (rider && !IsRiding(rider))
                 {
@@ -7686,7 +7815,15 @@ static void HotkeyPass()
                 {
                     Character* mount = GetMount(rider);
                     boost::unordered_map<Character*, SeatInfo>::iterator sit = mountSeat.find(mount);
-                    if (sit != mountSeat.end())
+                    if (sit == mountSeat.end())
+                    {
+                        // Was silent until 2026-08-31.  This is the one rejection that looks
+                        // exactly like "the key did nothing": the rider IS mounted, so the
+                        // helper line below never prints, yet no seat row means no tuning.
+                        DebugLog("Riding: seat-tuning key ignored - no seat row for this mount"
+                                 " (mounted=1 mountSeat=miss)");
+                    }
+                    else
                     {
                         SeatInfo& seat = sit->second;
                         if (stepSit)
@@ -7749,7 +7886,12 @@ static void HotkeyPass()
                 }
                 else
                 {
-                    DebugLog("Riding: select the rider first, then use the seat-tuning keys (see Settings->Controls)");
+                    // Say WHICH half failed: "nothing selected" and "the selected character is
+                    // neither a rider nor a tracked mount" send the player to different actions.
+                    DebugLog(std::string("Riding: seat-tuning key ignored - ")
+                             + (haveSel ? "selection is not a rider or a ridden mount"
+                                        : "nothing selected")
+                             + " (select the rider first; keys are in Settings->Controls)");
                 }
             }
         }
