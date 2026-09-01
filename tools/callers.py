@@ -6,6 +6,9 @@
 #   python tools\callers.py --ptr 0x5CC820 0x302B5  # 8-byte VA references (vftables live in .rdata)
 #   python tools\callers.py --field 0x6D8            # `<op> [reg+0x6D8]` member-access sites
 #   python tools\callers.py --calls 0x5B5980 2       # direct callees of that body, depth 2
+#   python tools\callers.py --ret 0x5DB749           # a probe's `site=` -> the real call site
+#   python tools\callers.py --strings 0x5D0DB0       # string constants a body touches (identity)
+#   python tools\callers.py --import "AnimationState" # imported API by regex + its call sites
 #
 # Why this exists: knowing a function's real entry (tools\hook_probe.py) does NOT tell you
 # whether the engine reaches it *directly* or *through the vftable*.  That distinction decides
@@ -32,6 +35,9 @@
 # an address with 0 direct callers AND 0 pointer references usually means X is the tail chunk
 # of the function just before it - check whether the previous record flows into it before
 # treating X as a callable entry.  (Live example: 0x5CC77C is the tail of 0x5CC760.)
+# ⚠️ The `logical entry` that `--ret` prints comes from logical_entry(), which is a HEURISTIC -
+# read its docstring before quoting it.  A chunk with its own nonzero prolog stops the walk early,
+# so the number can name a chunk that nothing ever calls (RE_NOTES 18.10).
 
 import os
 import struct
@@ -152,6 +158,108 @@ def where(pe, rva):
     return ('in 0x%X+0x%X' % (f[0], rva - f[0])) if f else 'NOT in any .pdata function'
 
 
+def _ffcall_len(b, i):
+    """Length of the `call r/m64` (FF /2) starting at b[i], or None if that is not one."""
+    j = i
+    while j < len(b) and 0x40 <= b[j] <= 0x4F:      # REX prefixes
+        j += 1
+    if j + 1 >= len(b) or b[j] != 0xFF or ((b[j + 1] >> 3) & 7) != 2:
+        return None
+    modrm = b[j + 1]
+    mod, rm = modrm >> 6, modrm & 7
+    ln = j + 2 - i
+    if mod == 3:
+        return ln
+    if rm == 4:
+        ln += 1                                     # SIB
+    if mod == 0:
+        ln += 4 if rm == 5 else 0                   # rip-relative
+    elif mod == 1:
+        ln += 1
+    else:
+        ln += 4
+    return ln
+
+
+def call_ending_at(pe, rva):
+    """[(site, length, text, target_or_None)] for every call instruction whose NEXT address is rva.
+
+    A return address is by definition the address right after a call, so this is the reverse of
+    direct(): it turns a logged return address back into its call site.  Both encodings that can
+    reach a hooked engine function are covered - `E8 rel32` (direct, the target is decoded and
+    ILT-resolved) and `FF /2` (indirect: through the vftable, so the target is a slot, not a
+    value visible here).
+    """
+    blob, sec = pe.read(rva - 16, 16)
+    if not blob:
+        return []
+    b, out = bytearray(blob), []
+    for ln in range(2, 9):
+        i = 16 - ln
+        if i < 0:
+            continue
+        if ln == 5 and b[i] == 0xE8:
+            t = rva + struct.unpack_from('<i', blob, i + 1)[0]
+            out.append((rva - ln, ln, 'call 0x%X' % t, ke_pe.deref_thunk(pe, t)))
+        elif _ffcall_len(b, i) == ln:
+            out.append((rva - ln, ln, 'call [reg%s]' % (
+                '+0x%X' % struct.unpack_from('<i', blob, i + ln - 4)[0] if ln >= 6 else ''), None))
+    return out
+
+
+def logical_entry(pe, rva):
+    """(chunk_begin, logical_begin): MSVC splits one function into several .pdata records, and this
+    walks UP from rva's chunk while the chunk has prolog=0, on the theory that a record without a
+    prologue must be a continuation (RE_NOTES 18.7).
+
+    ⚠️ HEURISTIC, NOT A VERDICT (RE_NOTES 18.10): a separated/chained chunk can carry its OWN
+    nonzero prolog size, so the walk stops early and reports a chunk as if it were the entry.
+    Live counterexample: 0x5CEA40 is its own .pdata record with prolog=40, yet it has 0 direct
+    sites and 0 pointer references, and the decompiler folds it into 0x5CE9C0 - the real entry,
+    which this function does NOT return for an rva inside 0x5CEBA0.  `prolog != 0` therefore
+    proves nothing about callability.  To settle an entry, all three must hold: it is a .pdata
+    record, SOMETHING reaches it (a direct site from direct() or a pointer reference from ptr()),
+    and the decompiler's getFunctionContaining agrees.
+    """
+    f = pe.func_of(rva)
+    if not f:
+        return None, None
+    b = f[0]
+    e = b
+    idx = [x[0] for x in pe.funcs].index(b)
+    while idx > 0 and not pe.prolog_size(e):
+        idx -= 1
+        e = pe.funcs[idx][0]
+    return b, e
+
+
+def strings_in(pe, rva, limit=24):
+    """[(site, target, text)] for `lea reg,[rip+disp32]` inside that .pdata record whose target is
+    a printable string.  This is the cheap way to give a function an identity without a
+    decompiler (RE_NOTES 18.6): the string constants a body touches usually name what it does.
+    ⚠️ It reads ONE record, so a logical function split across chunks needs each chunk asked."""
+    rec = pe.func_of(rva)
+    if not rec:
+        return []
+    blob, _ = pe.read(rec[0], rec[1] - rec[0])
+    b, out = bytearray(blob), []
+    for i in range(len(b) - 7):
+        if not (0x48 <= b[i] <= 0x4F and b[i + 1] == 0x8D and (b[i + 2] >> 6) == 0
+                and (b[i + 2] & 7) == 5):
+            continue
+        site = rec[0] + i
+        tgt = site + 7 + struct.unpack_from('<i', blob, i + 3)[0]
+        raw, sec = pe.read(tgt, 48)
+        if sec not in ('.rdata', '.data'):
+            continue
+        s = bytes(raw).split(b'\0')[0]
+        if 3 <= len(s) <= 47 and all(32 <= c < 127 for c in bytearray(s)):
+            out.append((site, tgt, s.decode('latin1')))
+            if len(out) >= limit:
+                break
+    return out
+
+
 # opcode -> (mnemonic, is_write).  Only the forms that actually show up in member access;
 # anything not listed here is skipped rather than guessed at.
 FIELD_OPS = {
@@ -220,6 +328,32 @@ def field(pe, disp):
     return out
 
 
+def iat_sites(pe, iat_rvas):
+    """{iat_rva: [(site, kind)]} for `call/jmp qword [rip+disp32]` landing on those IAT slots.
+
+    The fourth way into a function, and the only one the other scanners miss: a cross-module
+    call is `FF 15` (call) / `FF 25` (the ILT thunk's jmp) through the import table, so neither
+    direct() (rel32) nor indirect() ([reg+disp]) sees it.  Pair it with ke_pe.imports(): the
+    import list says WHETHER the exe can call an API, this says FROM WHERE.
+    ⚠️ An import whose only site is its own `FF 25` ILT thunk is reached by `E8 -> thunk`
+    instead; feed that thunk's rva back into direct() to find the real callers.
+    """
+    want, out = set(iat_rvas), {}
+    for name, va, vsz, ptr, rsz in pe.secs:
+        if name != '.text':
+            continue
+        blob = pe.d[ptr:ptr + rsz]
+        bb = bytearray(blob)
+        for i, b in enumerate(bb):
+            if b != 0xFF or i + 6 > len(bb) or bb[i + 1] not in (0x15, 0x25):
+                continue
+            tgt = va + i + 6 + struct.unpack_from('<i', blob, i + 2)[0]
+            if tgt in want:
+                out.setdefault(tgt, []).append(
+                    (va + i, 'call' if bb[i + 1] == 0x15 else 'jmp'))
+    return out
+
+
 def main(argv):
     if not argv:
         return (__doc__ or 'usage: callers.py <true rva> [...] | --vcall <slot off>'
@@ -227,6 +361,21 @@ def main(argv):
     pe = ke_pe.PE(ke_pe.KENSHI_EXE)
     print('exe   %s\nbase  0x%X   .pdata records %d\n' %
           (pe.path, pe.base, len(pe.funcs)))
+
+    if argv[0] == '--import':
+        import re
+        rx = re.compile(argv[1]) if len(argv) > 1 else None
+        imps = ke_pe.imports(pe)
+        sel = [t for t in imps if rx is None or rx.search(t[1])]
+        print('imports %d total, %d matching %r\n' %
+              (len(imps), len(sel), argv[1] if rx else '(all)'))
+        sites = iat_sites(pe, [t[2] for t in sel])
+        for dll, sym, iat in sel:
+            hits = sites.get(iat, [])
+            print('%s  [iat 0x%X]  %d site(s)   (%s)' % (sym, iat, len(hits), dll))
+            for site, kind in hits:
+                print('  0x%-8X %-4s %s' % (site, kind, where(pe, site)))
+        return 0
 
     if argv[0] == '--calls':
         rva = int(argv[1], 0)
@@ -236,6 +385,37 @@ def main(argv):
         for t in sorted(out):
             print('  0x%-8X %-26s from %s' % (
                 t, pe.classify(t), ','.join('0x%X' % c for c in sorted(out[t]))))
+        return 0
+
+    if argv[0] == '--ret':
+        for a in argv[1:]:
+            logged = int(a, 0)
+            print('logged site=0x%X  (as printed by a naming probe)' % logged)
+            for lbl, r in (('raw', logged),
+                           ('+0x%X' % ke_pe.RUNTIME_RVA_DELTA,
+                            logged + ke_pe.RUNTIME_RVA_DELTA)):
+                hits = call_ending_at(pe, r)
+                chunk, entry = logical_entry(pe, r)
+                print('  %-8s 0x%-8X %-22s %s' % (
+                    lbl, r, where(pe, r),
+                    ('logical entry 0x%X' % entry) if entry and entry != chunk else ''))
+                for site, ln, text, tgt in hits:
+                    print('      call site 0x%-8X len %d  %-22s %s' % (
+                        site, ln, text,
+                        ('-> 0x%X %s' % (tgt, pe.classify(tgt))) if tgt else '(indirect/vftable)'))
+                if not hits:
+                    print('      no call instruction ends here => NOT a return address')
+            print('')
+        return 0
+
+    if argv[0] == '--strings':
+        for a in argv[1:]:
+            rva = int(a, 0)
+            chunk, entry = logical_entry(pe, rva)
+            print('0x%X  %s  logical entry 0x%X' % (rva, where(pe, rva), entry or 0))
+            for site, tgt, s in strings_in(pe, rva):
+                print('  0x%-8X -> 0x%-8X %r' % (site, tgt, s))
+            print('')
         return 0
 
     if argv[0] == '--field':

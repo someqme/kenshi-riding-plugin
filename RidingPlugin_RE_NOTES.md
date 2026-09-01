@@ -656,7 +656,7 @@ callers.py --ptr 0x302B5 0x4B8D0        ->  各 1 个，都在 .rdata：0x16F2B1
 
 **调用方分裂（这就是全部结论）**
 
-- **三参 `0x535E50` ← 拔刀侧**：`CharacterHuman::drawWeapon`（头 `0x5DB800` ＋0x780 ＝ **`0x5DBF80`**，ENTRY prolog=45，序言 `40 55 53 56 57 41 54 41 55 41 56 48 8D 6C 24 D9`）站点 `0x5DC1D4`；`leaveSheathEquipped`@`0x5D24B0` 站点 `0x5D2709`。⚠️ `leaveSheathEquipped` **自己也是 `drawWeapon` 的被调方** ⇒ 拔刀侧是三参族这件事有**两条独立确认**。
+- **三参 `0x535E50` ← 拔刀侧**：`CharacterHuman::drawWeapon`（头 `0x5DB800` ＋0x780 ＝ **`0x5DBF80`**，ENTRY prolog=45，序言 `40 55 53 56 57 41 54 41 55 41 56 48 8D 6C 24 D9`）站点 `0x5DC1D4`（✅ **2026-09-01 运行时兑现**：`P43AT` 的 logged `site=0x5DB749` 换算过来正是这一条 call 的下一字节，见 §18.10）；`leaveSheathEquipped`@`0x5D24B0` 站点 `0x5D2709`。⚠️ `leaveSheathEquipped` **自己也是 `drawWeapon` 的被调方** ⇒ 拔刀侧是三参族这件事有**两条独立确认**。
 - **二参 `0x535D50` ← 收鞘侧**：虚表 `+0x198` 的「按位置串挂回去」`0x5DBD80` 站点 `0x5DBE8A`（§18.7:602 记的就是这一条）；`0x5D0BC7` 站点 `0x5D0CE0`；另有两处在 `0xCFDD0` 里（`0xD0048` / `0xD013C`，与武器无关的邻域）。
 - **`--calls 0x5DBF80` 的 12 个被调方里有 `0x535E50` 与 `0x5D24B0`，没有 `0x535D50`。**
 
@@ -666,9 +666,11 @@ callers.py --ptr 0x302B5 0x4B8D0        ->  各 1 个，都在 .rdata：0x16F2B1
 
 **方法论：`callers.py` 打在真入口上只看见一个站点，那大半是 ILT 跳板，必须再追一跳。** 实测 `0x535D50` 只有 1 个直调者、而它是个 `jmp`（`jmp NOT in any .pdata function`）；追过去 `0x42163` → 4 个真站点。三参那边 `0x1760C` → 2 个真站点。**别把「1 个站点」读成「几乎没人调」。**
 
-**顺带定死的两处逻辑函数边界**（MSVC 把一个逻辑函数拆成多条 `.pdata` 记录，`prolog=0` 的是续块，见 §18.7 负面结果 1）：T6 那个收刀站点 `0x5D051C`（`hook_probe` 报 `MID+298`）落在续块 `0x5D03F2-0x5D076D` 里，其入口是 **`0x5D0217`**（prolog=8）⇒ 逻辑函数 ≈ `0x5D0217-0x5D0779`；二参挂载站点 `0x5D0CE0` 落在续块 `0x5D0BFC-0x5D0D12`，入口是 **`0x5D0BC7`**（prolog=5）。
+**~~顺带定死的两处逻辑函数边界~~ —— 前半条已作废，见 §18.10**（MSVC 把一个逻辑函数拆成多条 `.pdata` 记录，`prolog=0` 的是续块，见 §18.7 负面结果 1）：❌ ~~T6 那个收刀站点 `0x5D051C`（`hook_probe` 报 `MID+298`）落在续块 `0x5D03F2-0x5D076D` 里，其入口是 `0x5D0217`（prolog=8）⇒ 逻辑函数 ≈ `0x5D0217-0x5D0779`~~ —— **`0x5D051C` 是 logged 值、不是本文件的 RVA**（要 `+0xA90` ＝ `0x5D0FAC`），所以这段边界是**对一个假地址做的划界，整段无效**。真站点的边界在 §18.10。✅ 二参挂载站点 `0x5D0CE0`（这个是**静态解码出来的**、不经探针 ⇒ 不受 §18.10 影响）落在续块 `0x5D0BFC-0x5D0D12`，入口是 **`0x5D0BC7`**（prolog=5）。
 
-**T6 那一趟点名出来的第二个站点：`0x5CE183`**（2026-09-01 从 `TASK.md`／`TEST_REQUIRED.md` 收容进来 —— 此前本手册完全没有它，改无处改）。它和 `0x5D051C` 一样是**调用方里的返回地址、不是函数入口**（`site=` 的模块名都是 `kenshi_x64.exe` ⇒ RVA 有效）。实测配比：`0x5D051C` `real=16`（真把刀从手里拿走 16 次、gap 中位数 22 帧、重复出现）＋ `0x5CE183` `real=3`，`over=0` ⇒ 12 条站点表没满、**没有第三个真写手被挤掉**。⚠️ 想改这两个数字前先看 `TEST_REQUIRED.md` 的 T6 判据，它们是那五条验收里最吃重的两条的证据。
+**T6 那一趟点名出来的两个站点：`0x5D051C` 与 `0x5CE183` 都是 logged 运行时值，真站点见 §18.10**（2026-09-01 从 `TASK.md`／`TEST_REQUIRED.md` 收容进来；同日 §18.10 查明要 `+0xA90`）。⇒ 真正的两个收刀写手是 **`0x5D0FA6 in 0x5D0DB0` ＝ `Character::_ragdollMode`**（ragdoll 消息那条路，`real=16`、gap 中位数 22 帧、重复出现 —— 第六趟同一站点 `real=11 noop=657`）与 **`0x5CEC0C in 0x5CE9C0` ＝ `Character::_carryMode(on=true,…)`**（续块 `0x5CEBA0+0x73`，`real=3` ≈ 每次上马一次）。定名与四路证据见 §18.10。`over=0` ⇒ 12 条站点表没满、**没有第三个真写手被挤掉**。⚠️ 想改这两个数字前先看 `TEST_REQUIRED.md` 的 T6 判据，它们是那五条验收里最吃重的两条的证据；⚠️ **别再把 logged `site=` 直接当 RVA 抄进任何文档** —— 抄之前先跑 `callers.py --ret`。
+
+⚠️⚠️ **方法论更正：`prolog != 0` 证不了「这是可调用入口」**（§18.7 负面结果 1 与 `callers.py` 的 `logical_entry()` 原来都把「续块」等同于 `prolog=0`，**错了**）。实测 `0x5CEA40` 自己是一条 `.pdata` 记录、`prolog=40`，但它 **0 个直调站点、0 个指针引用**，Ghidra 也把它并进 `0x5CE9C0` ⇒ MSVC 的 separated/chained 记录**可以带自己的 prolog 大小**。⇒ 判「是不是入口」要**三件一起看**：`.pdata` ENTRY ＋ 有直调站点或指针引用 ＋（能反编译时）反编译器认的 `getFunctionContaining`。`logical_entry()` 的 `prolog=0` 走法只是启发式，**别当判据**。
 
 **delta 的三重佐证（这一族不是靠「+0x780 一般对」蒙的）**：①挂载族七个符号 ＋0x780 全部落在**互不相同**的精确入口上（没有别名到同一个地址）；②语义交叉验证 —— `detachItem(const std::string&)` 头 `0x52D970` ＋0x780 ＝ **`0x52E0F0`**，正是 §18.7:607 早就解码出来的 `sheatheWeapon` 第 2 步被调方；③`0x5DBD80` 传着位置串调 `0x535D50`，与头文件里那个二参签名对得上。
 
@@ -688,7 +690,7 @@ callers.py --ptr 0x302B5 0x4B8D0        ->  各 1 个，都在 .rdata：0x16F2B1
 
 ### 18.9 反编译器就位（Ghidra 12.1.3）＋ 它当场推翻的两条（2026-09-01）
 
-**工具**：Ghidra 12.1.3 ＋ Temurin JDK 21 便携装在 `D:\KenshiModDev\revtools\`（仓库外、无需管理员、不改系统环境）。`kenshi_x64.exe` 的 auto-analysis **506 秒**跑完并存成工程 `revtools\ghidra-projects\kenshi`（462 MB，**一次性开销、别重跑**），得 **169,169 个函数**。接了 MCP 桥 `pyghidra-mcp`；不经 MCP 也能查：`revtools\scripts\DecompAt.java`（按地址反编译）/ `FindSym.java`（按子串搜符号）走 `analyzeHeadless -process kenshi_x64.exe -noanalysis -readOnly -postScript`。⚠️ 脚本**只能写 Java**（这份 Ghidra 没按 PyGhidra 模式启动，`.py` 一律报 `Ghidra was not started with PyGhidra`）。⚠️ 搜符号必须用 `getName(true)` 取**全限定名**，`getName()` 会全 0 命中（类名在 namespace 里）。
+**工具**：Ghidra 12.1.3 ＋ Temurin JDK 21 便携装在 `D:\KenshiModDev\revtools\`（仓库外、无需管理员、不改系统环境）。`kenshi_x64.exe` 的 auto-analysis **506 秒**跑完并存成工程 `revtools\ghidra-projects\kenshi`（462 MB，**一次性开销、别重跑**），得 **169,169 个函数**。接了 MCP 桥 `pyghidra-mcp`；不经 MCP 也能查：`revtools\scripts\DecompAt.java`（按地址反编译）/ `FindSym.java`（按子串搜符号）走 `analyzeHeadless -process kenshi_x64.exe -noanalysis -readOnly -postScript`。⚠️ 脚本**只能写 Java**（这份 Ghidra 没按 PyGhidra 模式启动，`.py` 一律报 `Ghidra was not started with PyGhidra`）。⚠️ 搜符号必须用 `getName(true)` 取**全限定名**，`getName()` 会全 0 命中（类名在 namespace 里）。⚠️ **传参有两个坑**（2026-09-01 各踩一次）：`analyzeHeadless` **吃掉任何以 `-` 开头的 arg**（脚本压根看不见），而且**按 `=` 把 `key=value` 拆成两个 arg** ⇒ `DecompAt.java` 的打印行数上限现在收**裸十进制**（`… -postScript DecompAt.java 0 0x1405D0DB0`，`0` ＝ 不截断），地址一律 `0x` 开头。⚠️ 还有第三个：改完 `.java` 若行为没变，是**编译缓存**没失效 —— 删 `%APPDATA%\ghidra\ghidra_12.1.3_PUBLIC\osgi\compiled-bundles\*\<脚本>.class` 再跑。
 
 **新能力：RTTI 类名是活的，`ke_pe.py` 的虚表库现在有名字了。** 6,290 个 `vftable` 标签 ＋ 18,989 条 RTTI 记录，且用的就是我们笔记里的类名：`AbstractMovementBase::vftable`@`0x1416FCBA8`、`CharMovement`@`0x1416FCC88`、`AnimationClass`@`0x1416F10E8`、`AnimationClassHuman`@`0x1416F1268`、`AnimationClassAnimal`@`0x1416F4588`、`AnimationClassBase`@`0x1416FA888`、**`PhysicsHullT`**@`0x1416DE808`（§13 记的「只前向声明」这条限制到此解除），`AnimationClassBase::SingleAnimation` 与 `::AnimationLayer` 也在。**Ogre 的方法名是真名**（`Ogre::AnimationState::setWeight` 直接出现在反编译结果里）⇒ 凡是调进 Ogre 的地方不用再猜。⚠️ **Kenshi 自己的方法名一个都没有**（`getFacingDirection` / `updateAnimationTransforms` / `beingCarriedUpdate` 全 0 命中）——stripped 是实的，RTTI 只给类名不给方法名。
 
@@ -709,6 +711,42 @@ if (*(AnimationState **)(param_1 + 0x28) != NULL) {
 **② `getFacingDirection@0x2AE320` 不是「一个小 getter」，§18.2:515 那句要改。** 那里写它是「`8B 42 08 …` 一个小 getter」——`8B 42 08`（`mov eax,[rdx+8]`）只是它的**第一条指令**。Ghidra 认这里是精确入口、**323 字节**，反编译出来是：把 `[rdx+8..0x18]` 5 个 dword 拷进 `[rcx+0x158..0x168]`，写 `[rcx+0x125]`/`[rcx+0x128]`，再把几个 float 夹进 `[rcx+0x110..0x11c]`，带 ~7 个参数。**一个返回朝向的 const getter 不会往对象里写 8 个字段** ⇒ **`+0x790 → getFacingDirection` 这一条现在存疑**（它是 `+0x790` 那一族仅剩的两根支柱之一）。对得上的部分：`0x2ADB90`（头值）与 `0x2AE310`（`+0x780`）在 Ghidra 里**都没有函数** ⇒ §18.1:507「+0x780 处是纯 `CC`」与「头 RVA 不可靠」两条都被独立确认。
 
 ⚠️ **本节全是反编译读数 ＝ 静态事实，不是实测。** 反编译能证伪「这个地址是那个函数」，**不能**证明「换成这个地址 hook 就不崩」。禁 hook 令是实测结论、原样有效（`doc.md`「禁止注册的危险 hook 地址」节）。
+
+### 18.10 点名探针打出来的 `site=` **不是本文件的 RVA**：要 `+0xA90`（2026-09-01）
+
+**这一条推翻了前面几节里所有「站点 RVA」的直接读法，先看它再看 §18.8:669/:671。**
+
+探针打的是 `_ReturnAddress() - GetModuleHandle(kenshi_x64.exe)`（`RidingPlugin.cpp:1092` 的 `ShDescribeAddr`，就是个减法，没有别的加工）⇒ 那**本该**就是 RVA。实测不是：三个 logged site 在本文件里**全部解码在指令中间**，谁都不是返回地址；而**同一个常数** `+0xA90` 一加，三个全部精确落在「一条 call 的下一字节」上，且那条 call 的目标正是被 hook 的那个函数。
+
+| logged `site=` | `+0xA90` | 落点 | 那条 call | 目标 |
+|---|---|---|---|---|
+| `0x5DB749`（`P43AT` 三参挂载） | **`0x5DC1D9`** | `0x5DBF80+0x259` | `0x5DC1D4` len 5 `E8` | 跳板 `0x1760C` → **`0x535E50`**（三参 `attachItem`） |
+| `0x5D051C`（`P43SH` 频繁那个） | **`0x5D0FAC`** | `0x5D0DB0+0x1FC` | `0x5D0FA6` len 6 `FF /2` | `[reg+0x2D0]` ＝ `sheatheWeapon` 的虚表槽 |
+| `0x5CE183`（`P43SH` 次要那个） | **`0x5CEC13`** | `0x5CEBA0+0x73`（续块，逻辑入口 **`0x5CE9C0`**） | `0x5CEC0C` len 7 `REX FF /2` | 同上 `[reg+0x2D0]` |
+
+**为什么这算定案**：①第一行的落点 `0x5DBF80` ＝ `CharacterHuman::drawWeapon`，而 §18.8:659 **早在静态就预言了「三参挂载的调用方是 drawWeapon、站点 `0x5DC1D4`」** —— 运行时独立命中同一个站点，这是**先验预测被兑现**，不是事后对齐；②后两行的 call 都吃 `[reg+0x2D0]`，而 `0x2D0` 正是 `sheatheWeapon` 的槽（§18.7），`--vcall 0x2D0` 那 38 个站点里恰好有这两个；③三个站点一个常数、`0x5D051C` 那个站点在一趟里被走了 668 次而值稳定 ⇒ 不是栈垃圾、不是尾调。
+
+⚠️ **成因未解释。** 已逐个排除：磁盘上第二份 exe（只有一份，36,718,592 B，比日志旧）、`ke_pe` 映射算错（节表 ＋ 代码字节双向核过，`off = ptr + (rva - va)` 教科书式正确）、KenshiLib 头 delta 其实是 `0xA90`（拿 10 个符号试 `+0x310`，9 个落在函数中间 ⇒ **`+0x780` 与 §12/§18 全部照旧有效**）、MinHook 跳板/尾调。⚠️ 因此**范围只到 `0x5CE000-0x5DC000` 这个窗口**（三个锚点都在里面）；出了这个窗口按未验证对待，**每次都要用 `callers.py --ret <logged rva>` 重新验**，那条命令把 raw 与 `+0xA90` 两行并排打出来，"no call instruction ends here => NOT a return address" 就是判据。常数记在 `tools\ke_pe.py` 的 `RUNTIME_RVA_DELTA`。
+
+**便宜的下一步（要做的时候顺手带上，不值得单独出一个构建）**：arm 那一刻打一行 `ShDescribeAddr((uintptr_t)GetRealAddress(att3))`。它印 `+0x535E50` ⇒ 偏移只在返回地址上；印 `+0x5353C0`（＝ `0x535E50 - 0xA90`）⇒ 整个模块基址口径差了这么多，全 image 一次定死。
+
+**顺带定死的语义（`callers.py --strings`，§18.6 的无反编译认脸法）**：`0x5D0DB0` 在收刀那条 call 之后 ~0x20 字节触到 `'female ragdoll'`(`0x5D0FC6`)／`'male ragdoll'`(`0x5D0FCD`) ⇒ **倒地/ragdoll 那条路**；`0x5CEA40` 触到 `'VO_Creature_Die'`(`0x5CEB73`) ⇒ **死亡那条路**。两个都是虚表进入（`0x5D0DB0` 只有 ILT 跳板 `0xC97D` 一个直调者，`0x5CEA40` 零个直调者）。
+
+**✅ 两个宿主已定名定型（2026-09-01，Ghidra ＋ 头文件 ＋ `.pdata` 三路互证）—— 这两个名字就是 P4-3 第 1 步要的答案**
+
+| 真实入口 | 头 RVA | `.pdata` | 头文件签名 |
+|---|---|---|---|
+| **`0x5D0DB0`** | `0x5D0630` | ENTRY prolog=43 | **`bool Character::_ragdollMode(const Character::RagdollMsg& message)`**（`Character.h:690`，protected） |
+| **`0x5CE9C0`**（`0x5CEA40`/`0x5CEBA0` 都是它的续块） | `0x5CE240` | ENTRY prolog=10 | **`void Character::_carryMode(bool on, bool makeRagdoll, bool makeHull)`**（`Character.h:639`） |
+
+四路证据，每一路都独立：①头 RVA **＋0x780** 精确落在两个 ENTRY 上（`hook_probe.py 0x5D0630 0x5CE240`）；②**参数形状对得上签名** —— `_ragdollMode` 反编译成 `(this, char *msg)` 且只读 `msg[0]`(char) 与 `*(uint*)(msg+4)`(mask) ＝ `RagdollMsg` 的两个字段，`_carryMode` 的序言第 13 字节就是 `84 D2`(`test dl,dl`) ＝ 那个 `bool on`，反编译的第一行正是 `if (param_2 != '\0')`；③**常数** —— `_ragdollMode` 里 `uVar2 == 1` / `uVar2 == 0x800` 与 `(uVar2 & 1) || (uVar2 >> 0xb & 1)`，`_carryMode` 第一件事就是 `local[0] = 0x800` ⇒ 正是 `RagdollPart::WHOLE`(1) 与 **`CARRY_MODE`(0x800)**；④**体内第三个符号也按同一 delta 落点** —— 两个函数都调 `0x5CE1E0`，而 `Character::dropCarriedObject(bool,bool)` 头 `0x5CDA60` ＋0x780 ＝ `0x5CE1E0`（ENTRY），调用形状 `(this,1,0)` 也对。顺带第五路：`param_1[0x89]` ＝ `+0x448` ＝ `animation`、`param_1[0x89]+0xE8` ＝ `appearance`，与 §18.7 从 `sheatheWeapon` 体内解出来的布局逐字吻合。
+
+**收刀发生在哪一条语句上（这才是修法要看的东西，⚠️ 只是描述、不是许可）**：两个函数都有同一段拆除序列，收刀是其中一条 —— `dropCarriedObject(true,false)` → `…(param_1[200], 0)` → `param_1[0xc9]->vtbl+0x60` → 两个 `0x5074A0`/`0x50D1B0` → `0x674830(param_1[0x50],1)` → **`this->vtbl[0x2D0]()` ＝ `sheatheWeapon`** → `…(param_1[200])`。
+- `_ragdollMode` 里这段被 **`if (mask & WHOLE) || (mask & CARRY_MODE)`** 罩着（`0x5D0FA6` 就在里面），之后才去播 `'male ragdoll'`/`'female ragdoll'`。
+- `_carryMode` 里这段是 `on != 0` 那一支的尾巴（`0x5CEC0C`，续块 `0x5CEBA0`），`'VO_Creature_Die'` 只在 `part == WHOLE` 时播 ⇒ 死亡是那一支的**另一个**用法，不是收刀的条件。
+
+⇒ **P4-1e-2 那句「绑在被携态而不是战斗状态上」现在有机制了**：骑乘本身就跑在 `RagdollPart::CARRY_MODE` 上，而 `_carryMode(on=true,…)` 的尾巴与 `_ragdollMode(mask ∋ CARRY_MODE)` 的拆除段**都无条件收刀**。日志侧的配比也对得上：`_carryMode` 站点 `real=3`（≈ 每次上马一次），`_ragdollMode` 站点 `real=11..16`、间隔中位 22 帧（≈ ragdoll 消息的节律）。
+⚠️ **仍然只是点名。** 两个都是**非虚成员函数、都有头文件符号** ⇒ 理论上 `GetRealAddress(&Character::_ragdollMode)` 能 hook，但**要不要动、动哪一端还没定**，`HISTORY.md` §B 那条「不许对绝对覆写做写入端补偿」照旧；而 `_carryMode` / `_ragdollMode` 是**引擎自己维护被携态的两条主干**，在它们身上改行为的风险远超「少收一次刀」。⚠️ 反编译读数不是实测（§18.9 结尾那条）。
 
 
 ## 19. 离线读 FCS 数据文件 + Ogre `.skeleton`（2026-08-31，全程没进游戏）
@@ -752,6 +790,9 @@ TASK.md 写的是「让 `chooseAttack` 交出技能 → 读 `tech->animation`(0x
 - ✅ **`FindAnimData()` 这道守卫必须留着，而且现在更要紧**：miss 时返回 NULL 是**正确行为**；同一个名字直接送进 `getAnimationData()`（`operator[]` 语义）就会往引擎的 `allAnims` 里永久插一条空指针（§15 / CLAUDE.md 硬约束）。**攻击 clip 名是「一定 miss」的那一类，绝不许绕过它。**
 - **推论（与 §15 的游戏内结果一致）**：人形表里 `attacks=0`、`ANIM_ATTACKS`/`ANIM_COMBAT` 各 0 条，而 `guard 1h` 那类**架势**在表里 —— 现在知道为什么了：**架势有记录，挥砍没有**。攻击的播放路径不经过记录表，所以它也不可能携带 `wholeBodyAllLayer`。
 - ⚠️ **剩下的是纯运行时问题，静态答不了、别在文档里假装答了**：①一条**没有记录**的 clip 被请求时落在哪个层、走的是哪个 API；②我们钉着 `w=1.0` 的 `kRidePose`（UPPER＋`whole`）会不会像 P2-1b-1 那样把它压在 `w=0.000`。⇒ P4-3 的路线判断**不变**：手控骨 + blend mask 仍是唯一已证可用的杠杆（clip 压不动手控骨）。
+- ✅✅ **运行时确认（2026-09-01 第六趟，`P41D` 判读层，312832 B）**：`chooseAttack` 交出的名字正是这一族裸 clip 名（`flykick` ×21 / `megakick` ×13 / `shoteiL` ×12 / `ma chudan` ×3 / `ma 2strike` ×2，`ch=1` 出现在 107 次读里的 51 次），其中 **5 个报 `ABSENT in allAnims`** ⇒ §19.3 的离线结论在引擎侧成立。
+  - ⚠️⚠️ **同一趟还量到一个新事实：引擎自己已经把其中一批种成了 NULL。** 13 行 `P41D clip key='<名>' ptr=0000000000000000 UNREADABLE`（`shoteiL` / `flykick` …）—— 那个调用点只有 `allAnims.find()` **命中**才走到 ⇒ **键在表里、值是空指针 ＝ 中毒条目**。能造成它的只有 `getAnimationData()` 的 `operator[]` 语义，而插件这一侧一个字节都没送进去（`FindAnimData()` 返回 `mi->second`、调用方全部指针判空）⇒ **是引擎的战斗代码自己拿技法 clip 名查过一次**。
+  - ⇒ **判读纪律**：同一份日志里 `ABSENT`（还没人查过）与 `find` 命中却 `ptr=0`（已经被查过、留下了毒）会**并存**，两者都**不是**「记录存在」。⇒ 「靠 `layer`/`wholeBodyAllLayer` 判层」这条路在运行时也确认没有 ⇒ 只能钉上去实测。**这条同时是 §15 那道 `FindAnimData()` 硬约束的活体证据：连引擎自己都在污染这张表。**
 
 ### 19.5 Ogre `.skeleton`（`[Serializer_v1.80]`）—— 长度字段**不可信**
 ```
@@ -772,3 +813,99 @@ chunk = [u16 id][u32 recordedLength] <payload>
 - `python tools\gamedata.py` ＝ itemType 直方图 ／ `--verify` 自检 ／ `--anim [子串]` ANIMATION 表 ／ `--tech` 技能→记录 ／ `--rec <子串>` 整条记录 ／ `--refs <子串>` 引用类别 ／ `--type <N>`。
 - `python tools\skelanims.py` ＝ 人形骨架的骨数＋全部轨道 ／ `--find <子串>` 过滤 ／ `--skel <文件名子串>` 换骨架 ／ `--list` 全部 `.skeleton` 的轨道数 ／ `--tech` 上面那张交叉核对表（它 `import gamedata`）。
 - 附带结论：type-112 `base animations`（`1533847-gamedata.base`）**不靠引用枚举任何东西**（0 个 refcat，只有两个 `.skeleton` 文件名字段）；所有名为 `animations` 的 refcat 都挂在 **itemType 76** 记录上。
+
+---
+
+## 20. 例本：工坊 2994497775 的 `ride.dll` 怎么做骑乘（**静态读二进制，2026-09-01，没进游戏、没读 hook 体**）
+
+**身份**：`D:\steam\steamapps\workshop\content\233860\2994497775` ＝「帝国风云（版本1.9.4.6.2）」（`<mod>2333</mod>`，最后更新 2026-08-31），是一份 **RE_Kenshi 插件 mod**：
+`RE_Kenshi.json` ＝ `{ "Plugins" : [ "plugin/KenshiExtensionPlugin.dll", "2333.dll","ride.dll" ] }`。
+`ride.dll` 163840 B，唯一导出 `?startPlugin@@YAXXZ`（ride.dll+0x1230），PDB 路径
+`C:\Users\HP\KenshiLib_Examples_deps\ride\x64\Release\ride.pdb` ⇒ **和我们同一个底座**（KenshiLib 示例工程 ＋ MSVCR100/VS2010 CRT）。
+用户实测过它：「用人的骨架做了一匹马把人扛起来，扛起来的人物可以战斗」。
+
+⚠️⚠️ **本节全部是第三方二进制的静态读数 ＝ 线索，不是证据。** 拿它做任何改动仍要过原来三道门（静态核地址 → 编译 → 进游戏实测），和 §19.6 同一条纪律。**hook 体一个都没反编译**，凡标「静态推断」的都待核。
+
+### 20.1 它挂了 12 个钩子，一个都不在我们的禁用名单上
+**手法**（和我们不同，值得记）：`GetModuleHandleA("KenshiLib.dll")` ＋ `GetProcAddress(<C++ 修饰名>)` → `KenshiLib::GetRealAddress` → `KenshiLib::AddHook`。⇒ 名字是**运行时字符串**，二进制里躺着完整修饰名 ⇒ **hook 清单可以静态点名**（12 个 `GetRealAddress` 站点：2 个在 `startPlugin` 里直接 `AddHook`，另 10 个走同一个包装 ride.dll+0x11400）。虚函数（`hitByMeleeAttack` / `update` / `mainLoop_GPUSensitiveStuff` / `operate`）只能这么拿地址，这也解释了为什么它们不在静态导入表里。
+
+| 安装点（ride.dll RVA） | 钩住的 KenshiLib 导出 |
+|---|---|
+| `startPlugin` 0x1230 | `TitleScreen::_CONSTRUCTOR`（延后初始化）、`GameWorld::mainLoop_GPUSensitiveStuff(float)`（**每帧驱动**） |
+| 0x2ED0 | `Character::hitByMeleeAttack(...)`、`MedicalSystem::addWound(...)` |
+| 0x3410 | `Character::dropCarriedObject(bool,bool)` |
+| 0x3470 | `UseableStuff::operate(Character*,float)` |
+| 0x36E0 | `CharBody::_move(RootObjectBase*,const Vector3&)`、`HavokCharacter::calculateAvoidanceVector(...)`、**`CombatMovementController::combatMovementAnimationUpdate(const Vector3&,const Vector3&,AnimationClass*,bool)`**、`CharMovement::update(float)` |
+| 0x3800 | `GameWorld::resetGame()` |
+| 0x3920 | `Character::_startStumble(CutDirection,Damages&,GameData*,Character*)` |
+
+### 20.2 三条「它不做什么」—— 对我们信息量最大的部分
+1. **完全没有 Ogre `AnimationState` / blend mask**：`OgreMain_x64.dll` 只导入 21 个符号，动画侧只有 `Node::setPosition` / `Node::setOrientation` / **`OldBone::setManuallyControlled`**（3 个调用点），刷新靠**主动调** `AppearanceBase::forceUpdateAnimationTransforms`。⇒ 它**没有我们 T8 那一类 mask 泄漏面**（我们的 `gLegMasked[]` / `LegMaskRelease` 是自选负担，不是骑乘的必需品）。
+2. **没挂我们永久禁的那两个**（`beingCarriedUpdate` / `updateAnimationTransforms`，§0）：每帧活儿挂在 `GameWorld::mainLoop_GPUSensitiveStuff`，变换刷新是主动调而不是挂钩子 ⇒ **一条独立的结构旁证：那两个钩子确实不是必需品。**
+3. **全身骨都手控，不止腿**：`.rdata` 里 22 根骨名 —— `Bip01 Pelvis` / `Spine`/`Spine1`/`Spine2`/`Spine3` / `Neck` / `Head` / 左右 `Clavicle`/`UpperArm`/`Forearm`/`Hand` / 左右 `Thigh`/`Calf`/`Foot`。⇒ 手控骨在生态里是**常规手法**，不是我们独有的偏方（与 §16 一致）。
+- 输入只有 `USER32!GetAsyncKeyState` 一个 ⇒ 没有键位设置界面，我们 §14 那条（键位进原版设置菜单）比它完整。
+
+### 20.3 座位底座 ＝ 引擎原生 carry ＋ 队伍改派
+静态导入里成套出现：`Character::pickupObject` / `getPickedUp` / `carryModeT(bool,bool,bool)` / `isBeingCarried` / `dropCarriedObject` / `getDropped` / `hand`（`isValid` / `getCharacter` / `toString`）/ `CharBody::getCurrentSubject` / `Character::setBedMode`。⇒ **它不自建座位，直接让「马」扛人**（＝ 用户看到的样子），我们 §2-§4 那套 carry 逆向对它是同一片地。
+队伍侧：`ActivePlatoon::getSquadLeader` / `setSquadLeader` / `addCharacterAt` / `Character::setSquadMemberType` / `getPlatoon` ＋ 存值键字符串 `mount_old_squad_type` ⇒ 上马时把骑手改派进坐骑的队伍、下马时按记下来的旧值还原。位置侧：`teleport`（两个重载）/ `get`/`setTerrainHeightPosition` / `getCurrentFloor` / `getBoneWorldPosition` / `CharMovement::trackAnimationMovement` ＋ `isTrackingAnimationMode` / `AbstractMovementBase::setDesiredSpeed`。
+
+### 20.4 坐姿疑似走「换 `idle stance` 授权引用」而不是每帧压骨（**静态推断，待核**）
+`.rdata` 里有三个字符串 `idle stance`（＝ 引用类别名）、`idle_stand_normal`（＝ 目标 stringID 形状）、`races`，配合导入的 `GameData::getReferenceList` / `GameDataReference::getPtr` / `GameDataContainer::getDataOfType` / `Character::get`/`setAppearanceData`，再配合存值键 `mount_old_idle_stance`（＝ 上马前的旧值，下马还原）。
+⇒ 读法是：**它换的是角色授权侧的站姿引用，让引擎自己去播那条 clip**，不是像我们那样每帧把骨压过去。⚠️ 只有字符串 ＋ 导入的组合，**hook 体没读 ⇒ 不算定论**。
+⇒ **对我们的意义（也只是意义，不是方案）**：如果站姿引用真能在运行时换，那 P2 的坐姿有可能不必靠 mask ⇒ T8 那条泄漏面有机会整块消失。要动之前必须先反编译它的 hook 体，再走三道门。
+
+### 20.5 战斗侧七个钩子逐个对到我们的阶段上
+- **`CombatMovementController::combatMovementAnimationUpdate`** ＝ 我们路线 A 每天在打的那一层（`guard 1h` 抢躯干、`pose=` 权重、TWIST）的**正规缝**。我们从来没在这里挂过钩子 ⇒ **这是本节最值得跟进的一条。**
+- `CharMovement::update`（虚）＋ `CharBody::_move` ＝ 移动/跟随的两个接缝（我们现在靠别处的每帧回调）。
+- **`Character::_startStumble`** ＝ 抗打断。我们 P4-4 走的是「被击倒就强制下马」，它多一个选择：**把踉跄本身吃掉**。
+- **`HavokCharacter::calculateAvoidanceVector`** ＝ 让坐骑与骑手不互推（我们的「人粘在鞍座上」是靠别的办法维持的）。
+- `Character::hitByMeleeAttack`（虚）＋ `MedicalSystem::addWound` ＋ 导入的 `Damages::multiply` ⇒ **伤害分流/缩放**（谁吃这一刀、吃多少）；我们 P3 是自己那一套。
+- `UseableStuff::operate`（虚）＝ 交互式上马；`GameWorld::resetGame` ＝ 读档/新游戏时清状态（我们该照抄这个习惯）。
+
+### 20.6 还没读的与怎么读
+- **没读**：`ride.dll` 的 hook 体（下一步：Ghidra，先读 `combatMovementAnimationUpdate` 与 `mainLoop_GPUSensitiveStuff` 两个 hook，再读 20.4 那条 `idle stance` 路径）、`2333.dll`（45568 B，看着是这份 mod 自己的玩法插件）、`plugin\KenshiExtensionPlugin.dll`（1229312 B ＝ 第三方框架 KEP，带 `kep_settings.json` 与 ja_JP/ru_RU 的 gettext `.mo`）。
+- **怎么读（可复现）**：`ride.dll` 的清单是纯 PE 静态读 —— 导入表 ＋ `.rdata` 里的修饰名字符串 ＋ `FF 15` 间接调用站点回指 IAT ＋ `.pdata` 归属。⚠️ 它的名字是 **KenshiLib 导出名**、不是 exe 地址 ⇒ 本节**故意不写任何 `kenshi_x64.exe` 地址**；真要落到 RVA 得走 §18 那条 header RVA ＋ `HEADER_RVA_DELTA` 的换算，而且换算结果只许写在本文件里。表格里的 `0x1230` 一类**是 `ride.dll` 自己的 RVA**，别拿去和 §12 的表比。
+
+## 21. `Ogre::AnimationState` 的生命周期 —— TASK.md T8 的 (a)/(b) fork **定案：(b)**（2026-09-01，全程静态，没进游戏）
+
+**一句话**：`dropped` 不是「那个对象死了」，它就是「那条 clip 停了」。⇒ 我们清零的大腿 handle **留在一个活着的对象上**，泄漏真实、按 `(角色, clip)` 计、跨趟累积。
+
+### 21.1 四条静态事实（都可复现）
+
+1. **取 state 只有一条路，而且是查表、不是创建。** `0x51CAA0`（104 B、Ghidra `EXACT_ENTRY true`）＝ `AnimationNameIDMapper::getSingleton()` → `getAnimationID(name)` → `Entity::hasAnimationState(id)` → `Entity::getAnimationState(id)`，没有就返回 NULL。**`param_1 + 0xA8` ＝ `Ogre::Entity*`**（宿主是 `AnimationClass` 一族）。孪生体 `0x51CB10`（89 B）同形，但走 `+0xB8` 那个带虚表的载体、虚槽 `+0x1D8`。另有两个不带 `has` 检查的取法：`0x845B60+0x2F`、`0x84B890` 里三处。
+2. **`SingleAnimation` 绑定 ＝ `0x5B3090`（186 B）**：`+0x28` 非 0 就直接返回（已绑）；否则按名字查（`+0x38` ＝ 宿主 `AnimationClass`，而 `param_1` 自己就被当 `std::string*` 传进去 ⇒ **`SingleAnimation+0x00` ＝ clip 名**），存进 `+0x28`，再 `setLoop`/`setWeight(0)`/`setTimePosition`/`setEnabled(true)`。
+3. **解绑 ＝ §18.9 ① 那个 `0x5B15C0`（83 B）**：`setWeight(0)` → `setEnabled(false)` →（`+0x68` 时）`setDisableTranslation(true)` → `+0x28 = 0`。**没有 destroy，也没有碰 blend mask。** 2 与 3 正好是一对，`+0x28` 是同一个字段。
+4. **exe 对 `Ogre::AnimationState` 的全部导入 ＝ 8 个方法，全是属性存取**（`setWeight` 20 站点 / `setEnabled` 15 / `setDisableTranslation` 11 / `getLength` 17 / `setTimePosition` 10 / `setLoop` 5 / `getTimePosition` 2 / `getAnimationName` 2）。**`blendmask` 在 2542 条导入里 0 命中**，也没有任何 ctor/dtor、`createAnimationState`/`destroyAnimationState`/`removeAnimationState`。⇒ Kenshi **不可能**创建或销毁一个 state，也**不可能**清掉一个 blend mask ⇒ **往 state 上装 mask 的只有我们自己**。（导入是链接期事实 ⇒ 「导入表里没有」对跨模块 API 是**证明不存在**，不是「没找到」。查法：`python tools\callers.py --import "(?i)blendmask"`。）
+
+### 21.2 定案：`dropped` 的成因就是 clip 停了
+
+`LegMaskRelease` 判 live 的方式是「某 layer 的 `addList`/`removeList` 里有 `SingleAnimation::mainState == st`」。而 21.1(3) **一停 clip 就把 `mainState` 写 0** —— 那条 `SingleAnimation` 还在表里、state 也还活在实体的 `AnimationStateSet` 里，只是 `mainState` 不再等于它 ⇒ 我们**必然**查不到 ⇒ 记 `dropped`。所以第六趟那个「7 个里 6 个查不到」根本不是异常，是**停了的 clip 的数量**。
+
+⇒ **(b) 成立**：mask 留在活对象上；而且按 21.1(2)，下次播同一条 clip 会用**同一个 animation ID** 从**同一个实体**取回**同一个对象**，我们清零的大腿 entry 原样在上面。
+
+### 21.3 (a) 那一支剩下的唯一出口 —— 不在骑乘路径上
+
+一个 state 只会随实体那整套 set 一起重建，能做这件事的只有：
+
+- **`Entity::_initialise(bool)`**，全 exe **2 个真站点**：`0x449930+0x16`（该函数 123 B，实参 **`false`** ⇒ 已初始化的实体**不**重建）与 `0x44BF40+0x5CB`（该函数触 `'queued'`/`'preloaded'`/`'load_id'`/`'loaded'`/`'Kenshi_ProgressBarFill'` ⇒ **资源装载/进度条**那条路）。
+- **`shareSkeletonInstanceWith`**（`0x52D480+0x86`、`0x84B890+0x16B`）与 **`stopSharingSkeletonInstance`**（`0x52DC90+0x292`、`0x531F40+0x89`）—— 都作用在**副实体**上：`0x52DC90` 触 `'overlap items'`、`0x531F40` 触 `'Hair'`、`0x84B890` 触 `'idle stance'`/`'Posture'`/`'Neck position'`/`'portrait offset x'`/`'RTT_Portrait'` ＝ **立绘 RTT**（顺带：§20.4 说例本换的那个 `'idle stance'` 授权键，Kenshi 自己在立绘路径上也读）。
+- ⚠️ **`_deinitialise` / `destroyEntity` / `destroyMovableObject` / `~Entity` 一条都没导入** ⇒ 实体的死法全在 OgreMain 内部，静态看不见。
+
+⇒ 上/下马不碰这些站点；但**角色实体一旦被重建或卸载，我们那张跟踪表的指针会整体悬空**。这就是修法必须自带活性判据、而不能直接解引用旧指针的理由。
+
+### 21.4 修法因此有了确定的对象（⚠️ **设计，未实现、未实测**）
+
+不再要求「在 `addList`/`removeList` 里查得到」，改成**按名字回取、再比对指针**：装 mask 时抄下 clip 名 ⇒ 交还时用 `AnimationNameIDMapper::getSingleton()` ＋ `getAnimationID(name)` ＋ `Entity::hasAnimationState(id)` ＋ `Entity::getAnimationState(id)` 重新取一次（**四个都是 OgreMain 导出，不需要任何 exe 地址、不需要新 hook**）：
+
+- 取回**同一个指针** ⇒ 对象活着、还是那条 clip ⇒ **可以安全清 mask**；
+- 取回 NULL 或换了指针 ⇒ 那套 set 被重建过 ⇒ 无事可做，丢掉是对的。
+
+宿主实体从 `AnimationClass + 0xA8` 取（21.1(1)；若 KenshiLib 头里已有字段名就用头里的）。⚠️ 这**只是交还我们自己装的 mask**，不是往骨头上多写一次 —— 写入端补偿照旧禁止（`HISTORY.md` §B）。
+
+### 21.5 顺带的后果
+
+- **原计划为分 (a)/(b) 而做的那一次构建 ＋ 一趟骑乘不用做了**（TASK.md 那条 fork 已改判、`TEST_REQUIRED.md` 也不用再加格子）。
+- **「泄漏的是不是起步/转向那类短命 clip」这个问题与 (a)/(b) 脱钩了**：不管哪条 clip，mask 都留着。⇒ 起步那一下「轻微夹腿」的候选解释变成「**上一趟留在起步/转向 clip 上的 mask**」，但**仍未证实** —— 要么按装 mask 时数「已经清零的 handle」那个自足判据数一次，要么直接上 21.4 的修法看症状消不消。
+- ⚠️ **全节是反编译 ＋ 导入表读数 ＝ 静态事实，不是实测**（§18.9 末尾那句照旧有效）。⚠️ **Kenshi 的 OgreMain 是改过的**（`AnimationNameIDMapper`、`Entity::hasAnimationState(uint)` 按 **ID** 取而不是按名字、`OldSkeletonInstance`）⇒ **别拿上游 Ogre 源码当第二真相源**。
+- **工具**：新增 `python tools\callers.py --import <regex>`（列匹配的导入符号 ＋ 它们的 `FF 15`/`FF 25` 站点，底层 `ke_pe.imports()`）。⚠️ 只对**跨模块**调用有效；Kenshi 自己的函数在本 image 里，这条看不见。
+

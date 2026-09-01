@@ -16,6 +16,15 @@ import struct
 KENSHI_EXE = r'D:\steam\steamapps\common\Kenshi\Kenshi_x64.exe'
 HEADER_RVA_DELTA = 0x780          # 1.0.65; re-derive with hook_probe.py --delta
 
+# What a `site=` printed by an in-game naming probe has to be shifted BY to become an RVA of
+# THIS file.  A probe reports `_ReturnAddress() - GetModuleHandle(exe)`, and that number does
+# not land on an instruction boundary here: every logged site decodes mid-instruction until it
+# is shifted up by this constant, at which point it lands exactly after a call whose target is
+# the hooked function.  Derive/verify it with `callers.py --ret <logged rva>` - never assume it.
+# ⚠️ Anchored on three sites in the 0x5CE000-0x5DC000 window only (RE_NOTES 18.10); the cause is
+# not established, so treat it as unverified elsewhere until a new anchor lands.
+RUNTIME_RVA_DELTA = 0xA90
+
 
 # --------------------------------------------------------------- PE basics ---
 
@@ -113,6 +122,46 @@ class PE(object):
         if f:
             return 'mid+%d' % (rva - f[0])
         return 'padding' if b[0] == 0xCC else 'leaf'
+
+
+# ---------------------------------------------------------------- imports ---
+
+def imports(pe):
+    """[(dll, symbol, iat_rva)] from the import directory, in table order.
+
+    Why this is an oracle and not a hint: an import is a LINK-TIME fact.  If
+    `Ogre::AnimationState::destroy...` is absent from this list, the exe cannot call it -
+    no vftable, no function pointer, no /LTCG duplication can hide it, because the call
+    would have nothing to bind to.  So "not in imports()" is a proof of absence for any
+    API that lives in another module (all of OgreMain), which no .text scan can give.
+    ⚠️ Only for cross-module calls.  Kenshi's own code is in this image and is invisible here.
+    """
+    d = pe.d
+    rva, size = struct.unpack_from('<II', d, pe.pe + 24 + 112 + 1 * 8)
+    if not rva:
+        return []
+    out, o = [], pe.off(rva)[0]
+    while o is not None:
+        oft, _ts, _fc, nameptr, first = struct.unpack_from('<IIIII', d, o)
+        if not (oft or first):                      # null descriptor terminates
+            break
+        no = pe.off(nameptr)[0]
+        dll = bytes(d[no:d.find(b'\0', no)]).decode('latin1') if no else '?'
+        t, iat = pe.off(oft or first)[0], first
+        while t is not None:
+            v = struct.unpack_from('<Q', d, t)[0]
+            if not v:
+                break
+            if v & (1 << 63):
+                sym = 'ordinal#%d' % (v & 0xFFFF)
+            else:
+                so = pe.off((v & 0x7FFFFFFF) + 2)[0]
+                sym = bytes(d[so:d.find(b'\0', so)]).decode('latin1')
+            out.append((dll, sym, iat))
+            t += 8
+            iat += 8
+        o += 20                                     # next descriptor
+    return out
 
 
 # ------------------------------------------------------------------- RTTI ---
