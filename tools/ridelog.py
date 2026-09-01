@@ -222,6 +222,10 @@ class Session(object):
         self.at_sites = {}       # site -> {"ov":n,"hands":n,"other":n,"slots":set()}
         self.at_lines = 0
         self.at_hands = 0        # logged lines whose slot was "hands"
+        # The count report_attach() actually judged on (dump counter if present,
+        # else the logged-line count).  Stashed so report_p41d() can cross-check
+        # its own weapon gate against it - see the "genuinely unarmed" branch.
+        self.at_hands_best = 0
         self.at_dump = None      # last "sites=.. hands=.. over=.. hk=.. app=.." payload
         self.at_hookfail = []    # "Could not hook AppearanceBase::attachItem (N-arg)!"
         # P4-3 step 3, naming half: the P41D combat lever.  Its ONE question here is
@@ -239,7 +243,13 @@ class Session(object):
         self.p41d_rung_rows = [] # dicts of each "P41D rung=" line (rider half)
         self.p41d_clip_absent = []    # names reported ABSENT in allAnims
         self.p41d_clip_unres = []     # names that could not even be looked up
-        self.p41d_clip_rows = []      # LogAnimRow("P41D clip", ..) rows, verbatim
+        self.p41d_clip_rows = []      # LogAnimRow rows that SNAPSHOTTED (lay=/flags= readable)
+        # LogAnimRow's OTHER shape: "key='..' ptr=%p UNREADABLE".  It is NOT a
+        # resolved record and must never be filed with the rows above: the call
+        # site only reaches LogAnimRow when allAnims.find() HIT, so ptr=0 means
+        # the map holds a key with a NULL value = a poisoned entry (engine-side
+        # getAnimationData() = operator[]).  That is a finding, not a pass.
+        self.p41d_clip_null = []      # verbatim "... ptr=.. UNREADABLE" rows
         self.p41d_abandoned = False   # "all rungs disarmed - ladder abandoned"
 
 
@@ -518,6 +528,11 @@ def parse(path, s):
                             s.p41d_clip_absent.append(m.group(1))
                         else:
                             s.p41d_clip_unres.append(m.group(1))
+                    elif "UNREADABLE" in line:
+                        # LogAnimRow's failure shape, "key='..' ptr=%p UNREADABLE".
+                        # Keep it OUT of p41d_clip_rows: it is the opposite of a
+                        # resolved record (see the field comment).
+                        s.p41d_clip_null.append(line.strip())
                     else:
                         # LogAnimRow's own shape: key='..' data='..' clip='..' lay=..
                         s.p41d_clip_rows.append(line.strip())
@@ -994,13 +1009,21 @@ def report_handback(s):
         print("    CHECK minDot missing - cannot say the bones returned to the"
               " binding pose")
     print("    " + verdict(drop == 0,
-                           "no tracked mask was dropped untraceable"
-                           " (dropped=0)"))
+                           "no tracked mask was dropped untraceable (dropped=%d)"
+                           % drop))
     if drop:
         print("        => THIS is the leak: %d mask(s) outlived the ride."
               "  The clip they sit on" % drop)
         print("           can no longer drive the thigh, which renders as the"
               " binding-pose straddle.")
+        # ⚠️ residue can NEVER contradict this, by construction:
+        # LegMaskResidueCount() re-scans only the LIVE addList/removeList, and a
+        # leaked mask sits on a state that is no longer listed.  So
+        # "residue=0 dropped>0" is the leak's normal shape, not a contradiction.
+        print("           !! residue=%d does NOT contradict it: residue re-scans"
+              " only the LIVE lists," % resid)
+        print("              and a leaked mask sits on a state that is no longer"
+              " listed at all.")
     if resid and not drop:
         print("        NOTE residue=%d with dropped=0 = somebody else's blend"
               " mask on our bones," % resid)
@@ -1636,6 +1659,9 @@ def report_attach(s):
     # The verdict itself.  Prefer the dump's counter (unbudgeted) over the
     # logged-line count (per-site budgets can hide repeats).
     hands = dump_hands if dump_hands is not None else s.at_hands
+    # Stash it for report_p41d()'s weapon gate: "wpn=0 pWpn=0" must not be read
+    # as "unarmed rider" when this same ride attached a weapon to the hand slot.
+    s.at_hands_best = hands
     trustworthy = (hk == 3) and (app is not None) and not bad_app
     if hands > 0:
         print("  ANSWER  attachItem(..., \"hands\") WAS called %d time(s) while"
@@ -1670,7 +1696,8 @@ def report_p41d(s):
           " (P41D) ==")
     total = (s.p41d_ai + len(s.p41d_read) + len(s.p41d_rung_rows)
              + len(s.p41d_precond) + len(s.p41d_clip_absent)
-             + len(s.p41d_clip_unres) + len(s.p41d_clip_rows))
+             + len(s.p41d_clip_unres) + len(s.p41d_clip_rows)
+             + len(s.p41d_clip_null))
     if not total:
         print("  no P41D line at all - NOT MEASURED, and that has five innocent"
               " readings:")
@@ -1696,10 +1723,11 @@ def report_p41d(s):
         print("    = 375 frames with a target inside 40u.")
         return
     print("  lines: ai=%d read=%d rung=%d precond=%d | clip rows=%d absent=%d"
-          " unresolved=%d"
+          " unresolved=%d null=%d"
           % (s.p41d_ai, len(s.p41d_read), len(s.p41d_rung_rows),
              len(s.p41d_precond), len(s.p41d_clip_rows),
-             len(s.p41d_clip_absent), len(s.p41d_clip_unres)))
+             len(s.p41d_clip_absent), len(s.p41d_clip_unres),
+             len(s.p41d_clip_null)))
     print("")
     print("  -- did chooseAttack yield? (the one question) --")
     yields = [d for d in s.p41d_read if d.get("ch") == "1"]
@@ -1788,10 +1816,31 @@ def report_p41d(s):
                   " past the weapon entirely.")
         else:
             print(verdict(False, "no weapon on either accessor (wpn=0 pWpn=0)"))
-            print("          => this rider is genuinely unarmed; ch=0 is then"
-                  " arithmetic, not a finding.")
-            print("            Give the rider a weapon and re-ride before"
-                  " reading anything into ch=.")
+            # ⚠️ Cross-section, because this branch used to print "genuinely
+            # unarmed" and trip 7 (2026-08-31) disproved it INSIDE THE SAME LOG:
+            # P43SH counted real sheathes and P43AT counted hand attaches, so the
+            # rider demonstrably owned a weapon and had it in the hand slot.
+            # wpn=0 at every read only means it was already back on his back BY
+            # THEN.  Each report_* judges one section, so say it here explicitly.
+            sh_real = sum(e["real"] for e in s.sh_sites.values())
+            if sh_real > 0 or s.at_hands_best > 0:
+                print("          !! but NOT unarmed: this same ride logged"
+                      " P43SH real=%d sheathe(s) (per-site," % sh_real)
+                print("             budgeted - the dismount dump counts more)"
+                      " and P43AT hands=%d hand-attach(es)" % s.at_hands_best)
+                print("             => the weapon exists and reached the hand"
+                      " slot.  wpn=0 on every read")
+                print("             means it was ALREADY re-sheathed by the time"
+                      " the lever read it => the")
+                print("             blocker is the re-sheather (P4-3 step 1's"
+                      " site), and ch= yielding only")
+                print("             unarmed techniques is the DOWNSTREAM effect of"
+                      " that, not an unarmed rider.")
+            else:
+                print("          => this rider is genuinely unarmed; ch=0 is then"
+                      " arithmetic, not a finding.")
+                print("            Give the rider a weapon and re-ride before"
+                      " reading anything into ch=.")
     print("")
     print("  -- the clip line (premise 2: is that name a record?) --")
     if s.p41d_clip_absent:
@@ -1830,7 +1879,32 @@ def report_p41d(s):
               " (see CLAUDE.md 人形动画表).")
         print("          !! still 静态字段: it predicts nothing about runtime"
               " weight - pin it and look.")
-    if not (s.p41d_clip_absent or s.p41d_clip_unres or s.p41d_clip_rows):
+    if s.p41d_clip_null:
+        for ln in s.p41d_clip_null[:6]:
+            print("     %s" % ln)
+        if len(s.p41d_clip_null) > 6:
+            print("     ... %d more" % (len(s.p41d_clip_null) - 6))
+        print(verdict(False, "find() HIT but the record pointer is NULL - this is"
+                             " NOT a resolved record"))
+        print("          => the call site only reaches this row when"
+              " allAnims.find() succeeded, so a")
+        print("            NULL value means the engine's own map CARRIES THAT KEY"
+              " WITH A NULL VALUE")
+        print("            = a poisoned entry (getAnimationData() is operator[]"
+              " semantics; see")
+        print("            CLAUDE.md 关键机制).  The engine's combat code queried"
+              " the technique clip")
+        print("            name itself and planted it.  That is a finding, not a"
+              " pass:")
+        print("            'ABSENT' = never queried, this = queried already and"
+              " left as a NULL.")
+        print("          => our side is safe by construction (FindAnimData"
+              " returns mi->second and every")
+        print("            caller pointer-tests it), but the layer question stays"
+              " UNANSWERED for these")
+        print("            names - there is no record to read lay=/flags= off.")
+    if not (s.p41d_clip_absent or s.p41d_clip_unres or s.p41d_clip_rows
+            or s.p41d_clip_null):
         print("     no clip line at all.")
         if not yields:
             print("     => EXPECTED, not a failure: the clip line is guarded by"

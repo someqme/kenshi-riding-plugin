@@ -512,7 +512,7 @@ CLAUDE.md 只留指针，需要 hook 新函数 / 直调新方法时查本节。
 
 ### 18.2 `.pdata` 是唯一权威的「这是不是函数入口」神谕
 exe 的异常目录（data directory #3）里有 **77108 条 `RUNTIME_FUNCTION`**（`begin/end/unwind` 三个 dword）。排序后二分即可回答：**`entry`（精确入口）/ `mid+N`（在别的函数里面 N 字节）/ `leaf`（不在表里——小叶子函数不需要 unwind 数据）/ `padding`（`CC`）**。`UNWIND_INFO` 还白送 **`SizeOfProlog`**、flags（`0x4`=CHAININFO）、frame register。
-- ⚠️ **`leaf` 不等于「地址错了」**，`padding` 才是强信号（往后 0x10 找）。`getFacingDirection`@`0x2AE320` 就是真·leaf（`8B 42 08 …` 一个小 getter，全程直调、从没出问题）。
+- ⚠️ **`leaf` 不等于「地址错了」**，`padding` 才是强信号（往后 0x10 找）。`getFacingDirection`@`0x2AE320` 确实是真·leaf（不在 `.pdata` 里、无调用无栈帧），⚠️ **但「一个小 getter」这个说法是错的、已被反编译推翻**：`8B 42 08` 只是它的第一条指令，整个函数 **323 字节**、往对象里写 8 个字段 ⇒ **它是不是 `getFacingDirection` 现在存疑**（见 §18.9 ②）。它「全程直调、从没出问题」是真的，但那是因为直调走 `GetRealAddress`、**从不依赖这个 RVA**。
 - **这套解析器的正确性由 `0x5B5980` 反过来证明**：第一遍扫 15 个头 RVA 全部 MID，唯一报 `ENTRY` 的就是那个**早已实测可用**的地址。
 
 **序言＝hook 的唯一真实风险**（`KenshiLib::AddHook` 搬 5 字节、**无跳板**，§13）。判定手法 ＝ **拿生产环境的正对照比形状**，别去追求「5 字节正好是指令边界」：
@@ -678,6 +678,31 @@ callers.py --ptr 0x302B5 0x4B8D0        ->  各 1 个，都在 .rdata：0x16F2B1
 | `createPhysicsAttachment` | `0x5357A0` | `0x535F20` | 55 |
 
 ⚠️ **序言这道门只答「hook 装得上」，不答「该不该调」**：本节全部是静态事实，**用途仍止于点名**，⚠️ **不许由此变成「我们自己去调 `attachItem` 把武器挂上去」**（对绝对覆写做写入端补偿 ＝ HISTORY §B 那三轮伺服的老路）。
+
+### 18.9 反编译器就位（Ghidra 12.1.3）＋ 它当场推翻的两条（2026-09-01）
+
+**工具**：Ghidra 12.1.3 ＋ Temurin JDK 21 便携装在 `D:\KenshiModDev\revtools\`（仓库外、无需管理员、不改系统环境）。`kenshi_x64.exe` 的 auto-analysis **506 秒**跑完并存成工程 `revtools\ghidra-projects\kenshi`（462 MB，**一次性开销、别重跑**），得 **169,169 个函数**。接了 MCP 桥 `pyghidra-mcp`；不经 MCP 也能查：`revtools\scripts\DecompAt.java`（按地址反编译）/ `FindSym.java`（按子串搜符号）走 `analyzeHeadless -process kenshi_x64.exe -noanalysis -readOnly -postScript`。⚠️ 脚本**只能写 Java**（这份 Ghidra 没按 PyGhidra 模式启动，`.py` 一律报 `Ghidra was not started with PyGhidra`）。⚠️ 搜符号必须用 `getName(true)` 取**全限定名**，`getName()` 会全 0 命中（类名在 namespace 里）。
+
+**新能力：RTTI 类名是活的，`ke_pe.py` 的虚表库现在有名字了。** 6,290 个 `vftable` 标签 ＋ 18,989 条 RTTI 记录，且用的就是我们笔记里的类名：`AbstractMovementBase::vftable`@`0x1416FCBA8`、`CharMovement`@`0x1416FCC88`、`AnimationClass`@`0x1416F10E8`、`AnimationClassHuman`@`0x1416F1268`、`AnimationClassAnimal`@`0x1416F4588`、`AnimationClassBase`@`0x1416FA888`、**`PhysicsHullT`**@`0x1416DE808`（§13 记的「只前向声明」这条限制到此解除），`AnimationClassBase::SingleAnimation` 与 `::AnimationLayer` 也在。**Ogre 的方法名是真名**（`Ogre::AnimationState::setWeight` 直接出现在反编译结果里）⇒ 凡是调进 Ogre 的地方不用再猜。⚠️ **Kenshi 自己的方法名一个都没有**（`getFacingDirection` / `updateAnimationTransforms` / `beingCarriedUpdate` 全 0 命中）——stripped 是实的，RTTI 只给类名不给方法名。
+
+**① `0x5B15C0` 的函数体不是「每帧更新动画变换」** —— §18.1:507 已按字节把 `updateAnimationTransforms→0x5B15C0` 划掉，反编译从语义上第二次否掉它。Ghidra 认这是**精确入口**（`EXACT_ENTRY true`）但整个函数只有 **83 字节**：
+
+```c
+*(undefined4 *)(param_1 + 0x54) = 0x3f800000;          // = 1.0f
+if (*(AnimationState **)(param_1 + 0x28) != NULL) {
+    Ogre::AnimationState::setWeight(..., 0.0);
+    Ogre::AnimationState::setEnabled(..., false);
+    if (*(char *)(param_1 + 0x68) != '\0') Ogre::AnimationState::setDisableTranslation(..., true);
+}
+*(undefined8 *)(param_1 + 0x28) = 0;                    // 断开那个 AnimationState
+```
+
+＝**拆掉一个动画槽位**，不是遍历骨骼的变换更新。`+0x28` 是 `Ogre::AnimationState*`、`+0x54` 是个 float、`+0x68` 是个 bool ⇒ 这个布局像 `AnimationClassBase::SingleAnimation`（它的 RTTI 与虚表现在都能查，见上）。⚠️ **这只是「函数体与名字不符」，不是「已确认它是别的函数」**，更**不构成解禁依据** —— `updateAnimationTransforms` 的真实入口**仍未定位**（`RidingPlugin.cpp` 的 `DISABLED HOOKS` 块写的 "The real entry is still unlocated" 才是对的口径）。
+
+**② `getFacingDirection@0x2AE320` 不是「一个小 getter」，§18.2:515 那句要改。** 那里写它是「`8B 42 08 …` 一个小 getter」——`8B 42 08`（`mov eax,[rdx+8]`）只是它的**第一条指令**。Ghidra 认这里是精确入口、**323 字节**，反编译出来是：把 `[rdx+8..0x18]` 5 个 dword 拷进 `[rcx+0x158..0x168]`，写 `[rcx+0x125]`/`[rcx+0x128]`，再把几个 float 夹进 `[rcx+0x110..0x11c]`，带 ~7 个参数。**一个返回朝向的 const getter 不会往对象里写 8 个字段** ⇒ **`+0x790 → getFacingDirection` 这一条现在存疑**（它是 `+0x790` 那一族仅剩的两根支柱之一）。对得上的部分：`0x2ADB90`（头值）与 `0x2AE310`（`+0x780`）在 Ghidra 里**都没有函数** ⇒ §18.1:507「+0x780 处是纯 `CC`」与「头 RVA 不可靠」两条都被独立确认。
+
+⚠️ **本节全是反编译读数 ＝ 静态事实，不是实测。** 反编译能证伪「这个地址是那个函数」，**不能**证明「换成这个地址 hook 就不崩」。禁 hook 令是实测结论、原样有效（`doc.md`「禁止注册的危险 hook 地址」节）。
+
 
 ## 19. 离线读 FCS 数据文件 + Ogre `.skeleton`（2026-08-31，全程没进游戏）
 

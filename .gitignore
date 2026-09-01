@@ -5,6 +5,7 @@
 
 # Internal dev notes (not for the public repo)
 CLAUDE.md
+doc.md
 RidingPlugin_HISTORY.md
 TASK.md
 TEST_REQUIRED.md
@@ -17,7 +18,7 @@ dmp.py
 
 # Superseded seat-table snapshots: kept on disk for provenance, not worth publishing.
 # snapshots/ itself IS tracked - it holds the inputs the shipped kDefaultSeats[] was
-# generated from (see CLAUDE.md, 内置默认座位).
+# generated from (see doc.md, 内置默认座位).
 snapshots/_superseded/
 
 # Build intermediates (should never be inside the tree, but just in case)
