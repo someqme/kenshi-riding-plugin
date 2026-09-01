@@ -893,7 +893,7 @@ chunk = [u16 id][u32 recordedLength] <payload>
 
 ⇒ 上/下马不碰这些站点；但**角色实体一旦被重建或卸载，我们那张跟踪表的指针会整体悬空**。这就是修法必须自带活性判据、而不能直接解引用旧指针的理由。
 
-### 21.4 修法因此有了确定的对象（⚠️ **设计，未实现、未实测**）
+### 21.4 修法因此有了确定的对象（✅ **已实现、已部署；⚠️ 未实测** —— 验收在 `TEST_REQUIRED.md` T11）
 
 不再要求「在 `addList`/`removeList` 里查得到」，改成**按名字回取、再比对指针**：装 mask 时抄下 clip 名 ⇒ 交还时用 `AnimationNameIDMapper::getSingleton()` ＋ `getAnimationID(name)` ＋ `Entity::hasAnimationState(id)` ＋ `Entity::getAnimationState(id)` 重新取一次（**四个都是 OgreMain 导出，不需要任何 exe 地址、不需要新 hook**）：
 
@@ -902,10 +902,13 @@ chunk = [u16 id][u32 recordedLength] <payload>
 
 宿主实体从 `AnimationClass + 0xA8` 取（21.1(1)；若 KenshiLib 头里已有字段名就用头里的）。⚠️ 这**只是交还我们自己装的 mask**，不是往骨头上多写一次 —— 写入端补偿照旧禁止（`HISTORY.md` §B）。
 
+**实现（2026-09-01，312832 B / md5 `E7613634783EDE5E948573B0C6ED3285`）**：上面那四步**一个都不用自己拼** —— 它们整套就是 21.1(1) 那个 `0x51CAA0`，而这个函数在 KenshiLib 头里**是有声明的**（`AnimationClassBase::getAnimationState(const std::string&)`，header RVA `0x51C320` ＋ `HEADER_RVA_DELTA 0x780` ＝ `0x51CAA0` ⇒ **同一个函数，双向对上**）。⇒ 落地成三处改动，都在 `RidingPlugin.cpp`：①跟踪表多一列 `gLegMaskedName[64]`（装 mask 时从 `SingleAnimation::animName` 抄，即 21.1(2) 那个查表用的同一个字符串）；②`LegMaskRelease` 的 live 判据加第二条路 —— 路 1（两张表）失败时才问路 2 `rAnim->getAnimationState(clip) == st`，并计数 `gLegMaskLate`；③交还日志多一个 `late=` 字段。⚠️ **`body`（0xA8）为 NULL、名字为空、或回取到 NULL/别的指针一律照旧丢弃**，从不解引用旧指针；名字超 64 字符会被截断 ⇒ 退化成旧的 `dropped`，不会误判。⚠️ **`late` 是自证字段**：修法前每次交还 `dropped=2..4`，修法后健康形状是 `dropped=0 late=2..4`；**`late=0` 说明救援一次都没受力，此时 `dropped=0` 不构成证据**（`tools\ridelog.py` 会照这个三分法直接打结论）。
+
+
 ### 21.5 顺带的后果
 
-- **原计划为分 (a)/(b) 而做的那一次构建 ＋ 一趟骑乘不用做了**（TASK.md 那条 fork 已改判、`TEST_REQUIRED.md` 也不用再加格子）。
-- **「泄漏的是不是起步/转向那类短命 clip」这个问题与 (a)/(b) 脱钩了**：不管哪条 clip，mask 都留着。⇒ 起步那一下「轻微夹腿」的候选解释变成「**上一趟留在起步/转向 clip 上的 mask**」，但**仍未证实** —— 要么按装 mask 时数「已经清零的 handle」那个自足判据数一次，要么直接上 21.4 的修法看症状消不消。
+- **原计划为分 (a)/(b) 而做的那一次构建 ＋ 一趟骑乘不用做了**（TASK.md 那条 fork 已改判）。⚠️ `TEST_REQUIRED.md` 后来还是开了一格 —— 但那是 **T11 ＝ 验 21.4 修法本身**（`dropped=0 late>0` ＋ 肉眼大腿张开），**不是**分 (a)/(b) 的那一格。
+- **「泄漏的是不是起步/转向那类短命 clip」这个问题与 (a)/(b) 脱钩了**：不管哪条 clip，mask 都留着。⇒ 起步那一下「轻微夹腿」的候选解释变成「**上一趟留在起步/转向 clip 上的 mask**」；第七趟把它推到了尽头（宿主 clip 有两次是 `run lower`，被清零之后症状从「轻微、暂态」升级成「大腿一直打不开、只有小腿在动」＝ **(b) 的行为侧实证**）⇒ 走了 21.4 的第二条路：**直接上修法看症状消不消**，判决等 T11。
 - ⚠️ **全节是反编译 ＋ 导入表读数 ＝ 静态事实，不是实测**（§18.9 末尾那句照旧有效）。⚠️ **Kenshi 的 OgreMain 是改过的**（`AnimationNameIDMapper`、`Entity::hasAnimationState(uint)` 按 **ID** 取而不是按名字、`OldSkeletonInstance`）⇒ **别拿上游 Ogre 源码当第二真相源**。
 - **工具**：新增 `python tools\callers.py --import <regex>`（列匹配的导入符号 ＋ 它们的 `FF 15`/`FF 25` 站点，底层 `ke_pe.imports()`）。⚠️ 只对**跨模块**调用有效；Kenshi 自己的函数在本 image 里，这条看不见。
 

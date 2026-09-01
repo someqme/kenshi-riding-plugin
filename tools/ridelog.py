@@ -969,6 +969,12 @@ def report_handback(s):
     #             dereferenced, so its mask stays behind).  A leaked mask leaves
     #             that clip permanently unable to drive the thigh, which renders
     #             as the binding-pose straddle - the reported symptom.
+    #   late=     states the live lists had lost but the by-name re-fetch got
+    #             back and restored anyway (RE_NOTES 21.4).  On every build
+    #             before md5 E7613634... this field does not exist and those
+    #             entries were counted in dropped= instead.  A plain ride loses
+    #             2-4 clips this way, so late>0 / dropped=0 is the healthy shape
+    #             and late=0 means the route simply was not exercised.
     #   states=   how many AnimationStates the ride ended up masking (cap 8).
     print("")
     print("  -- handback audit (LEGPOSE handback, DLL 307712 B+) --")
@@ -990,14 +996,17 @@ def report_handback(s):
     bad_dot = [v for v in dots if v < 0.999]
     drop = 0
     resid = 0
+    late = 0
+    have_late = any("late" in d for d in s.handback)
     for d in s.handback:
         drop += int(fnum(d, "dropped", 0))
         resid += int(fnum(d, "residue", 0))
+        late += int(fnum(d, "late", 0))
     print("    handbacks=%d  worst minDot=%s  man!=0: %d  residue total=%d "
-          " dropped total=%d"
+          " dropped total=%d  late total=%s"
           % (len(s.handback),
              ("%.4f" % min(dots)) if dots else "?",
-             len(bad_man), resid, drop))
+             len(bad_man), resid, drop, late if have_late else "n/a"))
     print("    " + verdict(not bad_man,
                            "every bone left manual control"
                            " (man=0x00 on all handbacks)"))
@@ -1011,11 +1020,46 @@ def report_handback(s):
     print("    " + verdict(drop == 0,
                            "no tracked mask was dropped untraceable (dropped=%d)"
                            % drop))
+    # late= is the by-name re-fetch (RidingPlugin.cpp LegMaskRelease route 2,
+    # RE_NOTES 21.4).  Without it a stopped clip is untraceable and its mask
+    # leaks, so on a pre-fix build these very entries WERE the dropped= ones.
+    # dropped=0 therefore stopped being self-sufficient evidence: it can also
+    # mean "nothing stopped this ride", which proves nothing about the fix.
+    if not have_late:
+        print("        NOTE no late= field -> this log predates the by-name"
+              " rescue build (md5 E7613634...).")
+        print("             On that build dropped>0 was expected on any ride"
+              " where a clip stopped.")
+    elif late:
+        print("        PASS  the by-name rescue fired: %d mask(s) the live lists"
+              " had lost were" % late)
+        print("              still restored (RE_NOTES 21.2: a stopped clip nulls"
+              " mainState, which is")
+        print("              why route 1 alone leaked).  late>0 with dropped=0 is"
+              " the healthy shape.")
+    else:
+        print("        NOTE late=0: no clip stopped between mask install and"
+              " handback this ride,")
+        print("             so the rescue route was never exercised - dropped=0"
+              " here is NOT evidence")
+        print("             that it works.  A plain ride normally loses 2-4"
+              " (compare the pre-fix trips).")
     if drop:
-        print("        => THIS is the leak: %d mask(s) outlived the ride."
-              "  The clip they sit on" % drop)
-        print("           can no longer drive the thigh, which renders as the"
-              " binding-pose straddle.")
+        if have_late:
+            print("        => STILL LEAKING after the by-name rescue: %d mask(s)"
+                  " outlived the ride." % drop)
+        else:
+            print("        => THIS is the leak: %d mask(s) outlived the ride."
+                  % drop)
+        print("           The clip they sit on can no longer drive the thigh,"
+              " which renders as")
+        print("           thighs clamped at the binding pose with only the"
+              " calves animating.")
+        if have_late:
+            print("           Route 2 failing too means the state set was rebuilt"
+                  " (RE_NOTES 21.3), the")
+            print("           clip name did not fit 64 chars, or body/0xA8 was"
+                  " NULL - check those three.")
         # ⚠️ residue can NEVER contradict this, by construction:
         # LegMaskResidueCount() re-scans only the LIVE addList/removeList, and a
         # leaked mask sits on a state that is no longer listed.  So
@@ -1029,10 +1073,10 @@ def report_handback(s):
               " mask on our bones," % resid)
         print("             not our leak.  Information only.")
     for d in s.handback:
-        print("      %s man=%s minDot=%s residue=%s dropped=%s states=%s"
+        print("      %s man=%s minDot=%s residue=%s dropped=%s late=%s states=%s"
               % (d.get("_ts", "?"), d.get("man", "?"), d.get("minDot", "?"),
                  d.get("residue", "?"), d.get("dropped", "?"),
-                 d.get("states", "?")))
+                 d.get("late", "n/a"), d.get("states", "?")))
     print("    NOTE all-clean here does NOT clear the report: this measures the"
           " bones and the")
     print("    masks, and a straddle that survives BOTH is engine-side (whatever"

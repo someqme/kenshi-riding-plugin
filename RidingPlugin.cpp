@@ -4538,14 +4538,24 @@ static const int kLegHostGraceFrames = 12;
 static int       gLegHostGrace = 0;   // frames of missing host tolerated so far
 static Ogre::AnimationState* gLegMasked[kLegMaskMax];
 static bool                  gLegMaskedMine[kLegMaskMax];  // we created that mask
+// The clip name that state was bound from, so the release can re-fetch it by name instead of
+// hunting for it in the live lists.  RE_NOTES 21.1(2): SingleAnimation::initialiseMainState
+// looks the state up with exactly this string on exactly this AnimationClass, so the re-fetch
+// below is the SAME lookup that produced mainState in the first place - not a guess at it.
+// A name too long to fit simply fails to match later, which degrades to the old drop.
+static char                  gLegMaskedName[kLegMaskMax][64];
 static int                   gLegMaskedCount = 0;
 static bool                  gLegMaskOverflow = false;  // said once, then stop nagging
 // Tracked states that were untraceable at release time, i.e. the documented leak path in
-// LegMaskRelease.  Counted rather than acted on: a pointer we cannot find in either live list
+// LegMaskRelease.  Counted rather than acted on: a pointer we cannot find by EITHER route
 // must never be dereferenced, so the only honest thing to do is drop it AND say we did.  Read
 // it in the LEGPOSE handback line - a non-zero value is the one mechanism that could leave a
 // clip permanently unable to drive the thighs, which is what "legs stuck apart" would look like.
 static int                   gLegMaskDropped = 0;
+// Tracked states the live lists had LOST but the by-name re-fetch got back (RE_NOTES 21.2: a
+// stopped clip nulls SingleAnimation::mainState, so a plain ride loses 2-4 this way).  This is
+// the counter that proves the fix fired: before it existed these were exactly the dropped= ones.
+static int                   gLegMaskLate = 0;
 static bool              gLegCalfHave[2];   // knee bend captured this ride
 static Ogre::Quaternion gLegCalfSnap[2];
 static bool             gLegCalfManual = false;  // we are replaying the bend right now
@@ -4658,8 +4668,9 @@ static AnimationClassBase::SingleAnimation* LegPoseFindHost(AnimationClass* rAni
 
 // Remember one masked AnimationState so the restore can undo exactly what we did - and
 // nothing else.  "mine" records that WE created the mask; destroying one the engine owns
-// would silently unmask whatever bones it was holding out.
-static void LegMaskTrack(Ogre::AnimationState* st, bool mine)
+// would silently unmask whatever bones it was holding out.  The clip name is kept for the
+// by-name re-fetch in LegMaskRelease (see gLegMaskedName).
+static void LegMaskTrack(Ogre::AnimationState* st, bool mine, const char* clip)
 {
     if (!st) return;
     for (int i = 0; i < gLegMaskedCount; ++i)
@@ -4675,6 +4686,9 @@ static void LegMaskTrack(Ogre::AnimationState* st, bool mine)
     }
     gLegMasked[gLegMaskedCount]     = st;
     gLegMaskedMine[gLegMaskedCount] = mine;
+    gLegMaskedName[gLegMaskedCount][0] = '\0';
+    if (clip)
+        _snprintf_s(gLegMaskedName[gLegMaskedCount], 64, _TRUNCATE, "%s", clip);
     ++gLegMaskedCount;
 }
 
@@ -4707,7 +4721,7 @@ static int LegMaskApply(AnimationClass* rAnim, unsigned short nb, bool calfMask,
                 sa->mainState->createBlendMask((size_t)nb, 1.0f);
                 mine = true;
             }
-            LegMaskTrack(sa->mainState, mine);
+            LegMaskTrack(sa->mainState, mine, sa->animName.c_str());
             for (int i = 0; i < kLegPoseBoneCount; ++i)
             {
                 if (!gLegPoseHas[i] || gLegPoseHandle[i] >= nb) continue;
@@ -4724,13 +4738,26 @@ static int LegMaskApply(AnimationClass* rAnim, unsigned short nb, bool calfMask,
     return touched;
 }
 
-// Undo LegMaskApply.  A tracked AnimationState is validated against the LIVE lists BY
-// POINTER COMPARISON ONLY - a state that has been torn down under us must never be
-// dereferenced, so an untraceable pointer is simply dropped (its mask leaks, which is
-// why gLegMaskOverflow above is worth logging).
+// Undo LegMaskApply.  A tracked AnimationState is validated BY POINTER COMPARISON ONLY - a
+// state that has been torn down under us must never be dereferenced - but there are now TWO
+// ways to prove it is still the right object, and the second one is the fix for the leak:
+//
+//   1. it is still in a layer's addList/removeList with mainState == st  (the clip is playing);
+//   2. AnimationClassBase::getAnimationState(clipName) hands back that same pointer.
+//
+// Route 1 alone is what leaked.  RE_NOTES 21.1(3): stopping a clip writes SingleAnimation::
+// mainState = 0 WITHOUT destroying the state and without touching its blend mask, so every
+// clip that finished during the ride became untraceable and kept our thighs masked to 0 for
+// the rest of the session - the reported "thighs clamped together after dismount, only the
+// calves move".  Route 2 is the same table lookup that bound the state in the first place
+// (21.1(2)) and is a pure read that returns NULL on a miss (21.1(1) - hasAnimationState is
+// checked first, so it cannot insert the way getAnimationData() does).  If the whole state
+// set was rebuilt under us (21.3) the pointer comes back NULL or different and we still
+// refuse to touch it, which is the only reason the comparison exists.
 static void LegMaskRelease(AnimationClass* rAnim, unsigned short nb)
 {
     gLegMaskDropped = 0;
+    gLegMaskLate    = 0;
     for (int t = 0; t < gLegMaskedCount; ++t)
     {
         Ogre::AnimationState* st = gLegMasked[t];
@@ -4761,6 +4788,13 @@ static void LegMaskRelease(AnimationClass* rAnim, unsigned short nb)
                     }
                 }
             }
+        }
+        // Route 2.  Only asked when route 1 failed, so late= counts exactly the entries that
+        // used to leak.  Needs the host entity (AnimationClass::body, 0xA8) to be there at all.
+        if (!live && rAnim && rAnim->body && gLegMaskedName[t][0])
+        {
+            std::string clip(gLegMaskedName[t]);
+            if (rAnim->getAnimationState(clip) == st) { live = true; ++gLegMaskLate; }
         }
         if (!live) { ++gLegMaskDropped; continue; }
         if (gLegMaskedMine[t])
@@ -4872,11 +4906,13 @@ static void LegPoseRestoreImpl(AnimationClass* rAnim, AnimationData* poseData)
     LegMaskRelease(rAnim, rAnim->skeleton ? rAnim->skeleton->getNumBones() : 0);
     // Ungated on purpose: one line per handback (bounded by dismounts and mid-ride releases),
     // and the defect it measures was reported from a trip whose diagnostics were OFF.
+    // late= is the by-name rescue count (RE_NOTES 21.4): before that route existed every one of
+    // these was a dropped= leak, so late>0 with dropped=0 is the fix doing its job.
     {
         char hb[192];
         _snprintf_s(hb, 192, _TRUNCATE,
-            "Riding: LEGPOSE handback man=0x%02X minDot=%.4f residue=%d dropped=%d states=%d",
-            man, minDot, LegMaskResidueCount(rAnim), gLegMaskDropped, states);
+            "Riding: LEGPOSE handback man=0x%02X minDot=%.4f residue=%d dropped=%d late=%d states=%d",
+            man, minDot, LegMaskResidueCount(rAnim), gLegMaskDropped, gLegMaskLate, states);
         DebugLog(std::string(hb));
     }
     (void)poseData;
