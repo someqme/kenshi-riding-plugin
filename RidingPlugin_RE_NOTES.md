@@ -316,6 +316,11 @@ CLAUDE.md 只留指针，需要 hook 新函数 / 直调新方法时查本节。
 - CharMovement：`pos` 0xC4、`destination` 0x0DC、`movementMode` 0x378；vtable 槽 `getPosition`=0x40、`isDestinationReached`=0x60、`halt`=0x98（AbstractMovementBase 段）
 - ContextMenuGUI：`contextMenuTarget` 0xA8、`optionsList` 0xF8；`ContextMenu::orders`(lektor<int>) = 与 optionsList 子项平行的 order 数组
 - 输入/设置窗口（未实现的自定义按键用，见 §14）：`InputHandler::addCommand` 0x363130、`InputHandler::loadConfig` 0x361F80、`controlEnabled` 偏移 0xD0、`DataPanelLine_KeyConfig` 0x3E7740、`OptionsWindow::getSingleton` 0x4067B0（`keysDatapanel` 0x100）、`resetAllKeys` 0x3E7030、`saveOptions` 0x3EC570、`DatapanelGUI::createLine` 0x6FC270（protected → 需 shim）
+- **2026-09-01 收容进来的五个地址**（此前只写在 `TASK.md`／`HISTORY` 里、本节完全没有 ⇒ 一旦要改就没有真相源可改。都是**头 RVA**、都走导出桩直调，出货代码不依赖数字本身）：
+  - `GameWorld::isPaused()` 0xDEDC0（非虚公有，全局 `ou`）—— **出货代码在用**：暂停帧提前 return、不推进捕获状态机（否则冻结的 mid-gait 基线会被烤进 cfg ＝ 暂停瞬移，全过程见 `HISTORY`「暂停」那条）。
+  - `Character::getAppearance()` 0x645C0（`Character.h:584`，返回 `AppearanceBase*`，**非虚**）—— P4-3 用它做**指针相等**过滤，替掉了原来那条「裸走 `Character+0x448` → `+0xE8`」的两次解引用（`0x448` 只有 `sheatheWeapon` 体内一路佐证，没有第二路）⇒ 零布局依赖。
+  - 「按层」动画权重那一组（P4-3 上半身门用；⚠️ **同名函数有两个，抓错就退回全局门**）：`AnimationClassBase::AnimationLayer::getTotalActionAnimationWeight()` **0x5B2430 ＝ 按层的那个**；`AnimationClassBase::getTotalActionAnimationWeight()` 0x5B2B50 ＝ 挂在外层类、是整个角色的和；`AnimationRequirement::isUpperBodyOnlyAction()` 0x51C2E0（`animationRequirements` 在 `AnimationClass` +0xF0，**已经在跑的通路**）。
+  - `_setPositionAndTeleport` 0x65E1C0 —— ⛔ **走过的死路，别再用它治下马落地**：它的 `floor` 参数是**楼层索引，不是地面吸附**，而且传送的是**已被 destroy 的 movement 的逻辑位** ⇒ 只把渲染拖到体心高度（更扎进地形），物理没重建（实测记录见 `HISTORY`「修复尝试⑥ rev 5」）。
 
 ## 13. RE 工具经验（2026-08-27 从 `CLAUDE.md` 迁入）
 
@@ -662,6 +667,8 @@ callers.py --ptr 0x302B5 0x4B8D0        ->  各 1 个，都在 .rdata：0x16F2B1
 **方法论：`callers.py` 打在真入口上只看见一个站点，那大半是 ILT 跳板，必须再追一跳。** 实测 `0x535D50` 只有 1 个直调者、而它是个 `jmp`（`jmp NOT in any .pdata function`）；追过去 `0x42163` → 4 个真站点。三参那边 `0x1760C` → 2 个真站点。**别把「1 个站点」读成「几乎没人调」。**
 
 **顺带定死的两处逻辑函数边界**（MSVC 把一个逻辑函数拆成多条 `.pdata` 记录，`prolog=0` 的是续块，见 §18.7 负面结果 1）：T6 那个收刀站点 `0x5D051C`（`hook_probe` 报 `MID+298`）落在续块 `0x5D03F2-0x5D076D` 里，其入口是 **`0x5D0217`**（prolog=8）⇒ 逻辑函数 ≈ `0x5D0217-0x5D0779`；二参挂载站点 `0x5D0CE0` 落在续块 `0x5D0BFC-0x5D0D12`，入口是 **`0x5D0BC7`**（prolog=5）。
+
+**T6 那一趟点名出来的第二个站点：`0x5CE183`**（2026-09-01 从 `TASK.md`／`TEST_REQUIRED.md` 收容进来 —— 此前本手册完全没有它，改无处改）。它和 `0x5D051C` 一样是**调用方里的返回地址、不是函数入口**（`site=` 的模块名都是 `kenshi_x64.exe` ⇒ RVA 有效）。实测配比：`0x5D051C` `real=16`（真把刀从手里拿走 16 次、gap 中位数 22 帧、重复出现）＋ `0x5CE183` `real=3`，`over=0` ⇒ 12 条站点表没满、**没有第三个真写手被挤掉**。⚠️ 想改这两个数字前先看 `TEST_REQUIRED.md` 的 T6 判据，它们是那五条验收里最吃重的两条的证据。
 
 **delta 的三重佐证（这一族不是靠「+0x780 一般对」蒙的）**：①挂载族七个符号 ＋0x780 全部落在**互不相同**的精确入口上（没有别名到同一个地址）；②语义交叉验证 —— `detachItem(const std::string&)` 头 `0x52D970` ＋0x780 ＝ **`0x52E0F0`**，正是 §18.7:607 早就解码出来的 `sheatheWeapon` 第 2 步被调方；③`0x5DBD80` 传着位置串调 `0x535D50`，与头文件里那个二参签名对得上。
 
