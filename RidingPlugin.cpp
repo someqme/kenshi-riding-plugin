@@ -22,14 +22,8 @@
 // its neighbours are spelled "Enums.h" / "util/lektor.h" / "Item.h" and it sits in
 // kenshi/ itself, so every one of those resolves relative to its own directory.
 #include <kenshi/Inventory.h>
-// Appearance.h is load-bearing for the P4-3 step-2 attach probe, and it is the ONLY include that
-// step needs.  There is no `class Appearance`: both attachItem overloads are declared on
-// AppearanceBase (:65-66), which is exactly what Character::getAppearance() (Character.h:584)
-// returns - so the probe's filter is a pointer comparison with no layout dependency, and the
-// member-pointer typedefs that disambiguate the overloads need this declaration.  Item stays
-// INCOMPLETE on purpose (this header forward-declares it and a pointer parameter never needs the
-// definition; proved by an isolation compile+link under the production flags).
-#include <kenshi/Appearance.h>
+// (kenshi/Appearance.h used to be included here for the P4-3 step-2 attach probe's member-pointer
+// typedefs; it went out with the probe.  Nothing else in this file names AppearanceBase.)
 // Vanilla rebindable-keybinding support: DatapanelGUI::addCustomLine lets us inject
 // a DataPanelLine_KeyConfig row into the Settings->Controls page, and
 // InputHandler::loadConfig is where we register our commands so their bindings
@@ -1040,391 +1034,20 @@ static Weapon* RiderWeaponInHands(Character* rider, const char** sheathOut)
     return h->weaponInHands;
 }
 
-// ---- P4-3 step 1: name the writer that puts the weapon back on the back ----------------
-// P4-1f left exactly one question standing: drawWeapon is NOT refused while mounted (12/12
-// post=1), yet the weapon returns to the back after ~14 frames with cma=1 for the whole ride.
-// "combat ended -> auto-sheathe" explains the FIRST sheathe and nothing after it => there is a
-// second writer, and it is bound to the carried state rather than to combat.  Static analysis
-// cannot finish this: sheatheWeapon is a PURE virtual call (vtable +0x2D0, base slot 0x641500
-// = `ret 0`), and `callers.py --vcall 0x2D0` finds 38 sites in 33 distinct host functions with
-// no way to type the receiver.  So hook the human override and print the CALLER's return
-// address.  KenshiLib::AddHook is a 5-byte jmp detour with no trampoline of its own, so the
-// detour is entered with the caller's return address still on the stack => _ReturnAddress()
-// names the call site.  Prologue gate already passed offline: real RVA 0x5CC820 (= header
-// 0x5CC0A0 + 0x780) is a .pdata exact entry, prolog=30, `40 53 48 83 EC 60` - the same shape
-// as the shipping _NV_update hook.
-// ⚠️ USE STOPS AT NAMING.  Calling sheatheWeapon ourselves is SHEATHING, not drawing, and
-// "re-draw every frame" stays banned (HISTORY §B: never compensate an absolute overwrite at the
-// writing end - go kill the writer).
-static const int kShSites     = 12;   // distinct call sites tracked per ride
-static const int kShLinesRide = 40;   // log lines per ride, all sites together
-static const int kShLinesSite = 4;    // per site: first sighting + 3 repeats, so the ~14-frame
-                                      // CADENCE reads off the log instead of a single line
+// P4-3 step 1's sheatheWeapon naming probe (a hook on CharacterHuman::sheatheWeapon, a per-ride
+// caller-site table, and ShDescribeAddr's "<module>+0x<rva>" formatter) lived HERE and is gone as
+// of the probe-free build.  Its verdict: the second writer is Character::_ragdollMode (real=16,
+// median gap 22 frames), with Character::_carryMode(on=true) secondary - both named in
+// RE_NOTES §18.10, reasoning in TASK.md P4-3 step 1, code in `git show 61872dc` (the commit that
+// shipped it) or `git show 7838deb:RidingPlugin.cpp` (last source with the full diagnostics set).
+// (!) USE STILL STOPS AT NAMING: re-drawing the weapon every frame stays banned (HISTORY §B).
 
-struct ShSite
-{
-    uintptr_t    ra;       // caller return address, absolute
-    int          nReal;    // calls that really took a weapon out of the hands (wih != 0)
-    int          nNoop;    // calls that had nothing to sheathe
-    int          lines;    // log lines already spent on this site this ride
-    unsigned int lastF;
-};
-static ShSite gShSites[kShSites];
-static int    gShCount = 0;    // sites in use this ride
-static int    gShLines = 0;    // lines spent this ride
-static int    gShOver  = 0;    // calls dropped because the site table filled up
-
-static void ShProbeArm()
-{
-    for (int i = 0; i < kShSites; ++i)
-    {
-        gShSites[i].ra    = 0;
-        gShSites[i].nReal = 0;
-        gShSites[i].nNoop = 0;
-        gShSites[i].lines = 0;
-        gShSites[i].lastF = 0;
-    }
-    gShCount = 0;
-    gShLines = 0;
-    gShOver  = 0;
-}
-
-// "<module>+0x<rva>" for an absolute code address.  The MODULE NAME is printed on purpose: if
-// AddHook ever hands us something other than the caller's own frame, the return address lands in
-// KenshiLib/MinHook and says so, instead of being reported as a meaningless kenshi RVA.
-static void ShDescribeAddr(uintptr_t a, char* out, int n)
-{
-    HMODULE m = NULL;
-    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
-                             | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                           (LPCSTR)a, &m) && m)
-    {
-        char path[MAX_PATH];
-        path[0] = 0;
-        const char* nm = "?";
-        if (GetModuleFileNameA(m, path, MAX_PATH))
-        {
-            nm = path;
-            for (const char* p = path; *p; ++p)
-                if (*p == '\\' || *p == '/') nm = p + 1;
-        }
-        _snprintf_s(out, n, _TRUNCATE, "%s+0x%X", nm, (unsigned int)(a - (uintptr_t)m));
-    }
-    else
-        _snprintf_s(out, n, _TRUNCATE, "?@%p", (void*)a);
-}
-
-// One sheathe call on a TRACKED rider (every human sheathes weapons, so the map lookup is what
-// keeps this probe inert in normal play).  Runs BEFORE the engine's own body, so wih= is the
-// pre-state: wih=1 means this call really did take a drawn weapon away, wih=0 means it was a
-// no-op and that site is not the writer we are hunting.
-static void ShNoteImpl(CharacterHuman* h, uintptr_t ra)
-{
-    Character* rider = (Character*)h;             // CharacterHuman: Character offset = 0x0
-    if (!rider || riderToMount.find(rider) == riderToMount.end()) return;   // not ours: silent
-
-    const char* sh = "?";
-    Weapon* wih = RiderWeaponInHands(rider, &sh);
-    char shBuf[64];
-    _snprintf_s(shBuf, 64, _TRUNCATE, "%s", sh ? sh : "");  // copy: aliases the engine's string
-
-    int idx = -1;
-    for (int i = 0; i < gShCount; ++i)
-        if (gShSites[i].ra == ra) { idx = i; break; }
-    bool firstSight = (idx < 0);
-    if (firstSight)
-    {
-        if (gShCount >= kShSites) { ++gShOver; return; }
-        idx = gShCount++;
-        gShSites[idx].ra    = ra;
-        gShSites[idx].nReal = 0;
-        gShSites[idx].nNoop = 0;
-        gShSites[idx].lines = 0;
-        gShSites[idx].lastF = gP3Frames;
-    }
-    ShSite& s = gShSites[idx];
-    unsigned int gap = firstSight ? 0u : (gP3Frames - s.lastF);
-    s.lastF = gP3Frames;
-    if (wih) ++s.nReal; else ++s.nNoop;
-
-    if (s.lines >= kShLinesSite || gShLines >= kShLinesRide) return;
-    ++s.lines;
-    ++gShLines;
-
-    char site[192];
-    ShDescribeAddr(ra, site, 192);
-    char b[448];
-    _snprintf_s(b, 448, _TRUNCATE,
-        "Riding: P43SH %s site=%s wih=%d sh='%s' cm=%d bc=%d st=%d gap=%u n=%d/%d f=%u",
-        firstSight ? "first" : "rep", site,
-        wih ? 1 : 0, shBuf,
-        rider->isInCombatMode(true, true) ? 1 : 0,
-        rider->_isBeingCarried            ? 1 : 0,
-        gRideStanceOn                     ? 1 : 0,
-        gap, s.nReal, s.nNoop, gP3Frames);
-    DebugLog(std::string(b));
-}
-
-// One line per ride at dismount: the whole site table, so the verdict is a single grep even when
-// the per-site line budget ran out mid-ride.
-static void ShProbeDumpImpl()
-{
-    if (gShCount == 0 && gShOver == 0) return;
-    char b[1024];
-    int w = _snprintf_s(b, 1024, _TRUNCATE, "Riding: P43SH sites=%d lines=%d over=%d",
-                        gShCount, gShLines, gShOver);
-    if (w < 0) return;
-    for (int i = 0; i < gShCount && w < 880; ++i)
-    {
-        char site[192];
-        ShDescribeAddr(gShSites[i].ra, site, 192);
-        int k = _snprintf_s(b + w, 1024 - w, _TRUNCATE, " | %s real=%d noop=%d",
-                            site, gShSites[i].nReal, gShSites[i].nNoop);
-        if (k < 0) break;
-        w += k;
-    }
-    DebugLog(std::string(b));
-}
-
-// SEH shells, separate functions for the same C2712 reason as the P3 probes above (the bodies
-// hold std::string temporaries).  A probe must never be able to take the game down.
-static void ShNote(CharacterHuman* h, uintptr_t ra)
-{
-    __try { ShNoteImpl(h, ra); }
-    __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION
-                  ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH)
-    { DebugLog("Riding: P43SH access violation - sheathe probe abandoned"); }
-}
-
-static void ShProbeDump()
-{
-    __try { ShProbeDumpImpl(); }
-    __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION
-                  ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH)
-    { }
-}
-
-// ============================ P4-3 step 2: the attachItem naming probe =========================
-// WHO re-attaches the weapon to the rider's HAND?  The fifth trip framed the question: the rider
-// was empty-handed ON SCREEN for the whole ride, yet that same log has 19 P43SH lines with wih=1
-// => weaponInHands (0x6D8) really did hold a blade.  So the weapon was not taken away, the SCENE
-// ATTACHMENT was never refreshed.  Kenshi hangs meshes on NAMED slots ("hands" / "back" /
-// "back2" / "backpack_attach") through Appearance, so the one fact still missing is whether
-// attachItem(..., "hands") is called AT ALL while the rider sits in the carried state:
-//     called     => the attachment point WAS refreshed and the invisibility has another cause
-//     not called => drawWeapon really cannot reach the attach step in the carried state
-//
-// Three ways this differs from the sheathe probe above, each for a recorded reason:
-//   * TWO hooks.  attachItem is OVERLOADED and the overloads are separate functions: 3-arg
-//     (item, mesh, slot) header 0x5356D0 -> real 0x535E50 (.pdata ENTRY, prolog=24) is the form
-//     drawWeapon calls; 2-arg (item, slot) header 0x5355D0 -> real 0x535D50 (ENTRY, prolog=18)
-//     is the sheathe-side re-attach path.  0x535D50 is NOT a forwarder (`callers.py --calls`:
-//     its callees never include 0x535E50) => one hook cannot cover both, and hooking only one
-//     manufactures the very "never called" answer this probe exists to EARN.  Hence ov=2/3 on
-//     every line.  Both prologues open 48 89 5C 24 10 = one complete position-independent mov,
-//     i.e. CLEANER than the shipping AnimationClassHuman::_NV_update hook (40 53 48 83 EC 20,
-//     whose 5-byte cut lands inside the sub) - AddHook copies 5 bytes with no trampoline replay,
-//     so the prologue is the only real question.  Registered by symbol, never by literal RVA.
-//   * The filter is a POINTER COMPARISON, not an offset walk (TASK.md's Character+0x448 ->
-//     +0xE8 route is superseded): getAppearance() already hands back the AppearanceBase* whose
-//     calls we want, recorded once at Mount().  Nothing is dereferenced to reach the verdict,
-//     which is what keeps the hook safe when the rider pointer goes stale.
-//   * The slot string sits in a DIFFERENT REGISTER per overload - 2-arg: RCX=this RDX=item
-//     R8=&slot; 3-arg: RCX=this RDX=item R8=&mesh R9=&slot.  Mixing them up compares the MESH
-//     name against "hands" = another silent failure, so the two bodies never share a signature.
-//
-// The budgets are SPLIT (hands vs everything else) so a burst of armour/backpack attaches cannot
-// starve the one "hands" line the verdict rests on, and the dump prints whenever the probe was
-// armed at all - so "hands=0 hk=3" is an ANSWER, while no P43AT line whatsoever can only mean
-// the code never ran.  The sheathe probe's silence had two readings; this one's has one.
-//
-// (!) USE STOPS AT NAMING, exactly as for sheatheWeapon.  Neither answer may turn into "so we
-// call attachItem ourselves every frame": that is compensating an absolute overwrite at the
-// writing end = HISTORY.md §B's three rounds of servo all over again.  Go kill the writer.
-static const int kAtSites      = 12;  // distinct call sites tracked per ride
-static const int kAtLinesHands = 24;  // per ride, slot=="hands" (the interesting half)
-static const int kAtLinesOther = 8;   // per ride, every other slot - a SEPARATE budget
-static const int kAtLinesSiteH = 4;   // per site: first sighting + 3 repeats, so the cadence
-static const int kAtLinesSiteO = 2;   // per site, other slots
-
-struct AtSite
-{
-    uintptr_t    ra;         // caller return address, absolute
-    int          ov;         // which overload this site called: 2 or 3
-    int          nHands;     // calls whose slot was exactly "hands"
-    int          nOther;
-    int          linesH;     // log lines already spent on this site's hands calls
-    int          linesO;
-    unsigned int lastF;
-    char         slot0[24];  // slot name of the first sighting, for the per-ride dump
-};
-static AtSite     gAtSites[kAtSites];
-static int        gAtCount   = 0;      // sites in use this ride
-static int        gAtLinesH  = 0;
-static int        gAtLinesO  = 0;
-static int        gAtOver    = 0;      // calls dropped because the site table filled up
-static int        gAtHands   = 0;      // "hands" calls this ride, all sites together
-static void*      gAtApp     = NULL;   // the ride's AppearanceBase*: COMPARED, never dereferenced
-static Character* gAtRider   = NULL;   // whose it is (only ever fed to riderToMount.find)
-static bool       gAtArmed   = false;  // a ride happened => the dump must print even with 0 sites
-static int        gAtHooked  = 0;      // bit 0 = 2-arg hook installed, bit 1 = 3-arg
-
-// Exact match on the slot name, hand-rolled so the counting path allocates nothing.  The slot is
-// a STRING in Kenshi, not an enum, so this is the whole test.
-static bool AtIsHands(const char* s)
-{
-    static const char kHands[] = "hands";
-    for (int i = 0; i < 6; ++i)
-        if (s[i] != kHands[i]) return false;
-    return true;
-}
-
-static void AtProbeArm(Character* rider)
-{
-    for (int i = 0; i < kAtSites; ++i)
-    {
-        gAtSites[i].ra       = 0;
-        gAtSites[i].ov       = 0;
-        gAtSites[i].nHands   = 0;
-        gAtSites[i].nOther   = 0;
-        gAtSites[i].linesH   = 0;
-        gAtSites[i].linesO   = 0;
-        gAtSites[i].lastF    = 0;
-        gAtSites[i].slot0[0] = 0;
-    }
-    gAtCount  = 0;
-    gAtLinesH = 0;
-    gAtLinesO = 0;
-    gAtOver   = 0;
-    gAtHands  = 0;
-    gAtRider  = rider;
-    // getAppearance() is non-virtual and reads a member; the rider is alive here by construction
-    // (we are inside Mount()).  A NULL read is reported as app=0 by the dump rather than guessed
-    // at, because it is the one thing that would explain hands=0 with both hooks installed.
-    gAtApp    = rider ? (void*)rider->getAppearance() : NULL;
-    gAtArmed  = true;
-}
-
-// One attachItem call on the tracked rider's own Appearance.  Runs BEFORE the engine's body, so
-// wih= is the pre-state.  Both guards are pointer comparisons: every human and animal in the
-// world attaches items, and this is what keeps the probe inert in normal play without touching
-// memory that may have gone stale.
-static void AtNoteImpl(void* app, uintptr_t ra, int ov,
-                       const std::string* mesh, const std::string* slot)
-{
-    if (!app || app != gAtApp || !gAtRider) return;                          // not ours: silent
-    if (riderToMount.find(gAtRider) == riderToMount.end()) return;           // not riding now
-
-    char slotBuf[24];
-    _snprintf_s(slotBuf, 24, _TRUNCATE, "%s", slot ? slot->c_str() : "");    // copy: aliases
-    char meshBuf[64];                                                        // the engine's string
-    _snprintf_s(meshBuf, 64, _TRUNCATE, "%s", mesh ? mesh->c_str() : "-");
-    bool hands = AtIsHands(slotBuf);
-
-    int idx = -1;
-    for (int i = 0; i < gAtCount; ++i)
-        if (gAtSites[i].ra == ra) { idx = i; break; }
-    bool firstSight = (idx < 0);
-    if (firstSight)
-    {
-        if (gAtCount >= kAtSites) { ++gAtOver; return; }
-        idx = gAtCount++;
-        gAtSites[idx].ra     = ra;
-        gAtSites[idx].ov     = ov;
-        gAtSites[idx].nHands = 0;
-        gAtSites[idx].nOther = 0;
-        gAtSites[idx].linesH = 0;
-        gAtSites[idx].linesO = 0;
-        gAtSites[idx].lastF  = gP3Frames;
-        _snprintf_s(gAtSites[idx].slot0, 24, _TRUNCATE, "%s", slotBuf);
-    }
-    AtSite& s = gAtSites[idx];
-    unsigned int gap = firstSight ? 0u : (gP3Frames - s.lastF);
-    s.lastF = gP3Frames;
-    if (hands) { ++s.nHands; ++gAtHands; } else ++s.nOther;
-
-    if (hands)
-    {
-        if (s.linesH >= kAtLinesSiteH || gAtLinesH >= kAtLinesHands) return;
-        ++s.linesH;
-        ++gAtLinesH;
-    }
-    else
-    {
-        if (s.linesO >= kAtLinesSiteO || gAtLinesO >= kAtLinesOther) return;
-        ++s.linesO;
-        ++gAtLinesO;
-    }
-
-    const char* sh = "?";
-    Weapon* wih = RiderWeaponInHands(gAtRider, &sh);
-    char shBuf[64];
-    _snprintf_s(shBuf, 64, _TRUNCATE, "%s", sh ? sh : "");   // copy for the same aliasing reason
-    char site[192];
-    ShDescribeAddr(ra, site, 192);      // reused verbatim: same "is this the caller's own frame?"
-    char b[576];                        // question, same module-name safeguard
-    _snprintf_s(b, 576, _TRUNCATE,
-        "Riding: P43AT %s ov=%d site=%s slot='%s' mesh='%s' hands=%d wih=%d sh='%s' cm=%d bc=%d"
-        " st=%d gap=%u n=%d/%d f=%u",
-        firstSight ? "first" : "rep", ov, site, slotBuf, meshBuf,
-        hands ? 1 : 0,
-        wih ? 1 : 0, shBuf,
-        gAtRider->isInCombatMode(true, true) ? 1 : 0,
-        gAtRider->_isBeingCarried            ? 1 : 0,
-        gRideStanceOn                        ? 1 : 0,
-        gap, s.nHands, s.nOther, gP3Frames);
-    DebugLog(std::string(b));
-}
-
-// Printed at the top of Dismount().  UNCONDITIONAL once a ride has happened - that is the whole
-// improvement over the sheathe probe, whose silence had two readings ("hook never installed" vs
-// "nobody called it").  Here hk= says whether the hooks went on and app= whether we ever got an
-// Appearance to compare against, so "sites=0 hands=0 hk=3 app=<nonzero>" is a VERDICT: attachItem
-// was never called on this rider while he was carried.  No P43AT line at all can then only mean
-// the pass never ran (log too early / DLL not the one you think).
-// Deliberately leaves the table alone, exactly like ShProbeDumpImpl: the state is last-ride-wins,
-// so clearing here would disarm a SECOND rider who mounted while this one was still up.
-static void AtProbeDumpImpl()
-{
-    if (!gAtArmed) return;
-    char b[1024];
-    int w = _snprintf_s(b, 1024, _TRUNCATE,
-                       "Riding: P43AT sites=%d hands=%d over=%d hk=%d app=%p",
-                       gAtCount, gAtHands, gAtOver, gAtHooked, gAtApp);
-    if (w < 0) return;
-    for (int i = 0; i < gAtCount && w < 880; ++i)
-    {
-        char site[192];
-        ShDescribeAddr(gAtSites[i].ra, site, 192);
-        int k = _snprintf_s(b + w, 1024 - w, _TRUNCATE, " | ov=%d %s hands=%d other=%d slot0='%s'",
-                            gAtSites[i].ov, site, gAtSites[i].nHands, gAtSites[i].nOther,
-                            gAtSites[i].slot0);
-        if (k < 0) break;
-        w += k;
-    }
-    DebugLog(std::string(b));
-}
-
-// SEH shells, separate functions for the same C2712 reason as the sheathe probe above (the bodies
-// hold std::string temporaries).  A probe must never be able to take the game down - and this one
-// runs inside an engine function that every character in the world calls.
-static void AtNote(void* app, uintptr_t ra, int ov,
-                   const std::string* mesh, const std::string* slot)
-{
-    __try { AtNoteImpl(app, ra, ov, mesh, slot); }
-    __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION
-                  ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH)
-    { DebugLog("Riding: P43AT access violation - attach probe abandoned"); }
-}
-
-static void AtProbeDump()
-{
-    __try { AtProbeDumpImpl(); }
-    __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION
-                  ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH)
-    { }
-}
-
+// P4-3 step 2's attachItem naming probe (two hooks on the AppearanceBase::attachItem overloads,
+// a per-ride site table, and the "hands" slot filter) lived HERE and is gone as of the probe-free
+// build.  Its verdict, in one line: the hand slot IS refreshed while the rider is carried
+// (hands=12 on one ride, other=0, slot0='hands'), and yet the blade is on the back on screen =>
+// whoever takes it away does NOT go through either hooked overload.  Details in TASK.md P4-3
+// step 2, addresses in RE_NOTES §18.10, code in `git show 07f3588`.
 static void DumpRiderAnimLayers(Character* rider, AnimationClass* rAnim, const char* tag)
 {
     if (!rAnim) return;
@@ -4023,24 +3646,16 @@ static void SeedPersistedConstants(Character* mount)
                    + " k=" + IntToStr((int)(si->second.sizeScale * 1000.0f))); } catch(...) {}
 }
 
-// ---- P1 diagnostic: enumerate the engine's REAL human animation table ------------
+// ---- P1 diagnostic: REMOVED (the human animation table has been enumerated) --------
 //
-// TASK.md P1.  AnimsListsManager::AnimList::allAnims (AnimationClass.h:276) is the map
-// the engine actually resolves animation names against, and it INCLUDES clips added by
-// the player's animation mods - which is exactly why a hardcoded list of vanilla names
-// cannot be used to pick a riding pose.  One shot per DLL load: the table is hundreds
-// of rows and nothing in it changes at runtime.
-//
-// P0 already answered the fork this dump was originally meant to decide: our pose clip
-// is `sitting_new`, registered on L1 (UPPER) with wholeBodyAllLayer=true, so it drives
-// the upper body and mounted combat needs a DIFFERENT clip, not a different pin.  The
-// two questions left for this run:
-//   1. is there any straddle / riding / side-sit clip to swap TO?  Zero hits is also an
-//      answer - it sends P2 straight to the procedural (P2b) or content-mod (P2c) route.
-//   2. which attack clips are UPPER-only?  P4-3 needs precisely that list.
-// Bonus: the KEY a suffixed clip such as "jog lower-7" is stored under, because
-// getAnimationData() and every pin we do key off the record name, not the clip name.
-static bool gAnimTableDumped = false;
+// TASK.md P1 is answered and the whole table lives in RidingPlugin_RE_NOTES.md §15, so the
+// one-shot ANIMTABLE dump (a debugContinuous-gated walk of AnimsListsManager::AnimList::allAnims
+// fired from Mount()) is gone as of the probe-free build.  What it settled, for anyone reading
+// the pin code below: our pose clip is `sitting_new`, registered on L1 (UPPER) with
+// wholeBodyAllLayer=true; there is NO vanilla straddle/side-sit clip to swap to (that is why P2
+// went procedural); and allAnims is keyed by RECORD name, not clip name, which is why every pin
+// in this file keys off the record name.  `git show 7838deb:RidingPlugin.cpp` if the dump itself is
+// ever needed again.
 
 // The exact type of AnimList::allAnims / actionAnims (AnimationClass.h:275-276),
 // spelled out instead of inferred so that iterating it with EngineAnimMap's iterator
@@ -4244,113 +3859,6 @@ static int AnimListAttackCount(AnimationClass* anim)
     if (!lst->attacks.valid()) return -1;
     unsigned int n = lst->attacks.size();
     return (n > 4096u) ? -1 : (int)n;   // absurd count = we are not reading a lektor
-}
-
-static void DumpHumanAnimTableImpl(Character* rider)
-{
-    AnimationClass* rAnim = rider ? rider->getAnimationClass() : NULL;
-    AnimsListsManager* mgr = AnimsListsManager::getSingleton();
-    // getAnimationDatasList() is the list THIS character resolves against (character
-    // list for humans, per-race list for animals), so it is the authoritative one for
-    // the rider; getCharacterList() is logged next to it as a cross-check.
-    AnimsListsManager::AnimList* own = rAnim ? rAnim->getAnimationDatasList() : NULL;
-    AnimsListsManager::AnimList* chr = mgr ? mgr->getCharacterList() : NULL;
-    AnimsListsManager::AnimList* lst = own ? own : chr;
-
-    // Layout self-check.  Everything after actionAnims depends on boost's
-    // unordered_map having the same size here as in the game build; if it does not,
-    // allAnims does not sit at 0xB8 and iterating it would walk garbage.  So this
-    // decides whether we iterate at all rather than trusting the header blindly.
-    long actOff = lst ? (long)((char*)&lst->actionAnims - (char*)lst) : -1;
-    long allOff = lst ? (long)((char*)&lst->allAnims    - (char*)lst) : -1;
-
-    char hd[320];
-    _snprintf_s(hd, 320, _TRUNCATE,
-        "Riding: ANIMTABLE own=%p charList=%p same=%d sizeof=%d "
-        "off(action)=%ld off(all)=%ld (want 120/184/384)",
-        (void*)own, (void*)chr, (own && own == chr) ? 1 : 0,
-        (int)sizeof(AnimsListsManager::AnimList), actOff, allOff);
-    DebugLog(std::string(hd));
-
-    if (!lst) { DebugLog("Riding: ANIMTABLE no list - aborted"); return; }
-    if (allOff != 0xB8 || actOff != 0x78)
-    {
-        DebugLog("Riding: ANIMTABLE boost layout mismatch - refusing to iterate");
-        return;
-    }
-
-    char cnt[320];
-    _snprintf_s(cnt, 320, _TRUNCATE,
-        "Riding: ANIMTABLE counts moveBase=%u moveUpper=%u idle=%u strafe=%u attacks=%u "
-        "action=%u all=%u",
-        lst->movementAnimsBase.valid()  ? lst->movementAnimsBase.size()  : 0u,
-        lst->movementAnimsUpper.valid() ? lst->movementAnimsUpper.size() : 0u,
-        lst->idleAnims.valid()          ? lst->idleAnims.size()          : 0u,
-        lst->strafeAnims.valid()        ? lst->strafeAnims.size()        : 0u,
-        lst->attacks.valid()            ? lst->attacks.size()            : 0u,
-        (unsigned int)lst->actionAnims.size(),
-        (unsigned int)lst->allAnims.size());
-    DebugLog(std::string(cnt));
-
-    // Targeted probes first, so the answers we came for are readable without paging
-    // through the whole table.  Both sides are printed: the map key AND what
-    // getAnimationData() resolves the same string to - a mismatch would mean the pin
-    // we do every frame is not pointing at the row we think it is.
-    static const char* kProbe[] = {
-        "sitting chair", "idle_stand_normal", "carry me",
-        "jog lower-7", "jog upper-6", "jog lower", "jog upper",
-        "run lower", "run upper", "sitting_new"
-    };
-    for (int pi = 0; pi < (int)(sizeof(kProbe) / sizeof(kProbe[0])); ++pi)
-    {
-        EngineAnimMap::const_iterator mi = lst->allAnims.find(std::string(kProbe[pi]));
-        AnimationData* viaGet = rAnim ? rAnim->getAnimationData(kProbe[pi]) : NULL;
-        if (mi == lst->allAnims.end() && !viaGet)
-        {
-            DebugLog(std::string("Riding:   PROBE '") + kProbe[pi] + "' absent");
-            continue;
-        }
-        char pt[96];
-        _snprintf_s(pt, 96, _TRUNCATE, "PROBE map=%p get=%p",
-                    (void*)(mi == lst->allAnims.end() ? NULL : mi->second), (void*)viaGet);
-        LogAnimRow(pt, kProbe[pi], (mi != lst->allAnims.end()) ? mi->second : viaGet);
-    }
-
-    // The attacks list is P4-3's raw material: which swings are UPPER-only decides
-    // whether the pose can keep LOWER to itself while the rider fights.
-    if (lst->attacks.valid())
-    {
-        unsigned int na = lst->attacks.size();
-        if (na > 512) na = 512;
-        for (unsigned int i = 0; i < na; ++i)
-            LogAnimRow("ATTACK", "", lst->attacks[i]);
-    }
-
-    // Full table.  Capped because a corrupt bucket chain would otherwise spin forever.
-    int n = 0;
-    for (EngineAnimMap::const_iterator ai = lst->allAnims.begin();
-         ai != lst->allAnims.end(); ++ai)
-    {
-        if (++n > 4000) { DebugLog("Riding: ANIMTABLE cap 4000 hit - truncated"); break; }
-        LogAnimRow("ALL", ai->first.c_str(), ai->second);
-    }
-    DebugLog("Riding: ANIMTABLE end rows=" + IntToStr(n));
-}
-
-// SEH shell: same rationale as mainLoop_hook.  This walks engine containers whose
-// layout we only believe, so a fault must cost the dump, not the session.  One shot
-// either way - the flag is set by the caller before we get here.
-static void DumpHumanAnimTable(Character* rider)
-{
-    __try
-    {
-        DumpHumanAnimTableImpl(rider);
-    }
-    __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION
-                  ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH)
-    {
-        DebugLog("Riding: ANIMTABLE access violation - dump abandoned");
-    }
 }
 
 // ---- P2-1b-2: the real straddle pose (TASK.md P2-1 route b, step 2) ----------------
@@ -5376,8 +4884,8 @@ static void LegPosePassImpl(AnimationClass* rAnim, AnimationData* poseData, Char
     }
 }
 
-// SEH shells: kept free of anything that needs C++ unwinding (C2712), same shape as
-// DumpHumanAnimTable.  Everything that allocates lives in the *Impl functions.
+// SEH shells: kept free of anything that needs C++ unwinding (C2712), the same split every
+// __try in this file uses.  Everything that allocates lives in the *Impl functions.
 static void LegPoseRestore(AnimationClass* rAnim, AnimationData* poseData)
 {
     __try { LegPoseRestoreImpl(rAnim, poseData); }
@@ -5524,9 +5032,6 @@ void Mount(Character* rider, Character* mount)
     gRideStanceWho     = NULL;
     gRideStanceTick    = 0;                  // and no stale wall-clock baseline either
     gP41kResolved      = false;              // P4-1k: re-resolve + re-log the probe clips
-    ShProbeArm();                            // P4-3-1: fresh sheathe-caller table per ride
-    AtProbeArm(rider);                       // P4-3-2: and a fresh attach-caller table, whose
-                                             // filter is the rider's Appearance*, recorded here
     // Route A straddle bookkeeping, per ride.  gLegCalfSnap holds a knee bend captured from
     // whoever rode last, gLegHostLast would swallow the first host line, and a stale mask
     // table would have LegMaskRelease pointer-validating against a dead AnimationClass - so
@@ -5602,28 +5107,11 @@ void Mount(Character* rider, Character* mount)
              // both-sides ruling has to fall back to rider-only for that species.
              + " mAtk=" + IntToStr(AnimListAttackCount(mAnimDbg))
              + " h=" + IntToStr((int)(hDbg * 10.0f)));
-
-    // P1 (TASK.md): one-shot enumeration of the engine's real human animation table.
-    // Fired from HERE because this is the first moment a rider's AnimationClass is
-    // guaranteed live, and gated on debugContinuous so a normal session never pays for
-    // it.  Budget 1 per DLL load: the table is hundreds of rows and static at runtime.
-    if (debugContinuous && !gAnimTableDumped)
-    {
-        gAnimTableDumped = true;          // set BEFORE the dump: one shot, pass or fail
-        DumpHumanAnimTable(rider);
-    }
 }
 
 void Dismount(Character* rider)
 {
     if (!rider) return;
-
-    // P4-3-1: print the ride's sheathe-caller table before any state is torn down.  Placed here
-    // rather than at the end so a dismount path that bails out early still leaves the verdict in
-    // the log; ShProbeArm() at the next Mount() is what clears it.
-    ShProbeDump();
-    AtProbeDump();      // P4-3-2: same placement, same reason - and this one prints even with zero
-                        // sites, because "attachItem was never called" IS the answer it may hold
 
     // P2-1b: hand the legs back before anything else.  If the straddle is armed when the ride
     // ends, the rider walks away with manually-controlled thighs (Skeleton::reset() will not
@@ -5796,9 +5284,6 @@ void RestoreRideAfterLoad(Character* rider, Character* mount)
     gRideStanceWho     = NULL;
     gRideStanceTick    = 0;                  // and no stale wall-clock baseline either
     gP41kResolved      = false;              // P4-1k: re-resolve + re-log the probe clips
-    ShProbeArm();                            // P4-3-1: fresh sheathe-caller table per ride
-    AtProbeArm(rider);                       // P4-3-2: and a fresh attach-caller table, whose
-                                             // filter is the rider's Appearance*, recorded here
     // Route A straddle bookkeeping, per ride.  gLegCalfSnap holds a knee bend captured from
     // whoever rode last, gLegHostLast would swallow the first host line, and a stale mask
     // table would have LegMaskRelease pointer-validating against a dead AnimationClass - so
@@ -6034,14 +5519,12 @@ void newPlayerTask_hook(PlayerInterface* thisptr, TaskType t, const hand& target
 //     idle takes ~21 frames to fade out) still happens instead of snapping;
 //   - render-side write only when nothing else carries weight, so a combat swing
 //     or any future blend is never pushed over 1.0 total.
-// The dump (debugContinuous only, budgeted) walks addList AND removeList of every
-// layer so the next in-game run NAMES whatever is draining the 3-5% - the current
-// DBG fields cannot (`oth` only watches the standing idle, `act` mirrors us).
-static int gPoseDumpBudget = 60;
-static unsigned int gPoseDumpFrame = 0;
-
+// The POSEDUMP half of this pass (a budgeted, debugContinuous-gated walk that PRINTED every
+// addList/removeList entry on the dip frames) is gone as of the probe-free build: it had already
+// named the drainer, and T2/T9 closed with `0.94-0.995` at 0 frames.  What stays is the walk
+// itself - `others` is the INPUT to the render-side gate below, not diagnostics.
 static void PoseLayerPin(AnimationClass* rAnim, AnimationData* poseData,
-                         bool renderSide, bool dump)
+                         bool renderSide)
 {
     if (!rAnim || !poseData || !rAnim->layer.valid()) return;
     unsigned int nl = rAnim->layer.size();
@@ -6068,25 +5551,6 @@ static void PoseLayerPin(AnimationClass* rAnim, AnimationData* poseData,
                 bool isMine = (pass == 0 && sa->animationData == poseData);
                 if (isMine) mine = sa;
                 else others += sa->weight;
-                if (dump)
-                {
-                    char pl[320];
-                    _snprintf_s(pl, 320, _TRUNCATE,
-                        "Riding:   POSE L%u %c%u '%s'%s w=%.3f dw=%.3f ms=%.3f "
-                        "t01=%.2f sp=%.2f flags=%s%s%s%s%s%s",
-                        li, pass ? 'R' : 'A', ai,
-                        sa->animName.c_str(), isMine ? " <-MINE" : "",
-                        sa->weight, sa->desiredWeight,
-                        sa->mainState ? sa->mainState->getWeight() : -1.0f,
-                        sa->currentFrameTime01, sa->speed,
-                        sa->looped ? "loop," : "",
-                        sa->synchSlave ? "slave," : "",
-                        sa->normalise ? "norm," : "",
-                        sa->autoRemove ? "auto," : "",
-                        sa->stillWanted ? "want," : "",
-                        sa->isAWholeBodyAction ? "whole" : "");
-                    DebugLog(std::string(pl));
-                }
             }
         }
     }
@@ -6211,7 +5675,7 @@ static void AnimUpdateImpl(AnimationClass* thisptr, float frameTIME)
                             // update fades them, so this frame is evaluated at full weight
                             // (the post-update pin in HaltAndForceSitPass is the render-side
                             // half of the same fix - see PoseLayerPin).
-                            PoseLayerPin(thisptr, poseData, false, false);
+                            PoseLayerPin(thisptr, poseData, false);
                         }
                         else
                         {
@@ -6827,25 +6291,12 @@ static void HaltAndForceSitPass()
                         // that consumes it (57 one-frame dips to 0.95-0.97, every 35 frames,
                         // measured after v1.5).  Pin the fields here too, this time including
                         // the render-side Ogre weight, since this pass is the last writer
-                        // before the frame is drawn.  Dump the whole layer list on the dip
-                        // frames so the drainer gets named.
+                        // before the frame is drawn.  (The POSEDUMP layer dump that used to
+                        // ride along on the dip frames is gone: it had named the drainer, and
+                        // T2/T9 closed on `0.94-0.995` being 0 frames.  `git show
+                        // 7838deb:RidingPlugin.cpp` if it is ever needed again.)
                         if (poseData && !stance)
-                        {
-                            ++gPoseDumpFrame;
-                            float pw = rAnim->getAnimationCurrentWeight(poseData);
-                            bool dump = debugContinuous && gPoseDumpBudget > 0
-                                        && (pw < 0.995f || (gPoseDumpFrame % 900) == 0);
-                            if (dump)
-                            {
-                                --gPoseDumpBudget;
-                                char ph[160];
-                                _snprintf_s(ph, 160, _TRUNCATE,
-                                    "Riding: POSE dump frame=%u pose='%s' w=%.3f budget=%d",
-                                    gPoseDumpFrame, kRidePose, pw, gPoseDumpBudget);
-                                DebugLog(std::string(ph));
-                            }
-                            PoseLayerPin(rAnim, poseData, true, dump);
-                        }
+                            PoseLayerPin(rAnim, poseData, true);
                         // P2-1b-3 straddle + P4-1M torso twist.  Deliberately the same window as
                         // the render-side weight pin: after Ogre's per-frame Skeleton::reset(),
                         // before render - which is precisely where a manual bone write has to
@@ -7645,7 +7096,8 @@ static void RiderCombatLeverImpl(Character* rider, Character* mount)
         AnimsListsManager*           mgr = AnimsListsManager::getSingleton();
         AnimsListsManager::AnimList* own = rAnim ? rAnim->getAnimationDatasList() : NULL;
         AnimsListsManager::AnimList* lst = own ? own : (mgr ? mgr->getCharacterList() : NULL);
-        // Same boost-layout self-check DumpHumanAnimTableImpl uses: if allAnims is not at 0xB8
+        // Same boost-layout self-check FindAnimData and AnimListAttackCount use (it was also the
+        // P1 ANIMTABLE dump's gate, before that dump was removed): if allAnims is not at 0xB8
         // the map we would search is not the map the game has, so refuse rather than guess.
         long allOff = lst ? (long)((char*)&lst->allAnims - (char*)lst) : -1;
         if (!lst || allOff != 0xB8)
@@ -8680,52 +8132,6 @@ void contextMenu_show_hook(ContextMenuGUI* thisptr, const lektor<int>& ordersLis
     } catch(...) {}
 }
 
-// ---- P4-3-1 hook: CharacterHuman::sheatheWeapon -------------------------------------------
-// Naming probe only - see the P4-3 block above ShNoteImpl for why this is the only tool that can
-// answer "who is the second writer".  _ReturnAddress() is taken as the very first statement,
-// while the frame is still exactly as the caller left it, and the SEH shell lives in ShNote so
-// this function holds nothing that needs unwinding.  The engine body always runs afterwards: the
-// probe observes, it never changes what the game does.
-void (*sheatheWeapon_orig)(CharacterHuman* thisptr) = NULL;
-
-void sheatheWeapon_hook(CharacterHuman* thisptr)
-{
-    uintptr_t ra = (uintptr_t)_ReturnAddress();
-    ShNote(thisptr, ra);
-    if (sheatheWeapon_orig) sheatheWeapon_orig(thisptr);
-}
-
-// ---- P4-3-2 hooks: AppearanceBase::attachItem, BOTH overloads ------------------------------
-// Naming probe only - the full reasoning is in the P4-3 step 2 block above AtProbeArm.  Two hooks
-// because the overloads are separate functions and the 2-arg one is NOT a forwarder; hooking one
-// would manufacture the "never called" answer this probe exists to earn, so every line carries
-// ov=2/3 and silence has exactly one reading.
-// On x64 a member function is called like a free function with `this` in RCX, so these signatures
-// match the real frames: 2-arg RCX=this RDX=item R8=&slot, 3-arg adds R9=&slot with R8=&mesh.
-// The reference parameters are taken as POINTERS so a null can be reported instead of crashing on
-// a dereference.  _ReturnAddress() is the first statement (frame still as the caller left it) and
-// the SEH shell lives in AtNote, so neither body holds anything that needs unwinding.  The engine
-// body always runs afterwards: if orig were NULL the hook never installed and this code is
-// unreachable, so the fallback return cannot change what the game does.
-static bool (*attachItem2_orig)(AppearanceBase*, Item*, const std::string*) = NULL;
-static bool (*attachItem3_orig)(AppearanceBase*, Item*, const std::string*,
-                                const std::string*) = NULL;
-
-static bool attachItem2_hook(AppearanceBase* thisptr, Item* item, const std::string* slot)
-{
-    uintptr_t ra = (uintptr_t)_ReturnAddress();
-    AtNote((void*)thisptr, ra, 2, NULL, slot);
-    return attachItem2_orig ? attachItem2_orig(thisptr, item, slot) : false;
-}
-
-static bool attachItem3_hook(AppearanceBase* thisptr, Item* item, const std::string* mesh,
-                             const std::string* slot)
-{
-    uintptr_t ra = (uintptr_t)_ReturnAddress();
-    AtNote((void*)thisptr, ra, 3, mesh, slot);
-    return attachItem3_orig ? attachItem3_orig(thisptr, item, mesh, slot) : false;
-}
-
 __declspec(dllexport) void startPlugin()
 {
     DebugLog("RidingPlugin: start");
@@ -8752,36 +8158,14 @@ __declspec(dllexport) void startPlugin()
     if (KenshiLib::SUCCESS != KenshiLib::AddHook(KenshiLib::GetRealAddress(&AnimationClassHuman::_NV_update), (void*)&animUpdate_hook, (void**)&humanUpdateOrig))
         ErrorLog("RidingPlugin: Could not hook AnimationClassHuman::update!");
 
-    // P4-3-1 naming probe: who re-sheathes a mounted rider's weapon?  sheatheWeapon is a pure
-    // virtual call, so GetRealAddress needs the _NV_ stub (core/Functions.h says twice that it
-    // "doesn't work with virtual functions") - and a rider of dynamic type CharacterHuman always
-    // lands on this override anyway (the Character base slot 0x2D0 is `ret 0`).  The prologue
-    // gate was cleared offline: real RVA 0x5CC820 is a .pdata exact entry, prolog=30.
-    if (KenshiLib::SUCCESS != KenshiLib::AddHook(KenshiLib::GetRealAddress(&CharacterHuman::_NV_sheatheWeapon), (void*)&sheatheWeapon_hook, (void**)&sheatheWeapon_orig))
-        ErrorLog("RidingPlugin: Could not hook CharacterHuman::sheatheWeapon!");
-
-    // P4-3-2 naming probe: is attachItem(..., "hands") called at all while the rider is carried?
-    // attachItem is OVERLOADED, so `&AppearanceBase::attachItem` alone is ambiguous - the typed
-    // member-pointer locals are what pick an overload, and KenshiLib exports a stub for each.  Both
-    // are ordinary (non-virtual) members, so GetRealAddress needs no _NV_ variant here.  Prologue
-    // gate cleared offline: both real entries are .pdata exact entries and both open with the one
-    // complete instruction `48 89 5C 24 10` (mov [rsp+0x10], rbx) - AddHook copies 5 bytes with no
-    // trampoline replay, so that is the whole question, and this is a cleaner cut than the shipping
-    // AnimationClassHuman::update hook above.  hk= in the dump records which ones went on, so
-    // "hands=0" can never be confused with "hook missing".
-    typedef bool (AppearanceBase::*Att3Fn)(Item*, const std::string&, const std::string&);
-    typedef bool (AppearanceBase::*Att2Fn)(Item*, const std::string&);
-    Att2Fn att2 = &AppearanceBase::attachItem;   // header 0x5355D0 -> real 0x535D50, ENTRY prolog=18
-    Att3Fn att3 = &AppearanceBase::attachItem;   // header 0x5356D0 -> real 0x535E50, ENTRY prolog=24
-    if (KenshiLib::SUCCESS != KenshiLib::AddHook(KenshiLib::GetRealAddress(att2), (void*)&attachItem2_hook, (void**)&attachItem2_orig))
-        ErrorLog("RidingPlugin: Could not hook AppearanceBase::attachItem (2-arg)!");
-    else
-        gAtHooked |= 1;
-    if (KenshiLib::SUCCESS != KenshiLib::AddHook(KenshiLib::GetRealAddress(att3), (void*)&attachItem3_hook, (void**)&attachItem3_orig))
-        ErrorLog("RidingPlugin: Could not hook AppearanceBase::attachItem (3-arg)!");
-    else
-        gAtHooked |= 2;
-
+    // The two P4-3 naming probes that used to be registered here (CharacterHuman::sheatheWeapon
+    // and both AppearanceBase::attachItem overloads) are GONE as of the probe-free build: they
+    // had delivered their verdicts (RE_NOTES §18.10 keeps every address, and the answers are in
+    // TASK.md P4-3 steps 1-2), and they were the only hooks this plugin installed on functions
+    // that EVERY character in the world calls.  Getting them back means `git show 61872dc`
+    // (sheathe) / `git show 07f3588` (attachItem) - or `git show 7838deb:RidingPlugin.cpp` for the
+    // whole set at once - not retyping them; and the prologue gates in those commits' comments are
+    // the record of why they were safe to cut in the first place.
     // ---- DISABLED HOOKS (safety fix) ----------------------------------------
     // Two hooks are deliberately NOT installed.  Disassembly (see
     // RidingPlugin_RE_NOTES.md section 0) showed the addresses they resolve to are

@@ -716,7 +716,9 @@ if (*(AnimationState **)(param_1 + 0x28) != NULL) {
 
 **这一条推翻了前面几节里所有「站点 RVA」的直接读法，先看它再看 §18.8:669/:671。**
 
-探针打的是 `_ReturnAddress() - GetModuleHandle(kenshi_x64.exe)`（`RidingPlugin.cpp:1092` 的 `ShDescribeAddr`，就是个减法，没有别的加工）⇒ 那**本该**就是 RVA。实测不是：三个 logged site 在本文件里**全部解码在指令中间**，谁都不是返回地址；而**同一个常数** `+0xA90` 一加，三个全部精确落在「一条 call 的下一字节」上，且那条 call 的目标正是被 hook 的那个函数。
+⚠️ **状态注记（2026-09-01）：打出这些 `site=` 的两个探针（`CharacterHuman::sheatheWeapon` ×1、`AppearanceBase::attachItem` ×2）已经从插件里摘掉了**（不带探针的干净构建，逐行经过与取回路线见 `TASK.md` X-5）⇒ **新日志里不会再有 `P43SH` / `P43AT` 行**。**本节的地址、换算与定名一个字都不改** —— 它们是记录，不跟着代码删；`ShDescribeAddr`（下面提到的那个减法）也随探针出去了，将来任何新探针要复用它就从那次提交里取回。
+
+探针打的是 `_ReturnAddress() - GetModuleHandle(kenshi_x64.exe)`（当时的 `ShDescribeAddr`，就是个减法，没有别的加工；⚠️ 那个函数已随探针摘掉，原来的行号 `RidingPlugin.cpp:1092` 从此作废）⇒ 那**本该**就是 RVA。实测不是：三个 logged site 在本文件里**全部解码在指令中间**，谁都不是返回地址；而**同一个常数** `+0xA90` 一加，三个全部精确落在「一条 call 的下一字节」上，且那条 call 的目标正是被 hook 的那个函数。
 
 | logged `site=` | `+0xA90` | 落点 | 那条 call | 目标 |
 |---|---|---|---|---|
@@ -866,7 +868,7 @@ chunk = [u16 id][u32 recordedLength] <payload>
 - **没读**：`ride.dll` 的 hook 体（下一步：Ghidra，先读 `combatMovementAnimationUpdate` 与 `mainLoop_GPUSensitiveStuff` 两个 hook，再读 20.4 那条 `idle stance` 路径）、`2333.dll`（45568 B，看着是这份 mod 自己的玩法插件）、`plugin\KenshiExtensionPlugin.dll`（1229312 B ＝ 第三方框架 KEP，带 `kep_settings.json` 与 ja_JP/ru_RU 的 gettext `.mo`）。
 - **怎么读（可复现）**：`ride.dll` 的清单是纯 PE 静态读 —— 导入表 ＋ `.rdata` 里的修饰名字符串 ＋ `FF 15` 间接调用站点回指 IAT ＋ `.pdata` 归属。⚠️ 它的名字是 **KenshiLib 导出名**、不是 exe 地址 ⇒ 本节**故意不写任何 `kenshi_x64.exe` 地址**；真要落到 RVA 得走 §18 那条 header RVA ＋ `HEADER_RVA_DELTA` 的换算，而且换算结果只许写在本文件里。表格里的 `0x1230` 一类**是 `ride.dll` 自己的 RVA**，别拿去和 §12 的表比。
 
-## 21. `Ogre::AnimationState` 的生命周期 —— TASK.md T8 的 (a)/(b) fork **定案：(b)**（2026-09-01，全程静态，没进游戏）
+## 21. `Ogre::AnimationState` 的生命周期 —— TASK.md T8 的 (a)/(b) fork **定案：(b)**（2026-09-01；定案本身全程静态，修法与结论已由第八趟实地确认，见 21.4）
 
 **一句话**：`dropped` 不是「那个对象死了」，它就是「那条 clip 停了」。⇒ 我们清零的大腿 handle **留在一个活着的对象上**，泄漏真实、按 `(角色, clip)` 计、跨趟累积。
 
@@ -893,7 +895,7 @@ chunk = [u16 id][u32 recordedLength] <payload>
 
 ⇒ 上/下马不碰这些站点；但**角色实体一旦被重建或卸载，我们那张跟踪表的指针会整体悬空**。这就是修法必须自带活性判据、而不能直接解引用旧指针的理由。
 
-### 21.4 修法因此有了确定的对象（✅ **已实现、已部署；⚠️ 未实测** —— 验收在 `TEST_REQUIRED.md` T11）
+### 21.4 修法因此有了确定的对象（✅ **已实现、已部署、已实测通过** —— 第八趟，2026-09-01）
 
 不再要求「在 `addList`/`removeList` 里查得到」，改成**按名字回取、再比对指针**：装 mask 时抄下 clip 名 ⇒ 交还时用 `AnimationNameIDMapper::getSingleton()` ＋ `getAnimationID(name)` ＋ `Entity::hasAnimationState(id)` ＋ `Entity::getAnimationState(id)` 重新取一次（**四个都是 OgreMain 导出，不需要任何 exe 地址、不需要新 hook**）：
 
@@ -905,10 +907,12 @@ chunk = [u16 id][u32 recordedLength] <payload>
 **实现（2026-09-01，312832 B / md5 `E7613634783EDE5E948573B0C6ED3285`）**：上面那四步**一个都不用自己拼** —— 它们整套就是 21.1(1) 那个 `0x51CAA0`，而这个函数在 KenshiLib 头里**是有声明的**（`AnimationClassBase::getAnimationState(const std::string&)`，header RVA `0x51C320` ＋ `HEADER_RVA_DELTA 0x780` ＝ `0x51CAA0` ⇒ **同一个函数，双向对上**）。⇒ 落地成三处改动，都在 `RidingPlugin.cpp`：①跟踪表多一列 `gLegMaskedName[64]`（装 mask 时从 `SingleAnimation::animName` 抄，即 21.1(2) 那个查表用的同一个字符串）；②`LegMaskRelease` 的 live 判据加第二条路 —— 路 1（两张表）失败时才问路 2 `rAnim->getAnimationState(clip) == st`，并计数 `gLegMaskLate`；③交还日志多一个 `late=` 字段。⚠️ **`body`（0xA8）为 NULL、名字为空、或回取到 NULL/别的指针一律照旧丢弃**，从不解引用旧指针；名字超 64 字符会被截断 ⇒ 退化成旧的 `dropped`，不会误判。⚠️ **`late` 是自证字段**：修法前每次交还 `dropped=2..4`，修法后健康形状是 `dropped=0 late=2..4`；**`late=0` 说明救援一次都没受力，此时 `dropped=0` 不构成证据**（`tools\ridelog.py` 会照这个三分法直接打结论）。
 
 
+**实测（第八趟，2026-09-01，同一份 md5 `E7613634…`，5 次上马 5 次下马）—— 两半都过，本节从此是实测结论不只是静态推理**：5 次交还**全部 `dropped=0`**、`late` 合计 **12**（4/2/2/2/2），`man=0x00` / `minDot=1.0000` / `residue=0` 照旧，`takeovers=5 restored=5 released=0`、`kept` 90/90 全 `1.0000`；肉眼「大腿张开，跑步时大腿跟着摆，很正常」⇒ 第七趟那个「大腿并着打不开、只有小腿在动、一直不恢复」不复现。⚠️ **`late=12` 才是这条实测的要害**：路 1（扫两张活表）在同一批交还里对这 12 张 mask **全部失败** ⇒ 21.2 的定案（clip 一停 `mainState` 就被置空、对象却活着）在运行时得到独立确认，「(b) 是真泄漏」不再只靠行为侧推。
+
 ### 21.5 顺带的后果
 
-- **原计划为分 (a)/(b) 而做的那一次构建 ＋ 一趟骑乘不用做了**（TASK.md 那条 fork 已改判）。⚠️ `TEST_REQUIRED.md` 后来还是开了一格 —— 但那是 **T11 ＝ 验 21.4 修法本身**（`dropped=0 late>0` ＋ 肉眼大腿张开），**不是**分 (a)/(b) 的那一格。
-- **「泄漏的是不是起步/转向那类短命 clip」这个问题与 (a)/(b) 脱钩了**：不管哪条 clip，mask 都留着。⇒ 起步那一下「轻微夹腿」的候选解释变成「**上一趟留在起步/转向 clip 上的 mask**」；第七趟把它推到了尽头（宿主 clip 有两次是 `run lower`，被清零之后症状从「轻微、暂态」升级成「大腿一直打不开、只有小腿在动」＝ **(b) 的行为侧实证**）⇒ 走了 21.4 的第二条路：**直接上修法看症状消不消**，判决等 T11。
+- **原计划为分 (a)/(b) 而做的那一次构建 ＋ 一趟骑乘不用做了**（TASK.md 那条 fork 已改判）。⚠️ `TEST_REQUIRED.md` 后来还是开了一格 —— 但那是 **T11 ＝ 验 21.4 修法本身**（`dropped=0 late>0` ＋ 肉眼大腿张开），**不是**分 (a)/(b) 的那一格；**T11 已于第八趟通过、条目已删，那份文件现在零条待测**。
+- **「泄漏的是不是起步/转向那类短命 clip」这个问题与 (a)/(b) 脱钩了**：不管哪条 clip，mask 都留着。⇒ 起步那一下「轻微夹腿」的候选解释变成「**上一趟留在起步/转向 clip 上的 mask**」；第七趟把它推到了尽头（宿主 clip 有两次是 `run lower`，被清零之后症状从「轻微、暂态」升级成「大腿一直打不开、只有小腿在动」＝ **(b) 的行为侧实证**）⇒ 走了 21.4 的第二条路：**直接上修法看症状消不消** —— **第八趟给出判决：消了**（见 21.4 的实测段）。
 - ⚠️ **全节是反编译 ＋ 导入表读数 ＝ 静态事实，不是实测**（§18.9 末尾那句照旧有效）。⚠️ **Kenshi 的 OgreMain 是改过的**（`AnimationNameIDMapper`、`Entity::hasAnimationState(uint)` 按 **ID** 取而不是按名字、`OldSkeletonInstance`）⇒ **别拿上游 Ogre 源码当第二真相源**。
 - **工具**：新增 `python tools\callers.py --import <regex>`（列匹配的导入符号 ＋ 它们的 `FF 15`/`FF 25` 站点，底层 `ke_pe.imports()`）。⚠️ 只对**跨模块**调用有效；Kenshi 自己的函数在本 image 里，这条看不见。
 

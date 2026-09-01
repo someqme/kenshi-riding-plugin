@@ -1308,6 +1308,16 @@ def report_pose(s):
     if s.posedump:
         print("  POSEDUMP lines=%d - remember the budget burns on the fade-in"
               " ramp unless you skip it" % s.posedump)
+    else:
+        print("  POSEDUMP lines=0 - EXPECTED from DLL 297984 B / md5"
+              " DF86CD07... onward: the")
+        print("    dump was removed with the probes (only the 'if (dump)' block"
+              " went; PoseLayerPin's")
+        print("    layer walk and both shipping gates stayed).  It is still the"
+              " only way to name")
+        print("    who steals the pose weight - recover it with 'git show"
+              " 7838deb:RidingPlugin.cpp'")
+        print("    if the pose line ever regresses.")
 
 
 def report_input(s):
@@ -1501,9 +1511,19 @@ def report_sheathe(s):
               " (prologue / GetRealAddress).")
         return
     if not s.sh_sites and not s.sh_dump:
-        print("  no P43SH line at all.  TWO different readings, and the hook"
+        print("  no P43SH line at all.  THREE different readings, and the hook"
               " error line above")
-        print("  did NOT appear, so the hook installed:")
+        print("  did NOT appear, so if the probe is in this build the hook"
+              " installed:")
+        print("    - the probe was REMOVED in DLL 297984 B / md5 DF86CD07..."
+              " (the probe-free")
+        print("      build, 2026-09-01).  It had answered: the re-sheather is"
+              " Character::")
+        print("      _ragdollMode (real=16, median gap 22 frames), secondary"
+              " _carryMode.")
+        print("      Silence is EXPECTED here - check the DLL's md5 before"
+              " reading anything")
+        print("      into it.  Recover the probe with 'git show 61872dc'.")
         print("    - this log predates DLL 305152 B (the probe build), or")
         print("    - sheatheWeapon was never called on a tracked rider this"
               " session, which is")
@@ -1607,13 +1627,25 @@ def report_attach(s):
               " called'.")
         return
     if not s.at_dump and not s.at_sites:
-        print("  no P43AT line at all, and no hook-failure ErrorLog.  Unlike"
-              " P43SH this has")
-        print("  only ONE reading: the code never ran.  The dump prints"
-              " unconditionally once a")
-        print("  ride has happened, so either this log predates DLL 312832 B"
-              " or no Mount()")
-        print("  completed this session.")
+        print("  no P43AT line at all, and no hook-failure ErrorLog.  TWO"
+              " readings now:")
+        print("    - the probe was REMOVED in DLL 297984 B / md5 DF86CD07..."
+              " (the probe-free")
+        print("      build, 2026-09-01).  It had answered: hands=12 / other=0 /"
+              " slot0='hands'")
+        print("      => the hand slot IS refreshed, yet the blade stays on the"
+              " back, so whoever")
+        print("      takes it back does NOT go through either hooked overload."
+              "  Silence is")
+        print("      EXPECTED here - check the DLL's md5 first.  Recover with"
+              " 'git show 07f3588'.")
+        print("    - the code never ran: the dump prints unconditionally once a"
+              " ride has")
+        print("      happened, so either this log predates DLL 312832 B or no"
+              " Mount()")
+        print("      completed this session.")
+        print("  Note there is still NO 'installed but nobody called it'"
+              " reading, unlike P43SH.")
         print("  NOT MEASURED - not a pass.")
         return
 
