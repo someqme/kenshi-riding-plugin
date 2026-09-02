@@ -3,7 +3,7 @@
 
 Streams RE_Kenshi_log.txt line by line (it has reached 6.7 MB in the past -
 never load it whole, never paste it into a chat) and prints the acceptance
-table for TEST_REQUIRED.md T1 / T3 / T4 plus the standing regression fields.
+table for TEST_REQUIRED.md T1 / T3 / T4 / T14 plus the standing regression fields.
 
     python tools\\ridelog.py [path\\to\\RE_Kenshi_log.txt]
 
@@ -28,6 +28,10 @@ DEFAULT_LOG = r"D:\steam\steamapps\common\Kenshi\RE_Kenshi_log.txt"
 # negative, fractional, a tuple, or a quoted clip name.
 KV = re.compile(r"([A-Za-z][A-Za-z0-9_]*)=('[^']*'|\([^)]*\)|[^\s]+)")
 
+# P43RD prints sh='<pre>'->'<post>'.  KV's quoted-value branch matches the FIRST
+# '...' and hands back only the pre-name, so the pair needs its own pattern.
+RD_SH = re.compile(r"sh='([^']*)'->'([^']*)'")
+
 
 def kv(line):
     return dict(KV.findall(line))
@@ -42,6 +46,18 @@ def ts(line):
     """
     head = line.split(None, 1)[0] if line.strip() else ""
     return head if re.match(r"^\d+\.\d+$", head) else "?"
+
+
+def tsnum(t):
+    """ts() hands back the raw token ("561.454" or "?"); arithmetic needs a float.
+
+    Returns None when the line had no usable timestamp, so callers can tell
+    "cannot correlate" apart from "correlates to 0.000".
+    """
+    try:
+        return float(t)
+    except (TypeError, ValueError):
+        return None
 
 
 # Two P3CMB rows closer together than this belong to one knockdown window.  The
@@ -251,6 +267,53 @@ class Session(object):
         # getAnimationData() = operator[]).  That is a finding, not a pass.
         self.p41d_clip_null = []      # verbatim "... ptr=.. UNREADABLE" rows
         self.p41d_abandoned = False   # "all rungs disarmed - ladder abandoned"
+        # P4-3-2, the sheathe SUPPRESSOR (DLL 302080 B and later).  Same hook
+        # address as the step-1 probe, opposite job: it declines the engine body
+        # instead of describing the caller.  There is no site= field on purpose
+        # (RUNTIME_RVA_DELTA must never enter shipping code), so the accounting is
+        # per RIDE, not per site: real= is the only field that proves the fix bore
+        # load, exactly like late= for the by-name mask rescue (RE_NOTES 21).
+        self.sup_rides = []      # dicts of "P43SUP ride real=.. noop=.. pass=.."
+        self.sup_skips = []      # dicts of the budgeted "P43SUP skip" lines
+        # T18's instrument (DLL 312832 B / md5 E83DB50D... and later, UNGATED):
+        # one "P43FT ride ok=.. noElig=.. noFight=.. noThr=.. far=.. dmin=.." per
+        # ride, saying WHICH of RideStanceRaw's three terms refused.  It exists
+        # because STANCE is diagnostics-gated, so a diag-OFF trip that fails would
+        # otherwise be undiagnosable.  Absent in every log before T18.
+        self.ft_rides = []
+        # P4-1e's forced-draw ladder, read here as the SECOND self-proving field
+        # for the suppressor: with the re-sheathe gone the budget stops being
+        # spent, so n= should stall at 1-2 instead of climbing to kDrawTryBudget
+        # (12) one rung per kDrawTryGap (10) frames.  Diagnostics-gated.
+        self.draw_n = []         # (n, left, wih_pre, wih_post, ts) per P41E draw
+        # P4-3-3, the stance-edge RE-DRAW (DLL 301568 B and later, UNGATED - it
+        # changes game state).  One line per 0 -> 1 stance edge that actually
+        # issued a drawWeapon; post= is the self-proving field, exactly like
+        # real= for the suppressor and late= for the mask rescue (RE_NOTES 21).
+        # The swing window that used to be read here (P43SW, kP43Sw*) was taken
+        # out of the DLL on the user's ruling after trip 10 answered it; its
+        # findings live in HISTORY §U, and no build carries it any more.
+        self.rd = []             # dicts of "P43RD edge ..." lines
+        # P4-3 step 2's THIRD probe (DLL 309760 B and later): who takes the hand
+        # slot away AFTER attachItem put the weapon there.  Trip 11 closed the
+        # data-layer half (post=1 4/4, wih=0->1, wpn=1 on 52/56 reads) while the
+        # screen stayed empty, so this probe is the only thing that can name the
+        # remover - or prove there isn't one, which is why BOTH halves below print
+        # unconditionally at dismount.  Naming only (TASK.md P4-3 step 2 gate).
+        self.dt_hookfail = []    # "Could not hook AppearanceBase::detachItem(slot)!"
+        self.dt_calls = []       # dicts of the budgeted per-call "P43DT first/rep" rows
+        self.dt_rides = []       # dicts of "P43DT ride sites=.. hands=.. over=.. hk=.. app=.."
+        self.dt_sites = {}       # site -> {"hands":n,"other":n,"slot0":str} from the ride rows
+        # P43HD: the hand-slot poll.  Its whole job is to make P43DT's SILENCE
+        # readable - an entity still sitting in "hands" with no detach line means
+        # the removal never happened.  ⚠️ It does NOT mean "the miss is
+        # render-side": that was the trip-12 reading and trip 13 killed it by
+        # fixing the same symptom with no render-side change at all (the real
+        # gate was drawWeapon's 2nd argument, RE_NOTES §18.12 / §18.12.1).
+        # loss= is still the money edge and has its own DLL-side budget.
+        self.hd_edges = []       # dicts of the per-transition lines (kind in "_kind")
+        self.hd_rides = []       # dicts of "P43HD ride samples=.. loss=.. .."
+        self.hd_appswap = []     # verbatim "P43HD appswap was=.. now=.." lines
 
 
 MOUNTED = re.compile(r"Riding: mounted \[(?P<sp>[^\]]*)\]")
@@ -287,6 +350,11 @@ def parse(path, s):
             # "hands=0" only means "never called" if the hooks actually went on.
             if "Could not hook AppearanceBase::attachItem" in line:
                 s.at_hookfail.append(line.strip())
+                continue
+            # Third trap, same reason.  This probe's answer may legitimately BE
+            # silence, so a failed install has to be distinguishable from it.
+            if "Could not hook AppearanceBase::detachItem" in line:
+                s.dt_hookfail.append(line.strip())
                 continue
             if "Riding:" not in line:
                 continue
@@ -366,7 +434,13 @@ def parse(path, s):
                                  # and the acceptance test is "1 -> 0 was observed", never
                                  # a number of seconds.
                                  d.get("holdms", d.get("hold", "?")),
-                                 "ms" if "holdms" in d else "f"))
+                                 "ms" if "holdms" in d else "f",
+                                 # [6] wall-clock timestamp.  STANCE f= counts the
+                                 # global frame while other lines count
+                                 # gLegPoseFrames, so correlating a stance edge with
+                                 # anything else (T13-A's draw ladder) has to go
+                                 # through the timestamp.
+                                 ts(line)))
                 continue
             if "Riding: TWIST" in line:
                 d = kv(line)
@@ -463,6 +537,36 @@ def parse(path, s):
                 if tuple_nonzero(d.get("mvW")):
                     s.mvw_nonzero += 1
                 continue
+            if "P43SUP" in line:
+                d = kv(line)
+                d["_ts"] = ts(line)
+                # "ride" is the ungated per-ride summary, "skip" a budgeted sample
+                # of the individual suppressed calls.  Never add them together.
+                if "P43SUP ride" in line:
+                    s.sup_rides.append(d)
+                else:
+                    s.sup_skips.append(d)
+                continue
+            if "Riding: P43FT ride" in line:
+                d = kv(line)
+                d["_ts"] = ts(line)
+                s.ft_rides.append(d)
+                continue
+            if "Riding: P43RD " in line:
+                # sh='<pre>'->'<post>' holds two quoted names with spaces in
+                # them, and KV stops at the first closing quote - so the pair has
+                # to be pulled out with its own regex before kv() is trusted.
+                d = kv(line)
+                d["_ts"] = ts(line)
+                m = RD_SH.search(line)
+                d["_shpre"], d["_shpost"] = m.groups() if m else ("?", "?")
+                s.rd.append(d)
+                continue
+            if "P41E draw n=" in line:
+                d = kv(line)
+                pre, _, post = (d.get("wih") or "").partition("->")
+                s.draw_n.append((fnum(d, "n"), fnum(d, "left"), pre, post, ts(line)))
+                continue
             if "P43SH" in line:
                 if "sites=" in line:
                     s.sh_dump = line.strip()
@@ -513,6 +617,44 @@ def parse(path, s):
                     s.at_hands += 1
                 else:
                     e["other"] += 1
+                continue
+            if "P43DT" in line:
+                if "P43DT ride" in line:
+                    d = kv(line)
+                    d["_ts"] = ts(line)
+                    s.dt_rides.append(d)
+                    continue
+                m = re.search(r"P43DT \| (\S+) hands=(\d+) other=(\d+)"
+                              r" slot0='([^']*)'", line)
+                if m:
+                    # The per-ride table, which is the authority: the per-call rows
+                    # above it are budgeted and under-count on purpose.
+                    e = s.dt_sites.setdefault(m.group(1), {"hands": 0, "other": 0,
+                                                           "slot0": m.group(4)})
+                    e["hands"] += int(m.group(2))
+                    e["other"] += int(m.group(3))
+                    continue
+                d = kv(line)
+                if d.get("site"):
+                    d["_ts"] = ts(line)
+                    d["_first"] = " P43DT first " in line
+                    s.dt_calls.append(d)
+                continue
+            if "P43HD" in line:
+                if "P43HD ride" in line:
+                    d = kv(line)
+                    d["_ts"] = ts(line)
+                    s.hd_rides.append(d)
+                    continue
+                if "P43HD appswap was=" in line:
+                    s.hd_appswap.append(line.strip())
+                    continue
+                m = re.search(r"P43HD (\w+)", line)
+                if m:
+                    d = kv(line)
+                    d["_ts"] = ts(line)
+                    d["_kind"] = m.group(1)
+                    s.hd_edges.append(d)
                 continue
             if "P41D" in line:
                 # Order matters: the three "P41D access violation .." lines never
@@ -761,7 +903,7 @@ def report_stance(s):
         return
     trans = []
     prev = None
-    for st, f, cm, d, hold, unit in s.stance:
+    for st, f, cm, d, hold, unit, _t in s.stance:
         if st != prev:
             trans.append((prev, st, f, cm, d, hold, unit))
             prev = st
@@ -1763,7 +1905,312 @@ def report_attach(s):
           " writer.")
 
 
+def report_detach(s):
+    """P4-3 step 2, the THIRD probe: who takes the hand slot away (P43DT+P43HD)."""
+    print("")
+    print("== P4-3 step 2 - who takes the HAND slot away (P43DT + P43HD) ==")
+    if s.dt_hookfail:
+        print("  " + verdict(False, "the detachItem hook did NOT install:"))
+        for line in s.dt_hookfail[:3]:
+            print("             " + line[:150])
+        print("             Nothing below means anything: silence and 'never"
+              " called' are the same")
+        print("             shape with the hook off.")
+        return
+    if not s.dt_rides and not s.dt_sites and not s.hd_rides:
+        print("  no P43DT/P43HD line at all, and no hook-failure ErrorLog.  THREE"
+              " readings:")
+        print("    - the probe was REMOVED in DLL 304128 B / md5 1792B72E... (the"
+              " probe-free")
+        print("      T19 build, 2026-09-02).  It had answered BOTH of its questions:"
+              " exactly ONE")
+        print("      site ever carried a slot='hands' detach"
+              " (kenshi_x64.exe+0x5CBDF8, 903 calls")
+        print("      on trip 15) and that site is attachItem's own"
+              " clear-before-write positive")
+        print("      control => no third-party writer takes the blade off the hand"
+              " (T15); and the")
+        print("      §18.12 sheath-slot fix reached the engine (back/back2/hip"
+              " detaches appeared")
+        print("      only once drawWeapon got a real 2nd arg) => T16.  Silence is"
+              " EXPECTED here -")
+        print("      check the DLL's md5 first.  The source is NOT in git: it is in"
+              " the snapshot")
+        print("      D:\\KenshiModDev\\RidingPlugin_src_E83DB50D.cpp.")
+        print("    - this log predates DLL 309760 B / md5 4E223D95... (the third"
+              " probe's first")
+        print("      build, 2026-09-02), or")
+        print("    - no ride reached Dismount() this session: BOTH ride lines"
+              " print")
+        print("      unconditionally once DtProbeArm has run.")
+        print("  NOT MEASURED - not a pass.")
+        return
+
+    # Preconditions.  This probe's answer may legitimately BE silence, so each of
+    # these has to be shown separately - a silent hook, a NULL filter pointer and
+    # "nobody detached" are three different facts with one shape.
+    hk = 0
+    app = None
+    over = 0
+    dump_hands = None
+    for d in s.dt_rides:
+        try:
+            hk |= int(d.get("hk", "0"))
+            over += int(d.get("over", "0"))
+        except ValueError:
+            pass
+    last = s.dt_rides[-1] if s.dt_rides else {}
+    app = last.get("app")
+    print("  %d ride line(s).  last: %s" % (
+        len(s.dt_rides),
+        " ".join("%s=%s" % (k, last[k]) for k in
+                 ("sites", "hands", "over", "hk", "app") if k in last) or "-"))
+    print("  " + verdict(hk & 1,
+                         "hk=1 - detachItem(slot) is hooked, so silence is"
+                         " informative" if hk & 1 else
+                         "hk=0 - the hook is NOT on; every count below is"
+                         " meaningless"))
+    if hk & 1:
+        print("        ONE hook is enough here, unlike attachItem: RE_NOTES"
+              " §18.11 shows the")
+        print("        Item* overload has zero reachable callers (its ILT thunk"
+              " 0x44026 has no")
+        print("        callers, and neither overload appears in any vtable) =>"
+              " the slot overload")
+        print("        is the only way in.")
+    if app is not None:
+        bad = app.strip("'") in ("0", "0000000000000000", "00000000", "(null)")
+        print("  " + verdict(not bad,
+                             "app=%s - the ride had an AppearanceBase* to filter"
+                             " on" % app if not bad else
+                             "app=%s - getAppearance() was NULL, so the filter"
+                             " rejected everything" % app))
+    if over:
+        print("  " + verdict(False, "over=%d call(s) never got a site row"
+                                    " (kDtSites full) - raise it and ride"
+                                    " again" % over))
+    foreign = [k for k in s.dt_sites
+               if not re.match(r"(?i)^kenshi[^+]*\.exe\+0x", k)]
+    if foreign:
+        print("  " + verdict(False, "%d site(s) resolve OUTSIDE the kenshi"
+                                    " module - the return address is not the"
+                                    " caller's:" % len(foreign)))
+        for k in foreign[:4]:
+            print("             " + k)
+        print("             Every RVA below is void until that is explained.")
+
+    # The site table.  hands first: everything else is bookkeeping.
+    hands_sites = [(k, e) for k, e in s.dt_sites.items() if e["hands"] > 0]
+    total_hands = sum(e["hands"] for _, e in hands_sites)
+    if s.dt_sites:
+        print("  detach sites this session (per-ride tables, unbudgeted):")
+        print("  %-34s %6s %6s %s" % ("site", "hands", "other", "slot0"))
+        for k, e in sorted(s.dt_sites.items(),
+                           key=lambda kv2: (-kv2[1]["hands"], kv2[0])):
+            print("  %-34s %6d %6d %s" % (k[:34], e["hands"], e["other"],
+                                          e["slot0"]))
+    else:
+        print("  site table EMPTY - nobody called detachItem on this rider's"
+              " Appearance.")
+
+    # The one address-free inference, and it is the load-bearing one: attachItem
+    # clears the target slot before writing it, from exactly TWO static sites
+    # (0x535E0E in the 2-arg form, 0x535ECF in the 3-arg one - RE_NOTES §18.11).
+    # So every successful draw MUST produce one "hands" detach, and >2 distinct
+    # hands sites PROVES a third writer without needing any RVA arithmetic.
+    print("  %d distinct site(s) carried a slot='hands' detach (%d call(s)"
+          " total)." % (len(hands_sites), total_hands))
+    if len(hands_sites) > 2:
+        print("  ANSWER  at least one NON-attachItem writer exists: attachItem"
+              " can account for")
+        print("          at most 2 distinct sites (§18.11), and %d were seen."
+              "  Name them:" % len(hands_sites))
+    elif hands_sites:
+        print("  READING %d site(s) <= the 2 that attachItem itself can account"
+              " for, so this is" % len(hands_sites))
+        print("          CONSISTENT with the probe's built-in positive control"
+              " and is NOT a")
+        print("          failure: every successful draw has to produce one"
+              " 'hands' detach from")
+        print("          inside attachItem (§18.11).  But 2 sites can equally be"
+              " one attachItem")
+        print("          plus one OTHER writer - only --ret can tell those apart,"
+              " so run it:")
+    if hands_sites:
+        for k, _e in sorted(hands_sites, key=lambda kv2: -kv2[1]["hands"])[:6]:
+            m = re.search(r"\+0x([0-9A-Fa-f]+)$", k)
+            if m:
+                print("            python tools\\callers.py --ret 0x%s"
+                      % m.group(1).upper())
+            else:
+                print("            (unparsable site: %s)" % k[:60])
+        print("          ⚠️ Do NOT shift these by hand.  RUNTIME_RVA_DELTA"
+              " (+0xA90) is anchored on")
+        print("          three sites in 0x5CE000-0x5DC000 ONLY (§18.10), and"
+              " attachItem lives at")
+        print("          0x535xxx - outside that window it is unverified."
+              "  --ret prints both.")
+
+    # --- T16: the sheath-slot fix's self-evidence (RE_NOTES §18.12 / §18.12.1) ---
+    # drawWeapon's 2nd argument IS the sheath location, and leaveSheathEquipped
+    # whitelists exactly "hip" and "back" - the empty string we used to pass fell
+    # straight through to the function tail, so the blade was never detached from
+    # the back, the sheath field stayed '' and no scabbard appeared (§18.12).  Now
+    # that a real slot name goes in, every successful draw must ALSO produce a
+    # detach carrying that slot, from the call site inside leaveSheathEquipped.
+    # That is this build's self-evidence and, like the hands inference above, it
+    # needs no RVA arithmetic - the slot NAME does the work.
+    SHEATH_SLOTS = ("back", "back2", "hip")
+    sheath_sites = [(k, e) for k, e in s.dt_sites.items()
+                    if (e.get("slot0") or "") in SHEATH_SLOTS]
+    sheath_calls = sum(e["hands"] + e["other"] for _k, e in sheath_sites)
+    rd_ok = [d for d in s.rd if fnum(d, "post") == 1]
+    rd_sheathed = [d for d in rd_ok if (d.get("_shpost") or "") in SHEATH_SLOTS]
+    print("")
+    print("  -- T16, the sheath-slot fix: did drawWeapon's arg2 land? --")
+    print("     %d site(s) / %d call(s) carried a sheath-family slot %s;"
+          " P43RD post=1 edges with"
+          % (len(sheath_sites), sheath_calls, "/".join(SHEATH_SLOTS)))
+    print("     a non-empty POST sheath name: %d of %d."
+          % (len(rd_sheathed), len(rd_ok)))
+    if sheath_calls and rd_sheathed:
+        print("  PASS   the fix took: the slot name reached the engine"
+              " (sh='' -> '%s') AND the"
+              % (rd_sheathed[-1].get("_shpost") or "?"))
+        print("         previously-skipped detach inside leaveSheathEquipped"
+              " now fires.  Name it with")
+        print("         --ret (above) before quoting any RVA - the expected"
+              " answer is the call at")
+        print("         0x5D2632 in 0x5D24B0 (§18.11 / §18.12.1).")
+    elif rd_ok and not rd_sheathed:
+        print("  FAIL   every successful edge still logs an EMPTY post sheath"
+              " name => arg2 never")
+        print("         arrived.  Check RideSheathSlotFor()'s return, then the"
+              " three ABI rules in")
+        print("         §18.12 (never \"back2\", <=15 chars, arg3 is a CONSUMED"
+              " in/out param - a")
+        print("         temporary std::string is wrong on principle).")
+    elif rd_sheathed and not sheath_calls:
+        print("  CHECK  the field got written but NO sheath-family detach was"
+              " seen => the whitelist")
+        print("         still refused the value, or P43DT is absent from this"
+              " build (check hk= above).")
+    else:
+        print("  NOT MEASURED  no successful P43RD edge in this log, so the"
+              " fix was never exercised")
+        print("         (empty hands + a stance edge is what arms it) - this"
+              " is not a pass.")
+    print("")
+
+    # ---- the poll half.  This is what makes P43DT's silence readable. --------
+    print("  -- P43HD, the hand-slot poll (what the ENGINE left, sampled before"
+          " our re-draw) --")
+    if not s.hd_rides and not s.hd_edges:
+        print("     no P43HD line at all while P43DT spoke - the poll never ran."
+              "  Half of this")
+        print("     probe is missing: 'nobody detached' cannot be separated from"
+              " 'it left another")
+        print("     way'.  NOT MEASURED.")
+        return
+    tot = {"samples": 0, "nonnull": 0, "gain": 0, "loss": 0, "swap": 0,
+           "appswap": 0, "nullapp": 0}
+    for d in s.hd_rides:
+        for k in tot:
+            try:
+                tot[k] += int(d.get(k, "0"))
+            except ValueError:
+                pass
+    for d in s.hd_rides:
+        print("     %s samples=%s nonnull=%s gain=%s loss=%s swap=%s appswap=%s"
+              " nullapp=%s first=%s last=%s" % (
+                  d.get("_ts", "?"), d.get("samples", "?"),
+                  d.get("nonnull", "?"), d.get("gain", "?"), d.get("loss", "?"),
+                  d.get("swap", "?"), d.get("appswap", "?"),
+                  d.get("nullapp", "?"), d.get("first", "?"), d.get("last", "?")))
+    if tot["samples"] == 0:
+        print("     " + verdict(False, "samples=0 - HdPoll never reached the"
+                                       " getAttachedEntity call"))
+        return
+    if tot["nullapp"]:
+        print("     " + verdict(False, "nullapp=%d - getAppearance() returned"
+                                       " NULL on a mounted rider, so those"
+                                       " frames" % tot["nullapp"]))
+        print("               are blind (and gDtApp's filter would have been"
+              " blind with them).")
+    if tot["appswap"]:
+        print("     NOTE  appswap=%d - the rider's Appearance POINTER changed"
+              " mid-ride." % tot["appswap"])
+        print("           That is a finding on its own: an Appearance rebuild"
+              " drops every")
+        print("           attachment without any detachItem call, which is"
+              " exactly the reading")
+        print("           P43DT alone could not distinguish from 'nobody"
+              " detached'.  The probe")
+        print("           adopts the new pointer so the hook keeps hearing"
+              " (HdPollImpl).")
+        for line in s.hd_appswap[:4]:
+            print("           " + line[:150])
+    for d in s.hd_edges[:14]:
+        print("     %s %-8s ent=%s prev=%s wih=%s st=%s cm=%s bc=%s" % (
+            d.get("_ts", "?"), d.get("_kind", "?"), d.get("ent", "-"),
+            d.get("prev", "-"), d.get("wih", "?"), d.get("st", "?"),
+            d.get("cm", "?"), d.get("bc", "?")))
+    if len(s.hd_edges) > 14:
+        print("     ... %d more" % (len(s.hd_edges) - 14))
+
+    last_hd = s.hd_rides[-1] if s.hd_rides else {}
+    lastent = (last_hd.get("last") or "").strip("'")
+    held = lastent not in ("", "0", "0000000000000000", "00000000", "(null)")
+    if tot["loss"] == 0 and held:
+        print("     ANSWER  the hand slot still HELD an entity on the last frame"
+              " of the ride and")
+        print("             never lost it (loss=0).  Paired with the P43DT"
+              " reading above, that")
+        print("             rules out 'somebody takes it back'.  ⚠️ It does NOT"
+              " point at the render")
+        print("             side: trip 13 (2026-09-02) fixed the same symptom"
+              " with ZERO render-side")
+        print("             change, so that arrow is retracted (RE_NOTES"
+              " §18.11.1 / §18.12.1).")
+        print("             Read the -- T16 -- block above first: an attachment"
+              " that exists while")
+        print("             the mesh is off screen is what an empty 2nd argument"
+              " to drawWeapon")
+        print("             looks like, because leaveSheathEquipped whitelists"
+              " only 'hip'/'back'")
+        print("             and the sheath pipeline never runs.")
+    elif tot["loss"]:
+        print("     ANSWER  loss=%d - the hand slot DID go empty %d time(s)"
+              " while mounted." % (tot["loss"], tot["loss"]))
+        print("             Line the loss timestamps up against the P43DT rows"
+              " above: a loss with")
+        print("             a detach in the same frame names the remover; a loss"
+              " with NO detach")
+        print("             line means it left some other way (see appswap)."
+              "  ⚠️ kHdLossLines=8")
+        print("             per ride, so a shortfall of lines is a budget, not"
+              " an absence.")
+    else:
+        print("     ANSWER  loss=0 but the last sample was empty (last=%s) -"
+              " the slot was never" % (lastent or "0"))
+        print("             seen holding anything, so nothing was there to be"
+              " taken away.  That")
+        print("             contradicts trip 6's hands=12 attach and is the"
+              " first thing to explain.")
+    print("  NOTE  naming only (TASK.md P4-3 step 2).  Neither half may become"
+          " 'so we call")
+    print("        attachItem ourselves' - that is write-side compensation for"
+          " an absolute")
+    print("        overwrite, HISTORY §B's servo road.  Go kill the writer, or"
+          " prove there")
+    print("        isn't one - and if there isn't, check what YOU pass to"
+          " drawWeapon before")
+    print("        you blame the render side (§18.12: the 2nd argument is the"
+          " sheath slot).")
+
+
 def report_p41d(s):
+
     """P4-3 step 3, naming half: does chooseAttack yield a technique, and what is
     that clip called?  Everything the P41D lever prints is secondary to that one
     question, so the ladder bookkeeping is summarised, not expanded."""
@@ -2071,6 +2518,603 @@ def report_p41d(s):
     print("        ourselves', which is HISTORY §B's servo road.")
 
 
+def stance_windows(s):
+    """[(enter_ts, exit_ts_or_None)] from the STANCE transitions, by timestamp.
+
+    T14-A needs this: the suppressor only fires INSIDE a stance, while the
+    P4-1e draw ladder only arms once the hands are EMPTY - which, with
+    suppression on, is exactly outside the stance.  Where a ladder run started
+    is therefore the whole difference between "n= is inconclusive by
+    construction" and "a second writer is emptying the hands under our nose".
+    STANCE f= counts the global frame, so this correlation must go by timestamp.
+    """
+    wins = []
+    prev = None
+    for row in s.stance:
+        st, t = row[0], tsnum(row[6])
+        if st == prev:
+            continue
+        prev = st
+        if t is None:
+            continue
+        if st == "1":
+            wins.append([t, None])
+        elif wins and wins[-1][1] is None:
+            wins[-1][1] = t
+    return [(a, b) for a, b in wins]
+
+
+def report_stance_terms(s):
+    """T18: which of RideStanceRaw's three terms refused, per ride.
+
+    Read this BEFORE T14-A / T14-B.  Those two only ever say "nothing
+    happened"; this says why.  Trip 14 (2026-09-02, diag OFF) is the reason it
+    exists: two fights with drawn=0 / real=0 and no way to tell from the log
+    whether the stance was blocked at the size gate, the combat term or the
+    threat search, because STANCE itself is diagnostics-gated.
+    """
+    print("")
+    print("== T18 - why the stance did or did not arm (P43FT) ==")
+    if not s.ft_rides:
+        print("  no P43FT line.  It was UNGATED and printed one per ride, so its")
+        print("  absence is NOT a diagnostics-off artefact.  TWO readings now, and")
+        print("  the P43RD rows below tell them apart:")
+        print("    - the instrument was REMOVED in the probe-free build 304128 B /")
+        print("      md5 1792B72E... (T19, 2026-09-02).  It had answered: the stance")
+        print("      DOES arm on the mount's own books (trip 15 ok=2182 / ok=2585,")
+        print("      noElig=0, dmin=7.6/8.4).  On such a log judge the stance from")
+        print("      T14-A/T14-B alone - real>0 and post=1 are the surviving fields.")
+        print("      Silence here is EXPECTED; check the DLL's md5 before reading")
+        print("      anything into it.")
+        print("    - or this log predates the T18 build (312832 B / E83DB50D...),")
+        print("      where the combat term was still rider->isInCombatMode(true,true)")
+        print("      and a player build never reached it (RE_NOTES 17.7): expect")
+        print("      drawn=0 / real=0 with no field to explain it.")
+        print("  Discriminator: a T19 log still has P43RD edges with post=1; a pre-T18")
+        print("  log has drawn=0 on every ride.")
+        return
+    print("  ok=armed  noElig=size gate  noFight=RideFightIsOn  noThr=no live")
+    print("  threat  far=threat beyond kRideThreatDist(60)  dmin=closest seen")
+    armed = 0
+    for i, d in enumerate(s.ft_rides, 1):
+        print("    ride %d: ok=%s noElig=%s noFight=%s noThr=%s far=%s dmin=%s"
+              % (i, d.get("ok"), d.get("noElig"), d.get("noFight"),
+                 d.get("noThr"), d.get("far"), d.get("dmin")))
+        if fnum(d, "ok", 0) > 0:
+            armed += 1
+    if armed == len(s.ft_rides):
+        print("  PASS   every ride armed the stance at least once.  The remaining")
+        print("         half of T18 is T14-A/T14-B below (real>0, drawn>0) plus the")
+        print("         eyeball: weapon out during the fight, combat pose not the")
+        print("         seat pose.  ok>0 alone does NOT close T18.")
+        return
+    if armed:
+        print("  CHECK  %d of %d rides armed it.  A ride spent entirely out of"
+              % (armed, len(s.ft_rides)))
+        print("         combat is normal - only judge rides that contained a fight.")
+    else:
+        print("  FAIL   no ride armed the stance.  The dominant zero-reason above")
+        print("         is the next thing to fix:")
+    # Point at the dominant refusal across all rides, which is the actionable bit.
+    tot = {}
+    for k in ("noElig", "noFight", "noThr", "far"):
+        tot[k] = sum(fnum(d, k, 0) for d in s.ft_rides)
+    worst = max(tot, key=lambda k: tot[k])
+    if tot[worst] <= 0:
+        return
+    if worst == "noElig":
+        print("         noElig dominates = MountCombatEligible refused.  Read the"
+              " mount")
+        print("         line's size=/rad=/elig= (T9): this is the size gate doing"
+              " its")
+        print("         job on a big mount, not a T18 regression.")
+    elif worst == "noFight":
+        print("         noFight dominates = RideFightIsOn is still false, i.e. the")
+        print("         MOUNT's books are empty too.  That would contradict trip 13")
+        print("         (mTgt=1 / mAtk=6 at 202.263, 3.3 s before any lever press),")
+        print("         so check the mount line's mAtk= and P3CMB mTgt= first.")
+    elif worst == "noThr":
+        print("         noThr dominates = a fight is on but RideNearestThreat found")
+        print("         nobody: every candidate was NULL, isDown() or isDead().  The")
+        print("         mount tiers are the new ones - see RideNearestThreat.")
+    else:
+        print("         far dominates = threats WERE found but all beyond 60u."
+              "  dmin")
+        print("         above is the closest one; kRideThreatDist is the knob, and"
+              " a")
+        print("         dmin just over 60 means the fight was real and out of reach.")
+
+
+def report_suppress(s):
+    """T14-A (was T13-A): did the sheathe suppressor actually take a weapon away?"""
+    print("")
+    print("== T14-A - sheathe suppression (P43SUP) ==")
+    if s.sh_hookfail:
+        print("  CHECK the hook did not install"
+              " ('Could not hook CharacterHuman::sheatheWeapon!').")
+        print("  Nothing below can mean anything: the engine body ran every time.")
+        print("  This ErrorLog is shared with the retired step-1 probe - on a"
+              " 302080 B+")
+        print("  log it is about the SUPPRESSOR.")
+        return
+    entries = 0
+    prev = None
+    for row in s.stance:
+        if row[0] != prev:
+            if row[0] == "1":
+                entries += 1
+            prev = row[0]
+    if not s.sup_rides and not s.sup_skips:
+        print("  no P43SUP line at all.  Neither shape is diagnostics-gated, so"
+              " this is")
+        print("  NOT the usual 'Ctrl+NUM. was off'.  Three readings:")
+        print("    - this log predates DLL 302080 B (no suppressor in the build);")
+        print("    - sheatheWeapon was never called on a tracked rider;")
+        print("    - the state filter rejected every call (riderToMount ->"
+              " mountSeat ->")
+        print("      RideCombatStance).  The third is the one worth chasing, and"
+              " the")
+        print("      tell is STANCE: entries(->1)=%d." % entries)
+        if entries:
+            print("      FIRST THING TO LOOK AT: entries>0 with zero P43SUP means"
+                  " the")
+            print("      rider was in stance and nothing tried to sheathe -"
+                  " re-read which")
+            print("      writer P43SH named, because the suppressor only covers"
+                  " the")
+            print("      virtual, not a direct bone/appearance write.")
+        return
+    real = sum(int(fnum(d, "real", 0) or 0) for d in s.sup_rides)
+    noop = sum(int(fnum(d, "noop", 0) or 0) for d in s.sup_rides)
+    npass = sum(int(fnum(d, "pass", 0) or 0) for d in s.sup_rides)
+    if s.sup_rides:
+        print("  %d per-ride summary line(s) (printed at dismount):"
+              % len(s.sup_rides))
+        for d in s.sup_rides:
+            print("    %s real=%s noop=%s pass=%s | P43RD drawn=%s fail=%s"
+                  " nowpn=%s"
+                  % (d.get("_ts"), d.get("real"), d.get("noop"), d.get("pass"),
+                     d.get("drawn"), d.get("fail"), d.get("nowpn")))
+    else:
+        # The summary only prints on dismount; skip lines print during the ride.
+        print("  %d skip line(s) but NO per-ride summary - the ride never ended"
+              " with a" % len(s.sup_skips))
+        print("  dismount in this log.  Counting the skip lines instead is wrong:"
+              " they are")
+        print("  budgeted at kShSupLines=10 per ride, so they saturate and"
+              " understate.")
+        for d in s.sup_skips:
+            r = int(fnum(d, "real", 0) or 0)
+            if r > real:
+                real = r
+            n = int(fnum(d, "noop", 0) or 0)
+            if n > noop:
+                noop = n
+        print("  highest running counter seen in those lines:"
+              " real=%d noop=%d" % (real, noop))
+    # THE gate.  real= counts suppressed calls whose PRE-state had a weapon in
+    # the hands, i.e. calls that would really have emptied them.  real=0 means
+    # the fix never bore load, and then "the weapon stayed in hand" proves
+    # nothing at all - identical discipline to late=0 invalidating the by-name
+    # mask rescue (RE_NOTES 21).
+    print("  " + verdict(real > 0,
+                         "real=%d suppressed call(s) really had a drawn weapon"
+                         " to lose" % real))
+    if real == 0:
+        print("        real=0 => THE FIX NEVER BORE LOAD.  Whatever the eyeball"
+              " half saw")
+        print("        this trip, it was not caused by this change.  Reference:"
+              " the")
+        print("        step-1 probe measured real=16 for _ragdollMode on one"
+              " ride.")
+        if noop:
+            print("        noop=%d with real=0 = the calls we swallowed were"
+                  " empty ones." % noop)
+            print("        FIRST THING TO LOOK AT: the real writer is not this"
+                  " virtual.")
+    if npass:
+        print("  NOTE pass=%d call(s) were deliberately let through (tracked"
+              " rider, but" % npass)
+        print("       not in stance).  Non-zero is the EXPECTED shape: the"
+              " mount-time")
+        print("       _carryMode sheathe must keep working, and the 1200 ms"
+              " stance tail")
+        print("       is what puts the weapon back afterwards.  pass=0 with"
+              " real>0 would")
+        print("       mean the gate is wider than designed.")
+    if s.sup_skips:
+        wih1 = sum(1 for d in s.sup_skips if d.get("wih") == "1")
+        print("  skip samples: %d line(s), %d with wih=1 (budget kShSupLines=10"
+              " per ride)" % (len(s.sup_skips), wih1))
+        for d in s.sup_skips[:6]:
+            print("    %s wih=%s sh=%s cm=%s bc=%s"
+                  % (d.get("_ts"), d.get("wih"), d.get("sh"),
+                     d.get("cm"), d.get("bc")))
+        if s.sup_skips and wih1 == 0:
+            print("        every sampled call had wih=0 - see the real=0 note"
+                  " above; the")
+            print("        sample is budgeted, so trust the ride summary's"
+                  " real= over this.")
+    # Second self-proving field: P4-1e's forced-draw ladder should stop being
+    # spent once nothing re-sheathes.  Both this and the ladder are
+    # diagnostics-gated, so absence here is silence, not a zero.
+    if not s.draw_n:
+        print("  no P41E draw line - the forced-draw ladder never ran"
+              " (diagnostics off,")
+        print("  or no equipped weapon in the slots).  The second self-proving"
+              " field is")
+        print("  simply unavailable this trip; judge on real= alone.")
+        return
+    nmax = max(n for n, _l, _a, _b, _t in s.draw_n if n is not None)
+    # Group the rows into runs so the START of each ladder can be placed against
+    # the stance windows.  A run breaks on n resetting to 1 or a >2 s gap.
+    runs = []
+    for row in s.draw_n:
+        n, t = row[0], tsnum(row[4])
+        newrun = (not runs or n == 1)
+        if not newrun and t is not None:
+            pt = tsnum(runs[-1][-1][4])
+            if pt is not None:
+                newrun = (t - pt) > 2.0
+        if newrun:
+            runs.append([])
+        runs[-1].append(row)
+    wins = stance_windows(s)
+
+    def where(t):
+        if t is None:
+            return None
+        for a, b in wins:
+            # Half-open on purpose: a ladder run that starts in the SAME frame as
+            # the 1->0 edge started after the gate closed, not inside it.
+            if t >= a and (b is None or t < b):
+                return True
+        return False
+
+    # Nearest stance transition of ANY kind, windows or not: a log can open with a
+    # bare 'STANCE 0' (no matching entry), and that edge still explains a run.
+    edges = []
+    eprev = None
+    for row in s.stance:
+        if row[0] != eprev:
+            eprev = row[0]
+            et = tsnum(row[6])
+            if et is not None:
+                edges.append((et, row[0]))
+
+    inside = [r for r in runs if where(tsnum(r[0][4])) is True]
+    print("  P41E draw lines=%d in %d run(s)  highest n=%d  (budget"
+          " kDrawTryBudget=12," % (len(s.draw_n), len(runs), int(nmax)))
+    print("        one rung per kDrawTryGap=10 frames; since 301568 B a SUCCESSFUL"
+          " P43RD")
+    print("        edge also spends one unit, so left= can step without a rung"
+          " here)")
+    for r in runs[:6]:
+        t = tsnum(r[0][4])
+        near = None
+        for et, est in edges:
+            if t is None:
+                continue
+            dd = abs(t - et)
+            if near is None or dd < near[0]:
+                near = (dd, est)
+        print("    run @%s  n=%s..%s  %s  nearest STANCE edge: %s"
+              % (r[0][4],
+                 "?" if r[0][0] is None else int(r[0][0]),
+                 "?" if r[-1][0] is None else int(r[-1][0]),
+                 "INSIDE stance" if where(t) is True else "outside stance",
+                 "-" if near is None
+                 else "-> %s, %.3f s away" % (near[1], near[0])))
+    # THE reading.  n= climbing to the budget is only evidence of a second
+    # writer if the climb happened while the gate was open; a ladder that runs
+    # entirely outside the stance is disjoint from the suppressor by
+    # construction and says nothing either way.  (Measured trip 10: all three
+    # runs started within ~160 ms of a STANCE -> 0.)
+    print("  " + verdict(not inside or nmax <= 2,
+                         "no ladder run climbed inside a stance window"
+                         " (inside=%d/%d)" % (len(inside), len(runs))))
+    if not inside:
+        print("        => n=%d is INCONCLUSIVE, not a failure: the ladder only"
+              " arms on" % int(nmax))
+        print("        empty hands, which under suppression happens only after"
+              " the stance")
+        print("        ends.  Judge half A on real= alone, and do not read this"
+              " as a")
+        print("        second writer.")
+    elif nmax > 2:
+        print("        a run climbed WHILE the gate was open => something else"
+              " empties")
+        print("        the hands inside the stance.  With real>0 that is a"
+              " SECOND writer")
+        print("        outside this virtual; with real=0 the suppressor never"
+              " ran at all.")
+    late = [row for row in s.draw_n if row[3] == "0"]
+    if late:
+        print("  NOTE %d draw line(s) ended wih=..->0: the draw itself did not"
+              " leave a" % len(late))
+        print("       weapon in the hands (post-state read in the same frame)."
+              " That is a")
+        print("       drawWeapon problem, not a sheathe problem - keep the two"
+              " apart.")
+
+
+def report_redraw(s):
+    """T14-B: does the 0 -> 1 stance edge put a blade back into an empty hand?"""
+    print("")
+    print("== T14-B - stance-edge re-draw (P43RD) ==")
+    if not s.rd:
+        print("  no P43RD line.  This one is NOT diagnostics-gated (it changes"
+              " game state,")
+        print("  same discipline as 'force dismount' and P43SUP), so absence is a"
+              " reading,")
+        print("  not silence.  Four of them:")
+        print("    - this log predates DLL 301568 B (no re-draw in the build);")
+        print("    - no 0 -> 1 stance edge ever happened (never in combat mode, or"
+              " no threat")
+        print("      inside kRideThreatDist while mounted);")
+        print("    - every edge found getCurrentWeapon() non-NULL, i.e. the rider"
+              " came into")
+        print("      the stance ALREADY armed and the suppressor kept it there -"
+              " that is")
+        print("      trip 10's real=41 / real=16 clusters, and it is the GOOD"
+              " case, not a miss;")
+        print("    - the rider had nothing in the weapon slots at all (nowpn).")
+        print("  The P43SUP ride line separates them: drawn= / fail= / nowpn= are"
+              " ungated")
+        print("  and printed at every dismount.  All three zero WITH a stance in"
+              " the log")
+        print("  means no edge ever reached the draw.")
+        return
+    print("  %d line(s) (budget kStanceDrawLines=8 per ride).  Edges are rationed"
+          " by the" % len(s.rd))
+    print("        release tail, not by a budget: kRideStanceHoldMs=1200 ms has to"
+          " drain")
+    print("        before the stance can fall to 0, so ~1 edge per 1.2 s is the"
+          " ceiling.")
+    for d in s.rd[:8]:
+        print("    %s post=%s wih=%s aCW=%s cm=%s ok=%s fail=%s left=%s f=%s"
+              % (d.get("_ts"), d.get("post"), d.get("wih"), d.get("aCW"),
+                 d.get("cm"), d.get("ok"), d.get("fail"), d.get("left"),
+                 d.get("f")))
+        print("          sheath '%s' -> '%s'"
+              % (d.get("_shpre"), d.get("_shpost")))
+    # THE gate.  post= is getCurrentWeapon() read straight after our drawWeapon
+    # returned, so post=0 on every line means the engine refused the draw inside
+    # the stance and the change bore no load - identical discipline to real=0 for
+    # the suppressor and late=0 for the by-name mask rescue (RE_NOTES 21).
+    okn = len([d for d in s.rd if d.get("post") == "1"])
+    print("  " + verdict(okn > 0,
+                         "post=1 on %d/%d edge(s) - the re-draw really put a"
+                         " weapon in the hand" % (okn, len(s.rd))))
+    if not okn:
+        print("        post=0 everywhere => THE RE-DRAW BORE NO LOAD.  Whatever"
+              " the eyeball")
+        print("        half saw this trip, it was not caused by this change."
+              "  Reference:")
+        print("        P4-1h measured post=1 on 12/12 for the same call made"
+              " OUTSIDE a")
+        print("        stance, so a stance-only refusal IS the finding - write it"
+              " down, do")
+        print("        not answer it by calling more often (HISTORY §B).")
+    # wih= is CharacterHuman::weaponInHands across the call, post= is
+    # getCurrentWeapon().  They are different fields and can disagree: post=1 with
+    # wih=..->0 is a weapon the engine considers current but has not put in the
+    # hand yet, which is the same distinction P4-1h had to keep apart.
+    split = []
+    for d in s.rd:
+        pre, _, wpost = (d.get("wih") or "").partition("->")
+        split.append((d, pre, wpost))
+    halfway = [t for t in split if t[0].get("post") == "1" and t[2] == "0"]
+    if halfway:
+        print("  NOTE %d line(s) ended post=1 wih=..->0: getCurrentWeapon() answers"
+              " yes while" % len(halfway))
+        print("       weaponInHands is still empty in that same frame.  Read the"
+              " NEXT frame's")
+        print("       P41K/DBG rows before calling it a failure - the attach may"
+              " land one")
+        print("       frame later - but if the blade stays on the back on screen,"
+              " THIS is the")
+        print("       field that said so first.")
+    armed_pre = [t for t in split if t[1] == "1"]
+    if armed_pre:
+        print("  CHECK %d line(s) started wih=1: the hands were NOT empty, yet"
+              " getCurrentWeapon()" % len(armed_pre))
+        print("        was NULL (the function returns before this point"
+              " otherwise).  Two")
+        print("        readings of 'armed' disagreeing is worth a look, not a"
+              " pass.")
+    # aCW is animationRequirements.currentWeapon, the ANIMATION layer's view of
+    # what the rider holds (5 = SKILL_UNARMED, the value P4-1d read on every
+    # sheathed rider).  A draw that leaves it at 5 armed the hand and not the
+    # animation, which is exactly what 「空手进架势仍空手」 looks like from here.
+    unarmed = [d for d in s.rd if d.get("post") == "1" and d.get("aCW") == "5"]
+    if okn:
+        print("  " + verdict(not unarmed,
+                             "aCW came off SKILL_UNARMED(5) on every successful"
+                             " edge (%d/%d still at 5)" % (len(unarmed), okn)))
+        if unarmed:
+            print("        aCW=5 with post=1 => the blade is current but the anim"
+                  " layer never")
+            print("        learned about it.  Same field as the P4-1d weapon gate,"
+                  " and the")
+            print("        reason a technique can still refuse to fire.")
+    # cm= is the RIDER's isInCombatMode(true,true).  Before the T18 fix
+    # RideStanceRaw REQUIRED it, so cm=0 on an edge meant a latch fault.  After the
+    # fix the combat term is RideFightIsOn(rider, mount) - an OR the MOUNT's own
+    # target/attacker list can satisfy alone - and T17 proved the rider's flag is
+    # permanently 0 in a player build (mounting drops aggro, the enemy never
+    # retargets onto the rider).  So cm=0 is now the EXPECTED shape and cm=1 is the
+    # notable one.  Telling the two builds apart takes TWO tests, because P43FT
+    # shipped WITH the fix and was subtracted again for T19 (304128 B / md5
+    # 1792B72E...): P43FT present => post-fix, and P43FT absent BUT edges with
+    # post=1 => ALSO post-fix.  That second test is this file's own T19
+    # discriminator (printed in the T18 section above): a pre-T18 player build
+    # never re-drew at all, so it reaches this line with drawn=0 on every ride
+    # and no edge to judge.  Byte size cannot do it here because 312832 collides
+    # with two pre-fix backups (_prev_E7613634, _prev_544D8C86) - CLAUDE.md's
+    # "identity is md5".
+    nocm = [d for d in s.rd if d.get("cm") == "0"]
+    if s.ft_rides or okn:
+        why = ("P43FT is present" if s.ft_rides else
+               "P43FT is gone yet %d edge(s) landed post=1 (a T19 build)" % okn)
+        print("  NOTE  %d/%d edge(s) fired with cm=0, which is EXPECTED on this"
+              " build:" % (len(nocm), len(s.rd)))
+        print("        %s => the stance's combat term is"
+              " RideFightIsOn(rider," % why)
+        print("        mount), satisfied by the MOUNT's attack target or attacker"
+              " list on its")
+        print("        own (RE_NOTES §17.7).  The rider's own flag staying 0 all"
+              " fight IS the")
+        print("        T17 finding, not a fault.  cm=1 here would mean something"
+              " wrote the")
+        print("        rider into combat mode - RiderCombatLever, or a third"
+              " party.")
+    else:
+        print("  " + verdict(not nocm,
+                             "every edge fired with cm=1 (%d/%d)"
+                             % (len(s.rd) - len(nocm), len(s.rd))))
+        if nocm:
+            print("        pre-T18 build (no P43FT line, and not one edge landed"
+                  " post=1): cm=0")
+            print("        on an edge is a LATCH fault, not a draw fault -"
+                  " RideStanceRaw could")
+            print("        not return 1 without combat mode.  Look at"
+                  " gStanceDrawWho/Prev - a")
+            print("        rider swap resets the latch and can re-fire on a stance"
+                  " already up.")
+    # The failure cap.  kStanceDrawFails=6 refusals disarm the re-draw for the
+    # REST OF THAT RIDE, deliberately: re-issuing an equipment mutation forever on
+    # a refusal is still a servo, just on a slower clock (HISTORY §B).
+    fmax = 0
+    for d in s.rd:
+        f = int(fnum(d, "fail", 0) or 0)
+        if f > fmax:
+            fmax = f
+    if fmax:
+        print("  " + verdict(fmax < 6,
+                             "refusals stayed under the cap (highest fail=%d of"
+                             " kStanceDrawFails=6)" % fmax))
+        if fmax >= 6:
+            print("        cap reached => the re-draw is DISARMED for the rest of"
+                  " that ride, so")
+            print("        later empty-handed stances in this log say nothing about"
+                  " the fix.")
+    # The user's ruling 「补拔失败不消耗 kDrawTryBudget，失败退回梯子」 is
+    # log-verifiable: left= is gDrawTries printed AFTER our own decrement, and the
+    # only other spender is the P41E ladder, which prints one left= line per rung.
+    # So between two P43RD lines left must fall by exactly (ladder lines in
+    # between) + (1 if the later edge succeeded, else 0).
+    # ONLY WITHIN ONE RIDE, though: Mount() re-arms gDrawTries = kDrawTryBudget
+    # (RidingPlugin.cpp:5355 and :5637), so a transition that straddles a dismount
+    # is comparing two different budgets.  lb > la catches that only when the
+    # re-arm happens to show up as an increase - if the previous ride spent as much
+    # as the next ride's first edge (trip 16: 11 -> 11) it looks identical to a
+    # refused edge that stole a unit.  So cut the sequence at the P43SUP ride
+    # lines, which print one per dismount and are ungated.
+    ladder_ts = sorted(t for t in (tsnum(r[4]) for r in s.draw_n) if t is not None)
+    ride_end_ts = sorted(t for t in (tsnum(d.get("_ts")) for d in s.sup_rides)
+                         if t is not None)
+    bad = []
+    skipped = 0
+    for i in range(1, len(s.rd)):
+        a, b = s.rd[i - 1], s.rd[i]
+        la, lb = fnum(a, "left"), fnum(b, "left")
+        if la is None or lb is None:
+            continue
+        if lb > la:
+            continue          # gDrawTries re-armed => a new ride (Mount / load)
+        ta, tb = tsnum(a.get("_ts")), tsnum(b.get("_ts"))
+        if (ta is not None and tb is not None
+                and [t for t in ride_end_ts if ta < t <= tb]):
+            skipped += 1
+            continue          # a dismount sits between them => different budgets
+        k = 0
+        if ta is not None and tb is not None:
+            k = len([t for t in ladder_ts if ta < t <= tb])
+        want = la - k - (1 if b.get("post") == "1" else 0)
+        if want < 0:
+            want = 0
+        if int(lb) != int(want):
+            bad.append((b.get("_ts"), int(la), int(lb), int(want), k,
+                        b.get("post")))
+    if len(s.rd) >= 2:
+        print("  " + verdict(not bad,
+                             "kDrawTryBudget accounting matches the ruling (%d"
+                             " transition(s) checked)"
+                             % (len(s.rd) - 1 - skipped)))
+        if skipped:
+            print("        (%d transition(s) straddled a dismount and were skipped:"
+                  " Mount()" % skipped)
+            print("        re-arms the budget, so those two edges are not on the"
+                  " same 12.)")
+        for row in bad[:4]:
+            print("        @%s left %d -> %d, expected %d (post=%s, %d ladder"
+                  " line(s) between)"
+                  % (row[0], row[1], row[2], row[3], row[5], row[4]))
+        if bad:
+            print("        A REFUSED edge that spent budget is the ruling being"
+                  " broken.  An")
+            print("        unexplained drop with diagnostics ON may still be the"
+                  " ladder (its")
+            print("        lines are counted above); with diagnostics OFF nothing"
+                  " else spends it.")
+        lefts = [x for x in (fnum(d, "left") for d in s.rd) if x is not None]
+        refused = len([d for d in s.rd if d.get("post") == "0"])
+        if not bad and lefts and max(lefts) == 0 and refused == 0:
+            print("        INCONCLUSIVE though: every left= is 0 and no edge was"
+                  " refused, so")
+            print("        neither half of the ruling actually got tested."
+                  "  gDrawTries was")
+            print("        already spent before the first edge - with diagnostics ON"
+                  " the P41E")
+            print("        ladder burns all 12 rungs at mount (see the runs above);"
+                  " with them")
+            print("        OFF the first successful edge should print left=11."
+                  "  And 'a refusal")
+            print("        spends nothing' needs one post=0 edge before it can be"
+                  " read at all.")
+    # Frame correlation, by frame number rather than by timestamp.  The latch is
+    # armed in HaltAndForceSitPass and consumed in CombatAndForceDismountPass, and
+    # both lines print gP3Frames - but the counter ticks BETWEEN those two passes,
+    # so the measured shape (trip 11, 4/4: 12319->12320, 12849->12850, 13756->13757,
+    # 15666->15667, +1 ms each) is f_edge = f_stance + 1, not equality.  Accept both
+    # frames.  STANCE is diagnostics-gated, so this is a bonus check, never the
+    # verdict - post= is.
+    st1 = set(row[1] for row in s.stance if row[0] == "1")
+    if st1:
+        okf = set(st1)
+        for f in st1:
+            try:
+                okf.add(str(int(f) + 1))
+            except (TypeError, ValueError):
+                pass
+        miss = [d for d in s.rd if d.get("f") not in okf]
+        print("  " + verdict(not miss,
+                             "every re-draw sits on a STANCE 1 frame or the one"
+                             " after it (%d/%d)"
+                             % (len(s.rd) - len(miss), len(s.rd))))
+        if miss:
+            print("        an f= that is neither a STANCE 1 frame nor f+1 means the"
+                  " edge did not")
+            print("        come from a 0 -> 1 transition this log recorded: look for"
+                  " a second")
+            print("        tracked rider (the latch is single-slot, keyed on"
+                  " gStanceDrawWho).")
+    else:
+        print("  no STANCE row - the frame cross-check needs continuous"
+              " diagnostics")
+        print("  (Ctrl+NUM.).  post= above does not, so the verdict stands without"
+              " it.")
+    if s.act_over:
+        print("  NOTE act>1.02 on %d frame(s) this trip.  Two known causes now"
+              " that the" % s.act_over)
+        print("       swing window is out of the build: the stance handover (trip"
+              " 4/6/9) and")
+        print("       the mount fade-in overlap (trip 8).  Anything else is new -"
+              " tell them")
+        print("       apart by timestamp.")
+
+
 def report_trailer(s, lines):
     print("")
     print("== leftovers ==")
@@ -2115,7 +3159,11 @@ def main(argv):
     report_legs(s)
     report_pose(s)
     report_sheathe(s)
+    report_stance_terms(s)
+    report_suppress(s)
+    report_redraw(s)
     report_attach(s)
+    report_detach(s)
     report_p41d(s)
     report_trailer(s, lines)
     print("")

@@ -22,8 +22,11 @@
 // its neighbours are spelled "Enums.h" / "util/lektor.h" / "Item.h" and it sits in
 // kenshi/ itself, so every one of those resolves relative to its own directory.
 #include <kenshi/Inventory.h>
-// (kenshi/Appearance.h used to be included here for the P4-3 step-2 attach probe's member-pointer
-// typedefs; it went out with the probe.  Nothing else in this file names AppearanceBase.)
+// Back for P4-3 step 2's THIRD probe (2026-09-02): the member-pointer typedef that picks the
+// detachItem(const std::string&) overload needs the class, and the hand-slot poll needs
+// getAttachedEntity (Appearance.h:69).  There is no `class Appearance`: both are declared on
+// AppearanceBase, which is exactly what Character::getAppearance() (Character.h:584) hands back.
+#include <kenshi/Appearance.h>
 // Vanilla rebindable-keybinding support: DatapanelGUI::addCustomLine lets us inject
 // a DataPanelLine_KeyConfig row into the Settings->Controls page, and
 // InputHandler::loadConfig is where we register our commands so their bindings
@@ -790,6 +793,47 @@ static int          gDrawNoWpn     = 0;   // "slots are empty" already reported 
 static unsigned int gDrawLastFrame = 0;
 static int          gInvDumped     = 0;   // one equipment-slot dump per ride
 
+// ---- P4-3-3: one re-draw on the stance edge (2026-09-02, user ruling) -------------------------
+// T13 half A shipped the sheathe suppressor and the tenth trip proved it bears load (real=57) -
+// but only for a blade that was ALREADY out when the stance came up.  Trip 10's three skip
+// clusters split cleanly: 213.048-214.073 was ten samples of wih=0 (that segment ran real=0
+// noop=132) and the user saw an empty-handed rider, while 252.729-254.076 and 385.886-387.419
+// were ten of ten wih=1 (real=41 / real=16) and the user saw 「人物在战斗中上马可以保持一会儿掏刀
+// 的姿势」.  So the suppressor GUARDS a weapon and never DRAWS one; this issues exactly one draw
+// on the 0 -> 1 stance edge and nothing anywhere else.
+//
+// Why an edge and nothing else:
+//   * 「每帧重拔」 is banned outright (HISTORY §B): a write-side servo against an every-frame
+//     overwriter is the one shape this project refuses.  The overwriter is already dead - that is
+//     what the suppressor did - so what remains is a single state transition, which is the shape
+//     §B prescribes instead.
+//   * Edges are rationed by the release tail, not by a budget: kRideStanceHoldMs (1200 ms) has to
+//     drain before the stance can fall to 0, so no amount of flickering produces edges faster
+//     than ~1 per 1.2 s.
+// Budget accounting, per the user's ruling 「补拔失败不消耗 kDrawTryBudget，失败退回梯子」:
+//   * A SUCCESSFUL re-draw spends one kDrawTryBudget unit (a call really was made).  It leaves
+//     gDrawCalls alone on purpose - that counter is the P41E ladder's own run numbering and
+//     ridelog.py groups ladder runs by `n=1`, so borrowing it would corrupt a judgement.
+//   * A REFUSED one spends nothing, so the ladder keeps all 12.  ⚠️ That ladder is
+//     debugContinuous-gated (RiderArmProbe, called from CombatAndForceDismountPass), so in a
+//     player build "fall back to the ladder" resolves to "fall back to the next stance edge";
+//     kStanceDrawFails is what bounds the retries there.
+//   * kStanceDrawFails exists because an engine that refuses this draw will refuse it on every
+//     edge, and re-issuing an equipment+animation mutation forever on a refusal is still a servo,
+//     just on a slower clock.  P4-1h measured 12/12 post=1, so the cap should stay unspent.
+static const int kStanceDrawFails = 6;   // refused stance-edge re-draws tolerated per ride
+static const int kStanceDrawLines = 8;   // per-ride P43RD line budget
+
+static Character* gStanceDrawWho = NULL;   // whose edge is pending; pointer compare only
+static bool gStanceDrawPend  = false;      // an edge fired; the draw has not been issued yet
+static bool gStanceDrawPrev  = false;      // last frame's stance, UNGATED (gRideStanceLast is
+                                           // only maintained inside the debugContinuous log)
+static bool gStanceDrawBusy  = false;      // our own drawWeapon is on the stack right now
+static int  gStanceDrawOk    = 0;
+static int  gStanceDrawFail  = 0;
+static int  gStanceDrawNoWpn = 0;          // edges that found no weapon in the slots at all
+static int  gStanceDrawLines = 0;
+
 // P4-1e-2: the whole block above used to live inside RiderCombatLever, i.e. behind "a live
 // attacker is within kAtkTryRange".  MEASURED 2026-08-30 (user report): fighting on foot and
 // THEN mounting drops the existing aggro - the enemies stop treating the pair as a target -
@@ -1034,13 +1078,44 @@ static Weapon* RiderWeaponInHands(Character* rider, const char** sheathOut)
     return h->weaponInHands;
 }
 
+// drawWeapon's SECOND argument is the sheath location the blade is leaving, and it is not
+// decoration: drawWeapon hands it straight to leaveSheathEquipped (RE_NOTES §18.12), which
+// whitelists exactly "hip" and "back" and returns having done NOTHING for any other string - the
+// empty one we used to pass included.  That skipped block is the three missing steps of every
+// mounted draw: detachItem(location) takes the blade's mesh OFF the back, the empty scabbard mesh
+// goes on in its place, and weaponInHandsSheathLocation (0x6E0) records where it came from.  Which
+// is exactly the observed failure - hand slot occupied in the data layer, blade still on the back
+// on screen, sh='' on every edge (RE_NOTES §18.11.1).
+// ⚠️ Never pass "back2".  leaveSheathEquipped derives that itself from the item's own field; the
+// whitelist rejects the 5-character string outright, which would put us right back here.
+// ⚠️ Keep the value at 15 characters or fewer.  drawWeapon clears the string in place on the way
+// out, and for a heap-allocated one it takes the `0xf < _Myres` branch into operator_delete - the
+// game's allocator on our buffer.  "hip"/"back" live in MSVC's internal buffer, so it is dead code.
+static std::string RideSheathSlotFor(Character* rider)
+{
+    // The back family is checked first and wins ties: it is where a primary weapon rides, and it is
+    // what the engine's own draw used for the one ride that renders correctly (sh='back').  "hip"
+    // is taken only when both back slots are provably empty, so a shield or a pack sitting on the
+    // hip can never be detached out from under the player by a wrong guess.
+    AppearanceBase* app = rider ? rider->getAppearance() : NULL;
+    if (app)
+    {
+        void* onBack  = (void*)app->getAttachedEntity(std::string("back"));
+        void* onBack2 = (void*)app->getAttachedEntity(std::string("back2"));
+        void* onHip   = (void*)app->getAttachedEntity(std::string("hip"));
+        if (!onBack && !onBack2 && onHip) return std::string("hip");
+    }
+    return std::string("back");
+}
+
 // P4-3 step 1's sheatheWeapon naming probe (a hook on CharacterHuman::sheatheWeapon, a per-ride
 // caller-site table, and ShDescribeAddr's "<module>+0x<rva>" formatter) lived HERE and is gone as
 // of the probe-free build.  Its verdict: the second writer is Character::_ragdollMode (real=16,
 // median gap 22 frames), with Character::_carryMode(on=true) secondary - both named in
 // RE_NOTES §18.10, reasoning in TASK.md P4-3 step 1, code in `git show 61872dc` (the commit that
 // shipped it) or `git show 7838deb:RidingPlugin.cpp` (last source with the full diagnostics set).
-// (!) USE STILL STOPS AT NAMING: re-drawing the weapon every frame stays banned (HISTORY §B).
+// (!) 每帧重拔 STAYS BANNED (HISTORY §B).  What P4-3-2 does instead is suppress the sheathe
+// itself - see RideSheatheSuppressed, right after RideCombatStance - so nothing here re-draws.
 
 // P4-3 step 2's attachItem naming probe (two hooks on the AppearanceBase::attachItem overloads,
 // a per-ride site table, and the "hands" slot filter) lived HERE and is gone as of the probe-free
@@ -1048,6 +1123,24 @@ static Weapon* RiderWeaponInHands(Character* rider, const char** sheathOut)
 // (hands=12 on one ride, other=0, slot0='hands'), and yet the blade is on the back on screen =>
 // whoever takes it away does NOT go through either hooked overload.  Details in TASK.md P4-3
 // step 2, addresses in RE_NOTES §18.10, code in `git show 07f3588`.
+
+// P4-3 step 2's THIRD probe (a hook on AppearanceBase::detachItem(const std::string&) with a
+// per-ride caller-site table = P43DT, a once-per-frame poll of getAttachedEntity("hands") = P43HD,
+// and ShDescribeAddr's "<module>+0x<rva>" formatter) lived HERE and is gone as of this build.
+// Both its verdicts are closed:
+//   * exactly ONE site ever carried a slot='hands' detach (kenshi_x64.exe+0x5CBDF8, 903 calls on
+//     trip 15), and that site is attachItem's own clear-before-write positive control (RE_NOTES
+//     §18.11) => there is NO third-party writer taking the blade off the rider's hand.  T15.
+//   * the sheath-slot fix took: slots back/back2/hip only start appearing once RideSheathSlotFor()
+//     passes a real name as drawWeapon's 2nd argument, i.e. leaveSheathEquipped's previously
+//     skipped detach now fires (RE_NOTES §18.12, runtime confirmation §18.12.1).  T16.
+// ⚠️ RECOVERY IS NOT `git show` - this probe was never committed.  The only source that still holds
+// it is the snapshot D:\KenshiModDev\RidingPlugin_src_E83DB50D.cpp (the source of the T18-passing
+// DLL, md5 E83DB50D17267C7C2DFA67A4BB144D3C).  ShDescribeAddr alone is also in `git show 07f3588`.
+// ⚠️ NAMING ONLY was the gate and still is: neither verdict may turn into "so we re-attach it
+// ourselves every frame" - that is write-side compensation for an absolute overwrite, HISTORY.md
+// §B's servo road, and 每帧重拔 stays banned.
+
 static void DumpRiderAnimLayers(Character* rider, AnimationClass* rAnim, const char* tag)
 {
     if (!rAnim) return;
@@ -1396,6 +1489,13 @@ static void WipeAllRideState(const char* why)
     debugLastPos.clear();
     mountLastPos.clear();
     pendingMount.clear();
+    // P4-3-3: the only latch in this file that an unwind could leave stuck.  mainLoop_hook's
+    // __except lands here, and gStanceDrawBusy is set across a drawWeapon call - so an AV inside
+    // that call would unwind past its own reset and leave the sheathe suppressor switched off for
+    // the rest of the session.  Fail-open is the safe direction, but not silently and not forever.
+    gStanceDrawBusy = false;
+    gStanceDrawPend = false;
+    gStanceDrawWho  = NULL;
 }
 
 // Back bones tried in order. Different animals use different skeletons:
@@ -2764,7 +2864,28 @@ static bool MountCombatEligible(Character* mount, const SeatInfo& seat)
 // but STAYS the engine's attack target.  P4-1M shipped with that check on the attacker scan and
 // missing on the attack target, and that single omission is most of why the stance never let go
 // (measured: target 122u behind the mount, isDead() == false, twist saturated at 60 deg).
-static Character* RideNearestThreat(Character* rider, float* distOut)
+// 🆕 T18: THE MOUNT'S BOOKS ARE CONSULTED AFTER THE RIDER'S.  In a player build the rider has
+// neither term - mounting drops aggro and the enemy keeps swinging at the mount (P4-1b: rTgt 0
+// of 33, eTgt=2 33 of 33) - so a rider-only search returns NULL for an entire fight and the
+// stance's third term can never come true.  The mount's books are the read-only evidence that
+// a fight is on, and trip 13's log shows them filling 3.3 s BEFORE the diagnostics lever was
+// ever pressed: 200.497 mTgt=1 mAtk=1, climbing to mAtk=6 by 202.263, all of it with cm=0 and
+// rTgt=0.  ⚠️ Distances are still measured FROM THE RIDER, so kRideThreatDist and the twist
+// angle keep exactly their old meaning; only the candidate list grew.
+static void RideThreatConsider(Character* c, Character* rider, Character* mount,
+                               const Ogre::Vector3& rp, Character** best, float* bestSq)
+{
+    // The mount is excluded as well as the rider: a player who orders an attack on their own
+    // mount is technically in combat, but holding a battle stance aimed at the animal you are
+    // sitting on is nonsense, and RideTwistTargetDeg would try to face straight down.
+    if (!c || c == rider || c == mount) return;
+    if (c->isDown() || c->isDead()) return;
+    Ogre::Vector3 dv = c->getPosition() - rp;
+    float dsq = dv.x * dv.x + dv.z * dv.z;
+    if (!*best || dsq < *bestSq) { *best = c; *bestSq = dsq; }
+}
+
+static Character* RideNearestThreat(Character* rider, Character* mount, float* distOut)
 {
     if (distOut) *distOut = -1.0f;
     if (!rider) return NULL;
@@ -2773,25 +2894,27 @@ static Character* RideNearestThreat(Character* rider, float* distOut)
     Character* best  = NULL;
     float bestSq     = 0.0f;
 
-    Character* tgt = rider->getAttackTarget().getCharacter();
-    if (tgt && tgt != rider && !tgt->isDead() && !tgt->isDown())
-    {
-        Ogre::Vector3 dv = tgt->getPosition() - rp;
-        best   = tgt;
-        bestSq = dv.x * dv.x + dv.z * dv.z;
-    }
+    // Tier order is a PRIORITY order, not merely a fallback chain: a declared attack target wins
+    // even when somebody else is nearer, because that is the one a swing would be for.  Inside
+    // the two attacker tiers the nearest live entry wins.
+    RideThreatConsider(rider->getAttackTarget().getCharacter(),
+                       rider, mount, rp, &best, &bestSq);
     if (!best)
     {
         lektor<hand> atk;
         rider->getAllAttackers(atk);
         for (lektor<hand>::iterator ait = atk.begin(); ait != atk.end(); ++ait)
-        {
-            Character* a = ait->getCharacter();
-            if (!a || a == rider || a->isDown() || a->isDead()) continue;
-            Ogre::Vector3 dv = a->getPosition() - rp;
-            float dsq = dv.x * dv.x + dv.z * dv.z;
-            if (!best || dsq < bestSq) { best = a; bestSq = dsq; }
-        }
+            RideThreatConsider(ait->getCharacter(), rider, mount, rp, &best, &bestSq);
+    }
+    if (!best && mount)
+        RideThreatConsider(mount->getAttackTarget().getCharacter(),
+                           rider, mount, rp, &best, &bestSq);
+    if (!best && mount)
+    {
+        lektor<hand> mAtk;
+        mount->getAllAttackers(mAtk);
+        for (lektor<hand>::iterator mit = mAtk.begin(); mit != mAtk.end(); ++mit)
+            RideThreatConsider(mit->getCharacter(), rider, mount, rp, &best, &bestSq);
     }
     if (best && distOut) *distOut = Ogre::Math::Sqrt(bestSq);
     return best;
@@ -2838,18 +2961,56 @@ static DWORD      gRideStanceTick = 0;      // GetTickCount() at the last advanc
 //   * MountCombatEligible - a big mount swings for itself (IsBigMount, mode 2||3 attack
 //     redirect) and its rider has no business waving a sword from up there.  Note this is the
 //     SIZE gate, not IsBigMount: the garru is mode 2 yet inside the size gate.
-//   * isInCombatMode(true, true) - out of combat there is no weapon in hand and the seat pose is
-//     the right answer.  P4-1i measured that kiting counts as combat, so this does not drop out
-//     the moment the rider stops swinging.
+//   * RideFightIsOn - "is anybody actually fighting".  Out of combat there is no weapon in hand
+//     and the seat pose is the right answer.  P4-1i measured that kiting counts as combat, so
+//     this does not drop out the moment the rider stops swinging.  🆕 T18 widened it away from
+//     the rider's own isInCombatMode(true, true), which a player build NEVER reaches; the whole
+//     rationale is on RideFightIsOn itself.
 //   * a live threat within kRideThreatDist - the term that actually ENDS the stance, see above.
+// 🆕 T18 - term ② of the stance, widened.  ⚠️ EVERY QUESTION HERE IS A READ; this function must
+// never write engine state.  That is the whole difference between it and RiderCombatLever, which
+// does write and is therefore debugContinuous-gated (:593).
+//
+// Why it had to be widened (2026-09-02 trip 14 / T17, RE_NOTES §17.7): the old term was the
+// rider's own isInCombatMode(true, true), and in a player build that is PERMANENTLY FALSE.
+// Mounting drops the rider's aggro (:7596) and the enemy goes on attacking the mount, never
+// retargeting onto the rider (P4-1b: eTgt=2, 33 of 33).  Every STANCE 1 in every earlier log was
+// produced by pressing the diagnostics lever first - trip 13 has the causality inside 13 ms
+// (203.828 rung=0 writes cm 0->1, 203.841 the first stance edge of the trip).  With diagnostics
+// off: two fights, stance never armed, P43RD drawn=0 fail=0 nowpn=0 twice.
+//
+// ⚠️ The mount's isInCombatMode is UNMEASURED - no log has ever carried it (P3CMB's cmM= is
+// isInCombatMode(true, FALSE) on the RIDER, :7278, not the mount).  So it is an OR term here, not
+// the fix: the two terms carrying the weight are the mount's attack target and attacker list,
+// which trip 13 recorded as true from 200.497 onward, 3.3 s before any lever press.
+// ⚠️ This does NOT widen who may hold a stance: MountCombatEligible still runs first, and
+// kRideThreatDist still decides when the stance ends.  getAllAttackers registers out to ~1000u
+// and does not clear (P4-1M), which is exactly why the distance term exists.
+static bool RideFightIsOn(Character* rider, Character* mount)
+{
+    if (!rider || !mount) return false;
+    if (rider->isInCombatMode(true, true)) return true;   // the original term, kept
+    if (mount->isInCombatMode(true, true)) return true;   // unmeasured, free to ask
+    Character* mt = mount->getAttackTarget().getCharacter();
+    if (mt && mt != rider && mt != mount && !mt->isDead() && !mt->isDown()) return true;
+    lektor<hand> mAtk;
+    mount->getAllAttackers(mAtk);
+    for (lektor<hand>::iterator it = mAtk.begin(); it != mAtk.end(); ++it)
+    {
+        Character* a = it->getCharacter();
+        if (a && a != rider && a != mount && !a->isDown() && !a->isDead()) return true;
+    }
+    return false;
+}
+
 static bool RideStanceRaw(Character* rider, Character* mount, const SeatInfo& seat)
 {
     if (!rider || !mount) return false;
     if (!MountCombatEligible(mount, seat)) return false;
-    if (!rider->isInCombatMode(true, true)) return false;
+    if (!RideFightIsOn(rider, mount))      return false;
     float d = -1.0f;
-    if (!RideNearestThreat(rider, &d)) return false;
-    return d >= 0.0f && d <= kRideThreatDist;
+    if (!RideNearestThreat(rider, mount, &d)) return false;
+    return (d >= 0.0f && d <= kRideThreatDist);
 }
 
 // `advance` = "you are the once-per-frame caller".  HaltAndForceSitPass passes true (it is also
@@ -2886,6 +3047,163 @@ static bool RideCombatStance(Character* rider, Character* mount, const SeatInfo&
         if (gRideStanceHold < 0) gRideStanceHold = 0;
     }
     return raw || gRideStanceHold > 0;
+}
+
+// ---- P4-3-2: kill the re-sheathe instead of compensating for it -----------------------------
+// P4-3 step 1 named two writers, both engine trunks: Character::_ragdollMode (real=16 per ride,
+// median gap 22 frames) and Character::_carryMode(on=true) (real=3, ~once per mount), addresses
+// in RE_NOTES §18.10.  Neither may be hooked - §18.10 calls them the two trunks that maintain
+// the carried state - and re-drawing the weapon after each sheathe is a write-side servo, which
+// HISTORY §B bans outright ("对绝对覆写别做写入端补偿，直接消灭覆写者本身").  §B's own
+// prescription is what this is: the sheathe is a virtual call through CharacterHuman vtable
+// +0x2D0 (§18.6), so hooking THAT and declining to run the engine body destroys the overwriter
+// with no servo anywhere.
+//
+// Three properties of the filter, each load-bearing:
+//   * STATE-based, never caller-address-based.  Gating on _ReturnAddress would import the
+//     unexplained RUNTIME_RVA_DELTA (+0xA90, RE_NOTES §18.9) into shipping code; naming is
+//     already done, so the site is not even logged (`git show 61872dc` for the formatter).
+//   * `stance`, not "is mounted".  The mount-time sheathe comes from _carryMode(on=true) at a
+//     moment when stance is necessarily FALSE (not in combat mode, no threat inside
+//     kRideThreatDist), so the engine's own carry setup is never touched - only the in-combat
+//     repeats are.  Putting the weapon away on boarding is correct behaviour and stays.
+//   * self-clearing.  Once the release tail (kRideStanceHoldMs) runs out the next sheathe call
+//     passes straight through and the weapon goes away by itself: there is no restore path to
+//     write, and nothing to leak if a ride ends abnormally.
+// ⚠️ Known invariant violation, tracked riders only: weaponInHands (0x6D8) stays non-NULL while
+// the rider is carried.  Nothing in the decoded part of sheatheWeapon asserts against that
+// (§18.7), but "nothing in the part we decoded" is not "nothing anywhere" - that is precisely
+// what this trip has to answer, alongside how a KO/ragdoll looks with the blade still in hand
+// (cosmetic at worst: P4-4 force-dismounts on rider down).
+static int gShSupReal  = 0;   // suppressed calls that really had a weapon in the hands
+static int gShSupNoop  = 0;   // suppressed calls that had nothing to take away
+static int gShPass     = 0;   // calls on a tracked rider we deliberately let through
+static int gShSupLines = 0;
+static const int kShSupLines = 10;   // per-ride line budget; NOT debugContinuous-gated
+
+// The map/stance half.  Separate from the SEH shell below because it holds iterators (objects
+// with destructors), which C2712 forbids in a function containing __try.
+static bool RideSheatheSuppressedImpl(Character* rider)
+{
+    if (!rider) return false;
+    // P4-3-3: our own drawWeapon is on the stack.  The suppressor exists to kill the engine's
+    // PERIODIC re-sheathe (_ragdollMode / _carryMode); if drawWeapon puts the old weapon away as
+    // part of the swap, swallowing that would be us fighting a request we made ourselves.  Checked
+    // before the map lookup so the pass-through cannot be lost to a missing seat entry.
+    if (gStanceDrawBusy) return false;
+    boost::unordered_map<Character*, Character*>::iterator it = riderToMount.find(rider);
+    if (it == riderToMount.end() || !it->second) return false;
+    boost::unordered_map<Character*, SeatInfo>::iterator sit = mountSeat.find(it->second);
+    if (sit == mountSeat.end()) return false;
+    // advance=false = pure read: HaltAndForceSitPass owns the once-per-frame hold counter, and
+    // this hook fires from the engine's own call graph at an arbitrary point in the frame.
+    // Precedent for the non-advancing call from a non-per-frame context: :5664.
+    bool stance = RideCombatStance(rider, it->second, sit->second, false);
+
+    const char* sh  = "?";
+    Weapon*     wih = RiderWeaponInHands(rider, &sh);
+    if (!stance) { ++gShPass; return false; }
+    if (wih) ++gShSupReal; else ++gShSupNoop;
+
+    // Unconditional, budgeted: this SUPPRESSES an engine action, and state-changing events are
+    // never debugContinuous-gated (same discipline as `LEGPOSE takeover` / `force dismount`).
+    if (gShSupLines < kShSupLines)
+    {
+        ++gShSupLines;
+        char b[320];
+        _snprintf_s(b, 320, _TRUNCATE,
+            "Riding: P43SUP skip wih=%d sh='%s' cm=%d bc=%d real=%d noop=%d pass=%d f=%u",
+            wih ? 1 : 0, sh ? sh : "",
+            rider->isInCombatMode(true, true) ? 1 : 0,
+            rider->_isBeingCarried            ? 1 : 0,
+            gShSupReal, gShSupNoop, gShPass, gP3Frames);
+        DebugLog(std::string(b));
+    }
+    return true;
+}
+
+// Fail OPEN on an access violation: letting the engine sheathe is always a valid game state,
+// swallowing the call on a rider we could not even read is not.
+static bool RideSheatheSuppressed(Character* rider)
+{
+    __try { return RideSheatheSuppressedImpl(rider); }
+    __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION
+                  ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH)
+    { return false; }
+}
+
+// The draw half of P4-3-3 (state and reasoning at the gStanceDraw* block).  Called at most once
+// per 0 -> 1 stance edge and never on any other trigger.
+//
+// ⚠️ Deliberately NOT called from HaltAndForceSitPass, which is where the edge is detected: that
+// pass is the last writer before render and owns the pose pins, so an equipment+animation mutation
+// belongs in CombatAndForceDismountPass instead - the same pass, and the same point in the frame,
+// where the P41E ladder has been calling drawWeapon all along.
+//
+// No SEH here: its caller holds map iterators, which C2712 forbids in a function containing __try,
+// and every dereference below is either a tracked-rider pointer the looks-live sweep already
+// validated this frame or an engine return value that is null-checked.  Same footing as the ladder.
+static void RideStanceRedraw(Character* rider)
+{
+    if (!rider) return;
+    if (rider->getCurrentWeapon()) return;             // already armed - the suppressor holds it
+    if (gStanceDrawFail >= kStanceDrawFails) return;   // refused before; stop hammering
+
+    // getPrimaryWeapon() reads the equipment slots, so it answers while the weapon is sheathed -
+    // which is the whole point here, and the reason getThePreferredWeapon() is not used (NULL in
+    // every P4-1d read).  Weapon -> Item is offset-0 single inheritance the whole way down.
+    Inventory* rInv = rider->getInventory();
+    if (!rInv) return;
+    Weapon* sw = rInv->getPrimaryWeapon();
+    if (!sw) sw = rInv->getSecondaryWeapon();
+    if (!sw)
+    {
+        // An unarmed rider is a legitimate state, not a refusal: it must not spend the failure
+        // budget, or a fist-fighter would burn the cap and a later real refusal would go unread.
+        ++gStanceDrawNoWpn;
+        return;
+    }
+
+    // The sheath name has to be COPIED across the call - the const char* aliases the engine's
+    // std::string and drawWeapon is entitled to reallocate it (P4-1h learned this the hard way).
+    const char* shPreP = "?";
+    Weapon* wihPre = RiderWeaponInHands(rider, &shPreP);
+    std::string shPre(shPreP ? shPreP : "");
+
+    gStanceDrawBusy = true;
+    std::string sheathArg = RideSheathSlotFor(rider);   // NOT std::string() - see RideSheathSlotFor
+    rider->drawWeapon(reinterpret_cast<Item*>(sw), sheathArg);
+    gStanceDrawBusy = false;
+
+    const char* shPost = "?";
+    Weapon* wihPost = RiderWeaponInHands(rider, &shPost);
+    bool ok = rider->getCurrentWeapon() ? true : false;
+    if (ok)
+    {
+        ++gStanceDrawOk;
+        if (gDrawTries > 0) --gDrawTries;   // success spends budget; refusal does not
+    }
+    else ++gStanceDrawFail;
+
+    // Unconditional, budgeted: this CHANGES game state, and state-changing events are never
+    // debugContinuous-gated (same discipline as `LEGPOSE takeover` / `force dismount` / P43SUP).
+    // `post=` is the self-proving field - post=0 on every line means the draw is being refused in
+    // the stance and the fix bore no load, exactly the way real=0 would invalidate the suppressor.
+    if (gStanceDrawLines < kStanceDrawLines)
+    {
+        ++gStanceDrawLines;
+        AnimationClass* dAnim = rider->getAnimationClass();
+        char b[352];
+        _snprintf_s(b, 352, _TRUNCATE,
+            "Riding: P43RD edge post=%d wih=%d->%d sh='%s'->'%s' aCW=%d cm=%d "
+            "ok=%d fail=%d left=%d f=%u",
+            ok ? 1 : 0, wihPre ? 1 : 0, wihPost ? 1 : 0,
+            shPre.c_str(), shPost ? shPost : "",
+            dAnim ? (int)dAnim->animationRequirements.currentWeapon : -1,
+            rider->isInCombatMode(true, true) ? 1 : 0,
+            gStanceDrawOk, gStanceDrawFail, gDrawTries, gP3Frames);
+        DebugLog(std::string(b));
+    }
 }
 
 // Orient the rider's scene node after the game's own update.  The carry physics pins
@@ -3812,6 +4130,26 @@ static AnimationData* gP41kBlow     = NULL;
 static bool           gP41kResolved = false;  // per ride
 static int            gP41kBudget   = 0;      // weight-sample lines per ride
 
+// ---- P4-3-2 swing window: REMOVED 2026-09-02, question answered ------------------------------
+// A debugContinuous-gated experiment used to open a 1000 ms window every 3 s while the stance was
+// up, swap the pinned clip from 'guard 1h' to 'mid blow', and log P43SW open/hold/close/after
+// lines.  The tenth trip (T13 half B) answered every question it was built to ask, so it came out
+// before this build shipped - an experiment that fires regardless of what the fight is doing is
+// not shipping posture, and leaving debugContinuous-only code in a player package means the
+// package cannot be A/B'd against what was tested.  Two hard mechanisms it established are now
+// constraints on any future ClipPin work and live in `doc.md` 关键机制 (route-A bullet):
+//   * Pinning a one-shot action clip at 1.0 makes the engine EVICT the looping stance from the
+//     playing list (guard play=0 on 37 of the open/hold rows), not fade it - so a one-shot always
+//     has to be followed by re-requesting the loop; waiting for it to fade back never happens.
+//   * The loop does come all the way back (w/acw/ms all 1.000), but not within ~0.3 s of the
+//     close: ClipPin's gate is the GLOBAL `target + others <= 1.02f` test and the dying one-shot
+//     is still inside `others`.  Judge recovery on the NEXT request, not on the closing frames.
+//   * 1000 ms of a pinned one-shot plays only ~20% of 'mid blow' (prog 0.010 -> 0.201).
+// Turning a swing into shipping behaviour needs a TRIGGER (what makes the rider swing, and when),
+// which is TASK.md P4-3 step 3, not a periodic timer.  Full trip-10 readings: TASK.md, and
+// HISTORY §U for the removed code's shape.  'mid blow' itself stays RESOLVED below - that one
+// resolve line is the standing evidence that the rider's own table holds a real swing.
+
 // Existence-checked lookup.  getAnimationData() has operator[] semantics and inserts a NULL
 // into the engine's own allAnims on a miss, so a name that might be absent must never reach it
 // - find() decides first, and only a name the map already holds is ever resolved.
@@ -4454,8 +4792,8 @@ static float RideLegAbductDeg(Character* mount, const SeatInfo& seat)
 // that answer landed.  Reading it back means the twist can never disagree with the facing it is
 // measured against.  It is one frame stale (LegPosePass runs just before ApplyRiderOrientation
 // in HaltAndForceSitPass) - at 0.12 smoothing that is invisible.
-static float RideTwistTargetDeg(Character* rider, AnimationClass* rAnim, bool stance,
-                                Character** tgtOut, float* distOut)
+static float RideTwistTargetDeg(Character* rider, Character* mount, AnimationClass* rAnim,
+                                bool stance, Character** tgtOut, float* distOut)
 {
     if (tgtOut)  *tgtOut  = NULL;
     if (distOut) *distOut = -1.0f;
@@ -4464,9 +4802,11 @@ static float RideTwistTargetDeg(Character* rider, AnimationClass* rAnim, bool st
 
     // Who to face.  Same threat finder the stance itself uses (RideNearestThreat), so the pose
     // can never twist toward somebody the stance has already written off - e.g. the knocked-out
-    // body that kept P4-1M's twist pinned at 60 deg.
+    // body that kept P4-1M's twist pinned at 60 deg.  ⚠️ `mount` must be handed over for the same
+    // reason the stance needs it (T18): in a player build the rider's own books are empty, so
+    // without it the stance would come up and then face nothing but kRideTwistNoTgtDeg.
     float tdist = -1.0f;
-    Character* tgt = RideNearestThreat(rider, &tdist);
+    Character* tgt = RideNearestThreat(rider, mount, &tdist);
     Ogre::Vector3 rp = rider->getPosition();
 
     // In stance but nobody identifiable: still twist, by a fixed amount.  A mounted fighter who
@@ -4660,7 +5000,7 @@ static void LegPosePassImpl(AnimationClass* rAnim, AnimationData* poseData, Char
     // of degrees in one frame, and the rider should turn, not teleport.
     float twistDist = -1.0f;
     Character* twistTgt = NULL;
-    float twistWant = RideTwistTargetDeg(rider, rAnim, stance, &twistTgt, &twistDist);
+    float twistWant = RideTwistTargetDeg(rider, mount, rAnim, stance, &twistTgt, &twistDist);
     gLegTwistDeg += (twistWant - gLegTwistDeg) * kRideTwistLerp;
     // Hand the spine back once the residue is invisible, so out of combat the torso is the
     // pose clip's again and nothing of ours is left masked.
@@ -5032,6 +5372,18 @@ void Mount(Character* rider, Character* mount)
     gRideStanceWho     = NULL;
     gRideStanceTick    = 0;                  // and no stale wall-clock baseline either
     gP41kResolved      = false;              // P4-1k: re-resolve + re-log the probe clips
+    gShSupReal         = 0;                  // P4-3-2: sheathe suppression counters, per ride
+    gShSupNoop         = 0;
+    gShPass            = 0;
+    gShSupLines        = 0;
+    gStanceDrawWho     = NULL;               // P4-3-3: no pending stance-edge re-draw, and no
+    gStanceDrawPend    = false;              // stale prev-edge latch, into a new ride
+    gStanceDrawPrev    = false;
+    gStanceDrawBusy    = false;
+    gStanceDrawOk      = 0;
+    gStanceDrawFail    = 0;
+    gStanceDrawNoWpn   = 0;
+    gStanceDrawLines   = 0;
     // Route A straddle bookkeeping, per ride.  gLegCalfSnap holds a knee bend captured from
     // whoever rode last, gLegHostLast would swallow the first host line, and a stale mask
     // table would have LegMaskRelease pointer-validating against a dead AnimationClass - so
@@ -5219,6 +5571,24 @@ void Dismount(Character* rider)
         p3Probe.erase(rider);
     }
 
+    // P4-3-2: one summary per ride, unconditional.  `real` is the load-bearing number - it counts
+    // sheathe calls that actually had a weapon in the hands, i.e. the ones the old probe attributed
+    // to Character::_ragdollMode (real=16, median gap 22 frames) - so `real=0` means the fix never
+    // bore load and a "weapon stayed in hand" reading proves nothing about it, exactly the way
+    // `late=0` invalidates the mask rescue (RE_NOTES §21).  MEASURED trip 10: real=57 / pass=667 /
+    // noop=311, and its only self-proving field is `real` - the P41E draw ladder can NOT serve as a
+    // second one, because that ladder arms on empty hands while the suppressor only fires inside
+    // the stance, so the two are disjoint by construction (all three trip-10 ladder runs started
+    // 0.000-0.156 s AFTER `STANCE -> 0`).  P4-3-3 adds the second half of the story: `drawn`
+    // counts stance-edge re-draws that succeeded, `fail` the ones the engine refused.
+    {
+        char shs[224];
+        _snprintf_s(shs, 224, _TRUNCATE,
+            "Riding: P43SUP ride real=%d noop=%d pass=%d | P43RD drawn=%d fail=%d nowpn=%d",
+            gShSupReal, gShSupNoop, gShPass,
+            gStanceDrawOk, gStanceDrawFail, gStanceDrawNoWpn);
+        DebugLog(std::string(shs));
+    }
     DebugLog("Riding: dismounted");
 }
 
@@ -5284,6 +5654,18 @@ void RestoreRideAfterLoad(Character* rider, Character* mount)
     gRideStanceWho     = NULL;
     gRideStanceTick    = 0;                  // and no stale wall-clock baseline either
     gP41kResolved      = false;              // P4-1k: re-resolve + re-log the probe clips
+    gShSupReal         = 0;                  // P4-3-2: sheathe suppression counters, per ride
+    gShSupNoop         = 0;
+    gShPass            = 0;
+    gShSupLines        = 0;
+    gStanceDrawWho     = NULL;               // P4-3-3: no pending stance-edge re-draw, and no
+    gStanceDrawPend    = false;              // stale prev-edge latch, into a new ride
+    gStanceDrawPrev    = false;
+    gStanceDrawBusy    = false;
+    gStanceDrawOk      = 0;
+    gStanceDrawFail    = 0;
+    gStanceDrawNoWpn   = 0;
+    gStanceDrawLines   = 0;
     // Route A straddle bookkeeping, per ride.  gLegCalfSnap holds a knee bend captured from
     // whoever rode last, gLegHostLast would swallow the first host line, and a stale mask
     // table would have LegMaskRelease pointer-validating against a dead AnimationClass - so
@@ -6149,6 +6531,20 @@ static void HaltAndForceSitPass()
                         // once-per-frame caller that ticks the release tail.
                         bool stance = RideCombatStance(rider, mount, sit->second, true);
                         gRideStanceOn = stance;   // read by the DBG tag, nothing else
+                        // P4-3-3: latch the 0 -> 1 edge for the one-shot re-draw.  UNGATED, and
+                        // kept separate from gRideStanceLast below, which only advances inside the
+                        // debugContinuous block - toggling diagnostics must never change whether
+                        // the rider arms itself (same discipline as the stance itself).  Whose
+                        // edge it is travels with the flag: the stance state machine is
+                        // single-rider (gRideStanceWho) but this loop walks every tracked pair.
+                        if (rider != gStanceDrawWho)
+                        {
+                            gStanceDrawWho  = rider;
+                            gStanceDrawPrev = false;
+                            gStanceDrawPend = false;
+                        }
+                        if (stance && !gStanceDrawPrev) gStanceDrawPend = true;
+                        gStanceDrawPrev = stance;
                         if (debugContinuous && (stance ? 1 : 0) != gRideStanceLast)
                         {
                             gRideStanceLast = stance ? 1 : 0;
@@ -6159,7 +6555,7 @@ static void HaltAndForceSitPass()
                             // ⚠️ holdms is WALL-CLOCK MILLISECONDS since this build (it was
                             // frames, printed as hold=, up to and including 297472 B).
                             float td = -1.0f;
-                            RideNearestThreat(rider, &td);
+                            RideNearestThreat(rider, mount, &td);
                             char pl[160];
                             _snprintf_s(pl, 160, _TRUNCATE,
                                 "Riding: STANCE %d f=%u cm=%d d=%.1f holdms=%d",
@@ -6241,12 +6637,12 @@ static void HaltAndForceSitPass()
                                     kP41kBlowAnim,  gP41kBlow  ? "found" : "ABSENT");
                                 DebugLog(std::string(rl));
                             }
-                            // Both routes drive the STANCE now, not the swing: 'guard 1h' is
-                            // UPPER without 'whole' and loops, so it is the one clip that can
-                            // hold a combat upper body indefinitely while the legs stay ours.
-                            // ('mid blow' stays resolved - the resolve line is the evidence that
-                            // a real swing exists in this rider's table - but requesting a
-                            // one-shot action clip every frame answers nothing about posture.)
+                            // 'guard 1h' is UPPER without 'whole' and loops, so it is the one
+                            // clip that can hold a combat upper body indefinitely while the legs
+                            // stay ours - it drives the STANCE.  'mid blow' is only RESOLVED
+                            // (that line is the evidence the rider's table holds a real swing);
+                            // the swing window that used to request it came out with T13, see
+                            // the retired-window note next to the two clip names.
                             // Route A gives it the whole body; there is no other route left.
                             AnimationData* want   = gP41kGuard;
                             const char*    wantNm = kP41kGuardAnim;
@@ -6778,7 +7174,8 @@ static void RiderArmProbeImpl(Character* rider, Character* mount)
             const char* shPreP = "?";
             Weapon* wihPre = RiderWeaponInHands(rider, &shPreP);
             std::string shPre(shPreP ? shPreP : "");
-            rider->drawWeapon(reinterpret_cast<Item*>(sw), std::string());
+            std::string sheathArg = RideSheathSlotFor(rider);   // see RideSheathSlotFor
+            rider->drawWeapon(reinterpret_cast<Item*>(sw), sheathArg);
             const char* shPost = "?";
             Weapon* wihPost = RiderWeaponInHands(rider, &shPost);
             AnimationClass* dAnim = rider->getAnimationClass();
@@ -7148,7 +7545,11 @@ static void RiderCombatLeverImpl(Character* rider, Character* mount)
         // rung needs no shim.  Weapon -> Item is offset-0 single inheritance all the way down
         // (Gear.h annotates the base offsets), so reinterpret_cast is the sound cast here: both
         // types are incomplete to the compiler, which makes a language-level upcast impossible.
-        if (pw) rider->drawWeapon(reinterpret_cast<Item*>(pw), std::string());
+        if (pw)
+        {
+            std::string sheathArg = RideSheathSlotFor(rider);   // see RideSheathSlotFor
+            rider->drawWeapon(reinterpret_cast<Item*>(pw), sheathArg);
+        }
         break;
     case 1:
         // The FOCUSED variant.  The unfocused one already runs every tick in the idempotent
@@ -7323,6 +7724,18 @@ static void CombatAndForceDismountPass()
             // (seat mode 2||3) so old and new logs stay comparable.
             if (debugContinuous && gCmbBudget > 0)
                 CombatProbe(rider, mount, bigMount);
+
+            // ---- P4-3-3: spend the pending stance edge, ungated ------------------------------
+            // Consumed here rather than where it was latched (HaltAndForceSitPass) for the reason
+            // in RideStanceRedraw's header.  The flag is cleared whether or not a draw happens, so
+            // one edge can only ever cost one attempt.  `riderFights` is not re-tested: the edge
+            // could only have been latched while the stance was up, and the stance already
+            // requires MountCombatEligible, so a big-mount rider can never reach this.
+            if (gStanceDrawPend && rider == gStanceDrawWho)
+            {
+                gStanceDrawPend = false;
+                RideStanceRedraw(rider);
+            }
 
             if (!riderFights)
             {
@@ -8132,6 +8545,26 @@ void contextMenu_show_hook(ContextMenuGUI* thisptr, const lektor<int>& ordersLis
     } catch(...) {}
 }
 
+// ---- P4-3-2 hook: CharacterHuman::sheatheWeapon (SUPPRESSION, not a probe) -------------------
+// This is the one hook in the plugin that DECLINES to run the engine body, so read
+// RideSheatheSuppressed's comment block before touching it.  The hook point itself is not new:
+// the same address carried P4-3 step 1's naming probe through a full ride with zero
+// `Could not hook` lines, and §18.6 established that vtable +0x2D0 is the only entry (pure
+// virtual call, no base-class bypass - the base slot is `ret 0`).  The only change from the probe
+// is the early return.
+//
+// ⚠️ CharacterHuman::Character offset is 0x0 (single inheritance, annotated in the headers), which
+// is what makes the cast below sound; both types are incomplete-ish to the compiler, so this is a
+// reinterpret, not a language upcast.
+void (*sheatheWeapon_orig)(CharacterHuman* thisptr) = NULL;
+
+void sheatheWeapon_hook(CharacterHuman* thisptr)
+{
+    if (RideSheatheSuppressed((Character*)thisptr))
+        return;                                    // the overwriter dies for this call
+    if (sheatheWeapon_orig) sheatheWeapon_orig(thisptr);
+}
+
 __declspec(dllexport) void startPlugin()
 {
     DebugLog("RidingPlugin: start");
@@ -8158,14 +8591,29 @@ __declspec(dllexport) void startPlugin()
     if (KenshiLib::SUCCESS != KenshiLib::AddHook(KenshiLib::GetRealAddress(&AnimationClassHuman::_NV_update), (void*)&animUpdate_hook, (void**)&humanUpdateOrig))
         ErrorLog("RidingPlugin: Could not hook AnimationClassHuman::update!");
 
-    // The two P4-3 naming probes that used to be registered here (CharacterHuman::sheatheWeapon
-    // and both AppearanceBase::attachItem overloads) are GONE as of the probe-free build: they
-    // had delivered their verdicts (RE_NOTES §18.10 keeps every address, and the answers are in
-    // TASK.md P4-3 steps 1-2), and they were the only hooks this plugin installed on functions
-    // that EVERY character in the world calls.  Getting them back means `git show 61872dc`
-    // (sheathe) / `git show 07f3588` (attachItem) - or `git show 7838deb:RidingPlugin.cpp` for the
-    // whole set at once - not retyping them; and the prologue gates in those commits' comments are
-    // the record of why they were safe to cut in the first place.
+    // P4-3-2: the sheathe SUPPRESSION hook.  Same address the step-1 naming probe used (it
+    // installed cleanly across full rides), but the body now declines the engine call for a
+    // tracked rider whose combat stance is up - HISTORY §B's "destroy the overwriter itself"
+    // instead of a per-frame re-draw.  ⚠️ This lands on a function every human in the world calls,
+    // so the very first thing the body does is `riderToMount.find` and bail: one hash lookup for
+    // everyone who is not our rider.
+    if (KenshiLib::SUCCESS != KenshiLib::AddHook(KenshiLib::GetRealAddress(&CharacterHuman::_NV_sheatheWeapon), (void*)&sheatheWeapon_hook, (void**)&sheatheWeapon_orig))
+        ErrorLog("RidingPlugin: Could not hook CharacterHuman::sheatheWeapon!");
+
+    // The THREE P4-3 naming probes that used to be registered here (CharacterHuman::sheatheWeapon,
+    // both AppearanceBase::attachItem overloads, and AppearanceBase::detachItem(slot)) are GONE as
+    // of the probe-free build: they had delivered their verdicts (RE_NOTES §18.10 keeps every
+    // address, and the answers are in TASK.md P4-3 steps 1-2), and they were the only hooks this
+    // plugin installed on functions that EVERY character in the world calls.  Getting the first two
+    // back means `git show 61872dc` (sheathe) / `git show 07f3588` (attachItem) - or
+    // `git show 7838deb:RidingPlugin.cpp` for that whole set at once - not retyping them; and the
+    // prologue gates in those commits' comments are the record of why they were safe to cut.
+    // ⚠️ The detachItem one was never committed: it is only in the file snapshot
+    // D:\KenshiModDev\RidingPlugin_src_E83DB50D.cpp (see the tombstone above RideThreatConsider's
+    // neighbourhood, near DumpRiderAnimLayers).  Its answer - one 'hands' detach site, and it is
+    // attachItem's own clear-before-write - is what closed T15 and T16.
+    // (P4-3-2 update: the sheathe ADDRESS is hooked again just above, but as a suppressor, not a
+    // probe - no caller-site table, no ShDescribeAddr.  The attachItem pair stays gone.)
     // ---- DISABLED HOOKS (safety fix) ----------------------------------------
     // Two hooks are deliberately NOT installed.  Disassembly (see
     // RidingPlugin_RE_NOTES.md section 0) showed the addresses they resolve to are

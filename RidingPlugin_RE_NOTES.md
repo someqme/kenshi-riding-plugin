@@ -498,6 +498,48 @@ CLAUDE.md 只留指针，需要 hook 新函数 / 直调新方法时查本节。
 - **shim 只能直调非虚方法**（§13 那条：虚函数要复现 vtable 布局，空壳做不到）。⇒ 本节两条路各走各的：**非虚的**（`_NV_initCombatMode` 等整张表）直接声明 + 链接器从导出桩解析；**虚的**（`drawWeapon` / `getThePreferredWeapon`）**按槽位偏移手动从 vtable 里取函数指针**（`0x3D8` / `0x3C8`），不进 shim。⚠️ 所以 17.1 那条「`CombatClass*` 横向 cast 成 `CombatClassAI*` 不加偏移」是**必需前提**——我们调的是派生类的函数体本身，不是让引擎替我们派发。
 - **`hand`（`GameObjectHandle`）能进编译树、可以直接用**（`_getAttackTarget()` 返回它，`.getCharacter()` 取回指针）；⚠️ **它取回的指针照样可能悬空**（会话中读档），所以战斗侧拿到的每个 `Character*` 仍要过 `CharacterLooksLive`。
 
+### 17.7 ⛔ **玩家包里骑手根本进不了战斗模式** —— 架势／补拔／收刀抑制三件全是诊断态产物（2026-09-02 第十四趟，标的 `D3D4879E…`，**诊断全程 OFF**，两趟骑乘，同一份 DLL）
+
+**这是十四趟里第一次在「玩家会看到的形状」下量骑乘战斗**：DLL 与第十三趟**同一份**（md5 `D3D4879E…`），唯一差别是 `debugContinuous` 全程没开（运行时键，`RidingPlugin.cpp:370` 默认 OFF、`:8468` ＝ Ctrl+小键盘句点）。
+
+| 量 | 第十三趟（诊断 ON，四趟骑乘） | 第十四趟（诊断 OFF，两趟骑乘） |
+|---|---|---|
+| `P43SUP ride real=`（真抑制掉的收刀） | 134 / 26 / 54 / 0 | **0 / 0** |
+| `pass=`（放行的收刀） | 524 / 242 / 0 / 52 | **507 / 189** |
+| `P43RD drawn=` | 2 / 1 / 0 / 0 | **0 / 0**（`fail=0 nowpn=0`） |
+| `P43HD ride nonnull=/samples=` | 4884/17334、1048/7869、1381/1381、264/1521 | **0/13691**、**1/4402** |
+| 肉眼 | 空手上马会拔刀、刀全程在手、打完自己收 | **空手全程没刀；持刀上马也被收；两段打架全程坐姿** |
+
+- **架势一次都没起来，这条是硬的**：`P43RD drawn=0 fail=0 nowpn=0`（三个计数器都无门控、每趟骑乘打印）＋ 第一趟 `nonnull=0`（13691 帧手上全空）⇒ 不可能是补拔第一道守卫 `if (rider->getCurrentWeapon()) return;` 拦的（`RidingPlugin.cpp:3440`）⇒ **补拔函数一次都没被调用** ⇒ **`0→1` 边沿一个都没有**。⚠️ 别拿 `cm=`／`st=` 采样当证据：`kDtLinesSiteH=4` 意味着 12 行带旗标的 `P43DT`/`P43HD` 全落在上马后 0.5 s 内（128.440–128.699、277.365–277.832，两趟骑乘分别到 262.393／321.856），打架时段**没有采样**。
+- **拆刀的人还是引擎收刀路径，不是新的第三方**：`hands` 拆卸 189 次全出自**一个**站点 `kenshi_x64.exe+0x5CBDF8`（§18.11 静态表里），和 `pass=189` **一比一对上**（§18.11.1 的结论没被推翻，只是这趟没人去抑制它）。
+- **根因 ＝ `RideStanceRaw` 的第二个条件**（`RidingPlugin.cpp:3301`，`rider->isInCombatMode(true, true)`）。第十三趟的时间线把因果钉死：
+  - `95.864 STANCE 0 f=6917 cm=0`（已上马、无战斗）
+  - `203.828 P41D ai … r cm=0` → **同一帧** `203.828 P41D rung=0 … post rTgt=1 cTgt=1 cm=1 cmM=1 in=1 opp=1`
+  - **13 ms 后** `203.841 STANCE 1 f=16701 cm=1 d=37.2` ← 全趟第一个架势边沿；四个边沿全在杠杆开始写之后
+  - 杠杆 ＝ `RiderCombatLever`，**`debugContinuous` 门控**（`:8060`）；rung 2 ＝ `cc->setAttackTarget`＋`setAttackTargetHandle`（`:7663`-`:7664`），rung 3 ＝ `rider->attackingYou(enemy,true,false)`。源码自己写明它只在诊断下跑，**因为它写真实游戏状态**（`:593`-`:594`）。
+- **为什么玩家包里骑手进不了战斗模式**：上马会**掉 aggro**（`:7596`-`:7598`，2026-08-30 实测），敌人也从不改打骑手（§17 P4-1b 结果：rung 4 无效、`eTgt=2`＝坐骑，33/33）⇒ 骑手既没 attacker 也没攻击目标 ⇒ `isInCombatMode` 恒 false。
+- ⇒ **连带失效的不止 P4-3**：P4-2「坐骑护主」的入口是 `rider->getAllAttackers()`（`:8069`），玩家包里同样恒空 ⇒ 那段从不下令；**P4-1「参战资格」的实测证据（P4-1b RESULT，`:596` 起）本来就是「诊断已开」时取的**，不构成玩家包里的证据。⚠️ §18.12.1「修法成立」那条**没有**被推翻 —— 鞘位参数确实是拦路的闸，只是它下游那一整条链在玩家包里从来没被点燃过。
+- ✅ **顺路收掉一笔欠账**：上马后一两秒那 7 对手槽抖动（§18.12.1）**是我们自己的梯子造的** —— 诊断关掉后 `gain=0/0`、`loss=0/1`（第十三趟是 14/12/0/11）。
+- ⏳ **仍未读到**：`kDrawTryBudget` 的 `left=`（补拔没触发 ⇒ 一行没打）**→ 第十五趟已读到，见下**、`P4-4` 落地姿态（这趟没触发强制下马）。
+
+**修法（用户 2026-09-02 裁定走「只读放宽」；✅ 已实测通过 ＝ 第十五趟，标的 `312832 B` / md5 `E83DB50D17267C7C2DFA67A4BB144D3C`）**
+- 架势第②项换成新的 `RideFightIsOn(rider, mount)`，四问取或：`rider->isInCombatMode(true,true)`（原项保留）∥ `mount->isInCombatMode(true,true)` ∥ 坐骑有活的攻击目标 ∥ 坐骑 `getAllAttackers()` 里有活人。**全部是读，一个引擎写都没有** —— 这就是它与 `RiderCombatLever` 的分界。
+- ⚠️ **只改第②项不够，这是本节最容易踩的坑**：第③项 `RideNearestThreat` 原本也**只**读骑手的 `getAttackTarget()` 与 `getAllAttackers()`，玩家包里两者同样空 ⇒ 架势会卡在第③项、再废一趟。所以它同时加了 `mount` 参数，候选按**优先级**四档：骑手攻击目标 → 骑手 attackers → **坐骑攻击目标 → 坐骑 attackers**。距离照旧从**骑手**位置量 ⇒ `kRideThreatDist` 与 `RideTwistTargetDeg` 的角度含义不变；四档共用新的 `RideThreatConsider()`（`isDown()`/`isDead()` 同等除名，**并把坐骑本身排除出威胁**，否则玩家攻击自己坐骑时骑手会朝着屁股底下摆架势）。`RideTwistTargetDeg` 也跟着收 `mount`。
+- ⚠️ **`mount->isInCombatMode` 是未测量项，不能当修法本体**：没有任何一份日志记过它 —— `P3CMB` 的 `cmM=` 是**骑手**的 `isInCombatMode(true, false)`（`RidingPlugin.cpp:7278`），`M` 那个字母骗人。真正有实测支撑的是**坐骑的攻击目标与 attackers**：第十三趟 `200.497 P3CMB … mAtk=1 … mTgt=1`，`202.263` 已 `mAtk=6`，其间 `cm=0 cmM=0 rTgt=0 rAtk=0` ⇒ **坐骑的账本比杠杆早 3.3 秒就是满的**，而骑手的账本要等杠杆。
+- 🆕 判据探针 `P43FT`（**不受 `debugContinuous` 门控**，每趟骑乘一行，紧跟 `P43SUP`）：`ok= noElig= noFight= noThr= far= dmin=` ＝ 三个条件里是哪一个拒绝的 ＋ 见过的最近威胁距离。理由 ＝ `STANCE` 那行是诊断门控的，诊断 OFF 的趟失败了会无从下手。`ridelog.py` 的 `-- T18 --` 一节自动判，并会指出日志是否早于本构建。⚠️ T19 摘探针时它与 `P43DT`/`P43HD` 一起摘。
+- **没采纳的候选**：把 rung 3 `rider->attackingYou(enemy,true,false)` 或 rung 2 `cc->setAttackTarget`（`:7663`-`:7664`）搬进出货路径 —— 它写真实游戏状态，副作用范围（AI 仇恨表、玩家自己的命令）没量过。
+
+**✅ 实测结果（第十五趟，2026-09-02，诊断全程 OFF，两趟骑乘，日志 `RE_Kenshi_log_trip15_E83DB50D_diagoff.txt`，16638 B / 199 行）—— 修法成立，本节这条 ⛔ 关闭**
+- 肉眼（用户报）：空手上马打一架 ＝ **有攻击架势、会出刀**；持刀上马打一架 ＝ **保持出刀、有攻击架势**。对照第十四趟的「全程没刀、全程坐姿」。
+- `P43FT ok=2182` / `2585`（两趟都 `noElig=0`，`dmin=7.6` / `8.4`）⇒ 架势靠**坐骑的账本**起来了，`RideFightIsOn` 不用等骑手的 `isInCombatMode`。
+- `P43RD drawn=2` / `1`，`post=1` **3/3**、`sheath '' -> 'back'` **3/3**、`aCW` 全部离开 `SKILL_UNARMED(5)`；`P43SUP real=50` / `66`；`P43HD nonnull=1164` / `1512`（第十四趟是 0/13691 与 1/4402）。
+- 🔑 **三个补拔边沿全部 `cm=0`** —— 这正是修法生效的形状：架势第②项已经不再要求骑手的战斗模式。⚠️ `ridelog.py` 里原来那条「every edge fired with cm=1」的 CHECK **必须**因此改成 NOTE（判别用「有没有 `P43FT` 行」，**不能用字节数**：`312832` 与 `_prev_E7613634` / `_prev_544D8C86` 撞号），否则以后每趟都误报一次假故障。
+- ✅ **`kDrawTryBudget` 的 `left=` 收掉了**：第一次成功边沿 `left=11`、同趟第二次 `left=10`、第二趟第一次 `left=11`，与裁定一致。
+- 🔎 **「坐骑 attacker 列表不清空」这条设计风险确认存在，60u 闸也确认是它的挡板**：`far=2400` / `688`（威胁找到了但超出 `kRideThreatDist=60`）⇒ 打完架的旧敌人真的还留在列表里，但架势没有被它们吊住。
+- ⏳ 肉眼四条里「打完收起来」用户这次没提（日志侧 `loss=3`、第二趟末 `last=0000000000000000` 与它一致，但那半只有肉眼能判）。另：第一趟骑乘是**坐骑倒地**结束的（`mount down @292.785`）。
+- ⇒ 连带解冻：P4-2「坐骑护主」仍然按 `rider->getAllAttackers()` 下令（`:8069`），**那条没跟着修** —— 玩家包里骑手的 attacker 列表照旧恒空，所以护主到今天还是没点燃过。要修就照本节的办法把坐骑的账本也读进去。
+
+
 ---
 
 ## 18. 静态 PE 定址：header RVA → 真实 RVA / `.pdata` 入口判定 / RTTI 取虚表（2026-08-30）
@@ -728,9 +770,11 @@ if (*(AnimationState **)(param_1 + 0x28) != NULL) {
 
 **为什么这算定案**：①第一行的落点 `0x5DBF80` ＝ `CharacterHuman::drawWeapon`，而 §18.8:659 **早在静态就预言了「三参挂载的调用方是 drawWeapon、站点 `0x5DC1D4`」** —— 运行时独立命中同一个站点，这是**先验预测被兑现**，不是事后对齐；②后两行的 call 都吃 `[reg+0x2D0]`，而 `0x2D0` 正是 `sheatheWeapon` 的槽（§18.7），`--vcall 0x2D0` 那 38 个站点里恰好有这两个；③三个站点一个常数、`0x5D051C` 那个站点在一趟里被走了 668 次而值稳定 ⇒ 不是栈垃圾、不是尾调。
 
-⚠️ **成因未解释。** 已逐个排除：磁盘上第二份 exe（只有一份，36,718,592 B，比日志旧）、`ke_pe` 映射算错（节表 ＋ 代码字节双向核过，`off = ptr + (rva - va)` 教科书式正确）、KenshiLib 头 delta 其实是 `0xA90`（拿 10 个符号试 `+0x310`，9 个落在函数中间 ⇒ **`+0x780` 与 §12/§18 全部照旧有效**）、MinHook 跳板/尾调。⚠️ 因此**范围只到 `0x5CE000-0x5DC000` 这个窗口**（三个锚点都在里面）；出了这个窗口按未验证对待，**每次都要用 `callers.py --ret <logged rva>` 重新验**，那条命令把 raw 与 `+0xA90` 两行并排打出来，"no call instruction ends here => NOT a return address" 就是判据。常数记在 `tools\ke_pe.py` 的 `RUNTIME_RVA_DELTA`。
+⚠️ **成因未解释。** 已逐个排除：磁盘上第二份 exe（只有一份，36,718,592 B，比日志旧）、`ke_pe` 映射算错（节表 ＋ 代码字节双向核过，`off = ptr + (rva - va)` 教科书式正确）、KenshiLib 头 delta 其实是 `0xA90`（拿 10 个符号试 `+0x310`，9 个落在函数中间 ⇒ **`+0x780` 与 §12/§18 全部照旧有效**）、MinHook 跳板/尾调。⚠️ 因此**范围只到 `0x5CE000-0x5DC000` 这个窗口**（三个锚点都在里面）；出了这个窗口按未验证对待，**每次都要用 `callers.py --ret <logged rva>` 重新验**，那条命令把 raw 与 `+0xA90` 两行并排打出来，"no call instruction ends here => NOT a return address" 就是判据。常数记在 `tools\ke_pe.py` 的 `RUNTIME_RVA_DELTA`。⚠️ **2026-09-02 第十三趟多了一个窗口外的锚点**：`0x535383` 在 `0x535xxx` 也 `+0xA90` 落在一条真的 5 字节 call 上（→ 同一个 `detachItem` 入口，raw 行明确 `NOT a return address`），细节见 **§18.12.1** ⇒ 两个不相交窗口各有锚点，但**成因仍未解释、纪律一字不改**（每个 logged `site=` 都跑 `--ret`）。
 
 **便宜的下一步（要做的时候顺手带上，不值得单独出一个构建）**：arm 那一刻打一行 `ShDescribeAddr((uintptr_t)GetRealAddress(att3))`。它印 `+0x535E50` ⇒ 偏移只在返回地址上；印 `+0x5353C0`（＝ `0x535E50 - 0xA90`）⇒ 整个模块基址口径差了这么多，全 image 一次定死。
+
+✅ **补注（2026-09-02 第十二趟，§18.11.1）：窗口外又添了两个锚点，同一个 `+0xA90`，共 5 个。** `P43DT` 打出的 `0x5CBDF8` 与 `0x535383` 两条 raw 都「不是返回地址」，`+0xA90` 后分别落在 `0x5CC888`（call `0x5CC883` → `0x52E0F0`）与 `0x535E13`（call `0x535E0E` → `0x52E0F0`），两个落点都在 §18.11 那张**静态先做好的**站点表里 ⇒ 又是一次先验预测被兑现。⚠️ **`0x535383` 在 `0x535xxx`、`0x5CBDF8` 在 `0x5CC8xx`，两个都在 `0x5CE000-0x5DC000` 之外** ⇒ 上一段那句「范围只到这个窗口」现在**偏保守**，但**成因仍然未解释**，所以纪律不变：**照旧每条 logged site 都用 `callers.py --ret` 验一次，永远不要手算**。
 
 **顺带定死的语义（`callers.py --strings`，§18.6 的无反编译认脸法）**：`0x5D0DB0` 在收刀那条 call 之后 ~0x20 字节触到 `'female ragdoll'`(`0x5D0FC6`)／`'male ragdoll'`(`0x5D0FCD`) ⇒ **倒地/ragdoll 那条路**；`0x5CEA40` 触到 `'VO_Creature_Die'`(`0x5CEB73`) ⇒ **死亡那条路**。两个都是虚表进入（`0x5D0DB0` 只有 ILT 跳板 `0xC97D` 一个直调者，`0x5CEA40` 零个直调者）。
 
@@ -751,7 +795,176 @@ if (*(AnimationState **)(param_1 + 0x28) != NULL) {
 ⚠️ **仍然只是点名。** 两个都是**非虚成员函数、都有头文件符号** ⇒ 理论上 `GetRealAddress(&Character::_ragdollMode)` 能 hook，但**要不要动、动哪一端还没定**，`HISTORY.md` §B 那条「不许对绝对覆写做写入端补偿」照旧；而 `_carryMode` / `_ragdollMode` 是**引擎自己维护被携态的两条主干**，在它们身上改行为的风险远超「少收一次刀」。⚠️ 反编译读数不是实测（§18.9 结尾那条）。
 
 
-## 19. 离线读 FCS 数据文件 + Ogre `.skeleton`（2026-08-31，全程没进游戏）
+### 18.11 `AppearanceBase::detachItem` 的静态全图 —— P4-3 第 2 步第 3 个探针的靶子（2026-09-02，全程静态）
+
+第十一趟把 P4-3 第 2 步顶成唯一卡点：**数据层有刀、屏幕上没刀**（`post=1` 4/4、`wih=0->1`、`aCW` 离开 `SKILL_UNARMED`、`wpn=1` 52/56），而第六趟已证 `attachItem(item, mesh, "hands")` 真的跑过（`hands=12` / `other=0` / `slot0='hands'`）。⇒ 剩下要点名的是**挂上去之后谁把它撤掉**，靶子就是 `detachItem`。
+
+| 真实入口 | 头 RVA | `.pdata` | 头文件签名（`Appearance.h`） |
+|---|---|---|---|
+| **`0x52E0F0`** | `0x52D970` | ENTRY prolog=43 | `bool AppearanceBase::detachItem(const std::string& slot)`（:71） |
+| `0x52E290` | `0x52DB10` | ENTRY prolog=20 | `bool AppearanceBase::detachItem(Item* item)`（:70） |
+| `0x52D960` | `0x52D1E0` | ENTRY prolog=15 | `AttachedEntity* AppearanceBase::getAttachedEntity(const std::string& slot) const`（:69） |
+
+**① 只 hook 一个重载 —— 这是对 §18.8「两个重载都要 hook，否则沉默有两种读法」的偏离，靠静态事实撑，不是图省事**：
+```
+python tools\callers.py 0x52E0F0 0x52E290     -> 各 1 个直调站点，都是自己的 ILT 跳板（0x1E88F / 0x44026）
+python tools\callers.py 0x1E88F 0x44026       -> 0x1E88F 有 14 个站点；0x44026 有 0 个
+python tools\callers.py --ptr 0x52E0F0 0x52E290 -> 两个都 0 个指针宽引用 ⇒ 都不在任何虚表里
+```
+⇒ `Item*` 那个重载**在 exe 里没有任何可达调用方**（跳板零引用 ＋ 不在虚表 ⇒ 也不可能被间接叫到）。所以「`slot` 侧沉默」只有一种读法。
+
+**② `detachItem(slot)` 的 14 个静态站点（`0x1E88F` 跳板侧），归属逐条查明 —— 探针一有命中就能当场归因**：
+
+| 站点 | 所属函数 | 是谁 |
+|---|---|---|
+| `0xD0053` / `0xD011F` | `0xCFDD0` | 未定名 |
+| `0x5324D4` | `0x532490` | `Appearance::attachItem_Hair` |
+| **`0x535E0E`** | `0x535D50` | **`attachItem` 二参：写槽前先清槽** |
+| **`0x535ECF`** | `0x535E50` | **`attachItem` 三参：写槽前先清槽（拔刀走的就是这个，§18.8）** |
+| `0x5C8294` | `0x5C8272` | 未定名续块 |
+| `0x5CA517` | `0x5CA4A0` | `CharacterAnimal::dropItem` |
+| `0x5CA7B7` | `0x5CA740` | `CharacterHuman::dropItem` |
+| `0x5CC7B2` | `0x5CC77C` | `dropWeaponInHands` 尾块（§18.7） |
+| `0x5CC883` | `0x5CC820` | `CharacterHuman::sheatheWeapon`（**已被 P4-3-2 抑制**） |
+| `0x5D0D74` | `0x5D0D52` | 未定名续块 |
+| `0x5D2632` | `0x5D24B0` | `leaveSheathEquipped` |
+| `0x5DC416` | `0x5DC310` | `Character::unequipItem`（虚，有 `_NV_`） |
+| `0x5DC5F5` | `0x5DC560` | `CharacterHuman::unequipItem`（虚，有 `_NV_`） |
+
+⚠️ **两个 `attachItem` 站点 ＝ 自噪声，同时也是这个探针自带的阳性对照**：每次成功拔刀**必然**从 `attachItem` 体内产生一条 `hands` 拆卸。⇒ 站点表里**只有这两条**是「没人拆过手槽」这个有意义的答案，**不是探针失败**。
+⚠️ 两个 `unequipItem` 是「非 `attachItem` 站点」里最强的候选（虚 ＋ `_NV_` ＋ 直接调 `detachItem`）；落在 `0x5C8272` / `0x5D0D52` 这两个未定名续块上则还要再查一次归属。
+
+**③ hook 安全性（`KenshiLib::AddHook` 固定拷 5 字节、无 trampoline）**：`0x52E0F0` 序言 `48 8B C4 | 56 | 57 | 41 54 …` ＝ `mov rax,rsp` ＋ `push rsi` ＋ `push rdi` ＝ **三条完整的位置无关指令，刚好在第 5 字节边界收口**（第 6 字节起是 `41 54` ＝ `push r12`）⇒ 比出货件里 `AnimationClassHuman::_NV_update` 那一刀更干净。三个都是**非虚成员函数**，`GetRealAddress` 的「虚函数不行」不适用；重载歧义用带类型的成员指针局部量解决（`typedef bool (AppearanceBase::*DetSlotFn)(const std::string&);`），**源码里不出现任何 RVA 字面量**。
+
+⚠️ **只许点名**（`TASK.md` P4-3 第 2 步的闸门）。两个答案都不许当场变成「我们自己去调 `attachItem`」＝ 对绝对覆写做写入端补偿（`HISTORY.md` §B）。
+⚠️ 全静态，**反编译／PE 读数不是实测**（§18.9 结尾）。
+
+### 18.11.1 运行时结果 —— **没有第三方写手**（2026-09-02 第十二趟，标的 `4E223D95…`，两趟骑乘，肉眼 A 不过／B 过）
+
+⚠️ **这一节原来的标题写的是「卡点是渲染侧」，那半个结论已被 §18.12.1 推翻** —— 真卡点是 `drawWeapon` 的第 2 个参数（空串被 `leaveSheathEquipped` 的白名单挡掉），修好之后**渲染侧一个字节都没改就正常了**。⇒ 本节仍然有效的部分是**「`hands` 拆卸只有 `sheatheWeapon` 一个站点、没有第三方写手」** 这条排除，以及下面那张字段对照表（它正是找到鞘位差异的地方）。「转渲染侧」那个箭头**别再跟着走**。
+
+| | 空手上马（`first=0`，肉眼**不过**：刀留在背上） | 先拔刀再上马（`first=7EA3A218`，肉眼过） |
+|---|---|---|
+| `hands` 拆卸站点 | `sites=1`，**全部** `0x5CBDF8` ×293 | `0x5CBDF8` ×107 |
+| `attachItem` 自清槽 | **一条都没有** | `0x535383` ×1，摘的是 **`back`** |
+| 同趟 `P43SUP pass=`（放行的收鞘） | **293** | **107** |
+| 手槽占用 `nonnull/samples` | 6540 / 14885（44%） | 1398 / 3869 |
+| `swap` / `appswap` / `nullapp` | 0 / 0 / 0 | 0 / 0 / 0 |
+
+- **两趟的 `hands` 拆卸数 ＝ 放行数，一个不多一个不少**（293＝293、107＝107），被抑制的那 286 次一条拆卸都没产生 ⇒ **手槽的唯一写手就是我们已经在抑制的 `sheatheWeapon`**。「≥3 个站点 ＝ 第三方写手」那条读法**被排除**。
+- 换算一律走 `callers.py --ret`，**没有手算**（§18.10）：
+```
+python tools\callers.py --ret 0x5CBDF8 -> raw 不是返回地址；+0xA90 = 0x5CC888 in 0x5CC820+0x68，call 0x5CC883 -> 0x52E0F0
+python tools\callers.py --ret 0x535383 -> raw 不是返回地址；+0xA90 = 0x535E13 in 0x535D50+0xC3，call 0x535E0E -> 0x52E0F0
+```
+  两条落点正是上表的 `0x5CC883`（`sheatheWeapon`）与 `0x535E0E`（`attachItem` 二参自清槽）⇒ **§18.11 的站点表被运行时兑现两条**，同时给 §18.10 的 delta 添了两个**窗口外**的锚点（见 §18.10 补注）。
+- ⚠️ **那条「自带阳性对照」要打折**：预言是「每次成功拔刀必然从 `attachItem` 体内产生一条 `hands` 拆卸」，空手那趟（5 次 `post=1` ＋ 12 级 `P41E` 梯子）**一条都没有** ⇒ 三参的清槽**带条件**（我们的拔刀门控在手槽为空时才开，空槽无须清）。阳性对照实际兑现在**二参**那条上：收鞘把刀挂回 `back` 之前先清 `back`。⇒ 结论不受影响（拆卸数与放行数仍逐趟对齐），但**别再拿「站点表只剩那两条 ＝ 没人拆手槽」当判据**。
+- ⇒ **抑制期内手槽是持续被占的**（空手那趟 44% 的帧），没有拆卸、没有 Appearance 重建（`appswap=0`/`swap=0`/`nullapp=0`），刀却在屏幕上留在背上 ⇒ **P4-3 第 2 步的「谁撤掉」这一问已答完：没人撤。剩下的是渲染侧。**
+- ✅ **本趟最有价值的一条 —— `weaponInHandsSheathLocation`（`0x6E0`，§17.3）在两趟里不一样**：肉眼过的那趟 `sh='back'`；不过的那趟 5/5 条 `P43RD` 全是 `sheath '' -> ''`。而我们调的是 `rider->drawWeapon(sw, std::string())` ＝ **第 2 个参数传空串**，`drawWeapon`@`0x5DBF80` 的被调方里就有 `leaveSheathEquipped`@`0x5D24B0`（§18.8:661；它引用 `"hip"/"back"/"back2"/"sheath"`），而 `sheatheWeapon` 第 5 步正是拿这个字段当位置串把刀挂回去（§18.7:615）。⇒ **假设**：空串让「把刀从鞘里取出来」那一步没执行，背上那份挂载原地不动，手槽里那份只存在于数据层。
+  - ⚠️ **是假设、不是实测**。要坐实需要两条：①静态解 `drawWeapon`@`0x5DBF80` 怎么用第 2 个参数（以及引擎自己的调用方传什么，`--vcall 0x3D8`）；②运行时把 `getAttachedEntity` 从 `"hands"` 扩到 `"back"/"back2"/"hip"/"sheath"`，看背上那份是否与手槽**同时**非空。
+  - ✅ 这条**不违反 `HISTORY.md` §B**：改的是我们传给引擎自家 API 的参数，不是对每帧覆写做写入端补偿。
+  - ✅✅ **①已做完，假设坐实 ⇒ 见 §18.12**；②不必再做（要确认的那件事 `P43DT` 现成就能打：修好以后每次拔刀会多出一条 `slot='back'` 的拆卸）。
+
+### 18.12 `drawWeapon` 的第 2 个参数 ＝ **鞘位**；`leaveSheathEquipped` 只认 `"hip"`/`"back"`，空串 ＝ 整段不执行（2026-09-02，Ghidra 反编译，§18.11.1 那条假设**已坐实**）
+
+**一句话**：`drawWeapon` 把第 2 个参数原样交给 `leaveSheathEquipped`@`0x5D24B0`，后者开头是一张**白名单** —— 只有 `"hip"`（`0x16C0580`）与 `"back"`（`0x16C0584`）能过，且长度必须**精确相等**；别的字符串（**包括空串**）一律 `goto` 收尾、清串、**什么都不做**。被跳过的那一段正是「把刀从背上摘下来」：
+
+| 被跳过的动作（`0x5D24B0` 体内） | 地址 | 逐条对上的症状 |
+|---|---|---|
+| `detachItem(appearance, loc)` | `0x52E0F0`，站点 `0x5D2632`（§18.11:788 早就列了这一条） | 刀的 mesh 一直挂在背上 ⇒ 肉眼「刀还在背上」 |
+| `weaponInHandsSheathLocation = loc` | 写 `Character+0x6E0`（§17.3），站点 `0x5D26CE` | `P43RD` 5/5 全是 `sheath '' -> ''` |
+| `attachItem(app, weaponInHands, <"sheath" 网格>, loc)` | 三参 `0x535E50`（§18.8），站点 `0x5D2709` | 背上不会出现空鞘 |
+
+⇒ **`std::string()` 就是 T15 那个「渲染侧卡点」的成因**：三条症状一条不漏地对上白名单外那一跳，不是巧合。
+
+**`drawWeapon`@`0x5DBF80`（901 B）的形状**（`param_1`＝`this`／`param_2`＝`Item* wpn`／`param_3`＝鞘位串）
+
+```c
+if (!wpn) { this->vt[0x428](); wpn = this->m_0x6D0; }
+if (this->weaponInHands /*0x6D8*/) {
+    if (this->weaponInHands == wpn) { loc.clear(); return 1; }   // ⚠️ 啥也没干就 return 1
+    this->vt[0x2d0]();                                          // sheatheWeapon（§18.7）
+}
+if ((c = FUN_747BB0(this->m_0x2E8, loc)) && *(int*)(c+0xB8)) {   // loc 当 KEY 被读一次
+    if (!FUN_74C650(this->m_0x2E8, wpn)) { loc.clear(); return 0; }
+    loc.assign(wpn + 0xE8);                                     // 命中就用 Item 自己的串顶掉
+}
+*(char*)(wpn + 0x129) = 1;
+mesh = wpn->vt[0x18]()->map_0x1F8["bare sword"] + 0x28;         // 网格名从游戏数据取
+if (wpn->vt[0x2d8]()) mesh = wpn->vt[0x18]()->map_0x1F8["mesh"] + 0x28;
+if (mesh.size != 0)                                             // ⚠️ 只看网格名空不空
+    attachItem3(*(void**)(this->m_0x448 + 0xE8), wpn, mesh, "hands");
+... this->weaponInHands = wpn; AK::SoundEngine::SetSwitch("Weapons", ...);
+if (wpn != this->m_0x6D0) leaveSheathEquipped(this, copy_of(loc), (int)*(int*)(wpn+0xE0));
+loc.clear(); return 1;                                          // 每条返回路径都清
+```
+
+- ✅ **挂 `"hands"` 那一步只被「网格名非空」门控，跟第 2 个参数无关** ⇒ 这就是为什么空串照样 `post=1`、手槽照样被占（§18.11.1 的 `nonnull=6540/14885`），而背上那份原地不动。**数据层成功、渲染层没变**，两件事在源码里是两条独立的门。
+- ⚠️ **KenshiLib 头文件的 `const std::string&` 是错的**：`param_3` 在**每一条**返回路径上都被就地清空（`_Myres=0xf`／`_Mysize=0`／`buf[0]=0`），命中上面那个 `assign` 时还会被整串顶掉。它是个**被消费的入参**，不是 const 引用。
+- ⚠️ **传进去的串必须 ≤ 15 字符**：清空走的是 `if (0xf < _Myres) operator_delete(_Ptr)` —— 堆串会让**游戏的**分配器去 free **我们的**缓冲。`"hip"`/`"back"` 落在 MSVC 的内部缓冲里，这条分支是死代码。
+- ⚠️ **`weaponInHands == wpn` 时 `drawWeapon` 直接 `return 1`**，一件事都不做。⇒ 读 `post=` 时别把 1 当「这次真拔了」。
+- ⚠️ **`drawWeapon` 体内自己会经 vtable `+0x2D0` 调 `sheatheWeapon`**（手上已有*另一把*时）—— 那正是 P4-3-2 抑制器坐的位置。当前骑乘路径进不到这一支（手槽逻辑上是空的），但改抑制器之前要想到这条。
+
+**`leaveSheathEquipped`@`0x5D24B0`（718 B）的形状**（`param_3` ＝ `(int)*(int*)(Item+0xE0)`）
+
+```c
+if (loc != "hip" && loc != "back") goto done;      // ← 空串死在这里
+if (loc == "back" && param_3 > 0) loc = "back2";   // ⚠️ "back2" 是它自己推的
+if (this->weaponInHands /*0x6D8*/) {
+    detachItem(app, loc);
+    sheathMesh = weaponInHands->vt[0x18]()->map_0x1F8["sheath"] + 0x28;
+    this->weaponInHandsSheathLocation /*0x6E0*/ = loc;
+    if (sheathMesh.size != 0) attachItem3(app, this->weaponInHands, sheathMesh, loc);
+}
+done: loc.clear();
+```
+
+- ⚠️⚠️ **永远不要传 `"back2"`**：白名单只认 3 字节的 `"hip"` 与 4 字节的 `"back"`，`"back2"` 长度不等 ⇒ 直接掉进 `goto done`，回到今天这个 bug。要 `"back2"` 就传 `"back"`，让它自己按 `Item+0xE0` 推。
+
+**为什么 `--vcall 0x3D8` 答不了「引擎自己传什么」（负面结果，省重复劳动）**
+
+- `--vcall 0x3D8` ＝ **72 个站点**，比 §18.7 的 `0x2D0`（38 个）更糟；抽查 `0x5D02A2 in 0x5D00B0+…` 反编译出来是 `(**(code**)(*plVar7+0x3d8))(plVar7)` ——**单参**、返回值当指针判空 ⇒ 那是别的类的同偏移槽。静态给不了接收者类型，这条路封死。
+- `callers.py 0x5DBF80` ＝ 1 个直调站点，且是 ILT 跳板 `0x3C0E7`；**追一跳后 `0x3C0E7` 有 0 个直调者** ⇒ 引擎对 `drawWeapon` 的调用**全部**走虚表，静态看不见任何一个实参。
+- ⇒ **鞘位的真值只能从运行时拿**，而它已经拿到了：肉眼过的那趟（引擎自己拔的刀）`sh='back'`（§18.11.1）—— 同一个角色、同一把刀，引擎用的就是 `"back"`。
+- `callers.py 0x408D1`（`leaveSheathEquipped` 的 ILT）→ 唯一站点 `0x5DC2A1 in 0x5DBF80+0x321` ⇒ **`drawWeapon` 是它唯一的调用方**，白名单挡掉的就是整条鞘位流水线。
+
+**复现口令**（都离线）
+```
+python tools\callers.py --strings 0x5DBF80        -> 'bare sword' / 'mesh' / 'hands' / 'Weapons'
+python tools\callers.py --strings 0x5D24B0        -> 'hip'(0x16C0580) / 'back'(0x16C0584) / 'back2' / 'sheath'
+python tools\callers.py 0x5DBF80 0x5D24B0         -> 各 1 个站点，都是 ILT 跳板
+python tools\callers.py 0x408D1                   -> 0x5DC2A1 in 0x5DBF80+0x321
+analyzeHeadless … -postScript DecompAt.java 0x1405DBF80 0x1405D24B0 0x140535E50 0
+```
+⚠️ **方法论**：`--field 0x6E0` 把 `0x5DC6F5/0x5DC727/0x5DC745`（`in 0x5DC650`）列成 `lea r`，看着像鞘位的读者，其实是 `FUN_791BF0(this+0x6E0)` 那类**取地址当参数**的用法。`--field` 的 `lea` 行只说明「这里取了这个成员的地址」，**别读成读/写鞘位**。
+
+### 18.12.1 运行时确认 —— **修法成立，白名单那道闸是唯一的闸**（2026-09-02 第十三趟，标的 `D3D4879E…`，四趟骑乘，`TEST_REQUIRED.md` T16 已关）
+
+**肉眼（真判据，两半都过）**：半 A 空手上马 ＝ **「打架时会自动掏刀，刀全程在手上，打完会自己收起来」**；半 B 先拔刀上马 ＝ 和以前一样刀在手上（对照没坏）。⇒ 症状从「数据层有刀、屏幕上没刀」直接消失，**不需要任何渲染侧改动**。
+
+**日志侧的三条自证**（`python tools\ridelog.py`，全在 `RE_Kenshi_log_trip13_D3D4879E.txt`）
+
+| 字段 | 第十二趟（空串） | 第十三趟（`"back"`） | 读法 |
+|---|---|---|---|
+| `P43RD` 的 `sheath` | `'' -> ''` **5/5** | **`'' -> 'back'` 3/3** | `weaponInHandsSheathLocation`（§17.3）终于被写进去了 |
+| `P43DT` 的 `slot='back'` 拆卸 | **一条都没有** | **`0x5D1BA7` other=39** | 就是 §18.12 说被跳过的那一段现在跑了 |
+| `P43DT` 的 detach 站点数 | 1（只有 `hands`） | **3** | 多出来的两个都是 `slot0=back` |
+
+**两个新站点由 `callers.py --ret` 换算，不是手算**（§18.10 那条红线）：
+- `0x5D1BA7` → `+0xA90` ＝ `0x5D2637 in 0x5D24B0+0x187`，call site **`0x5D2632`**（len 5）→ `0x52E0F0` entry ⇒ **正是 §18.11:788 记的、§18.12 判定被空串跳过的那次 `detachItem(app, loc)`。** 39 次 ＝ 每次真拔刀一次。
+- `0x535383` → `+0xA90` ＝ `0x535E13 in 0x535D50+0xC3`，call site **`0x535E0E`** → `0x52E0F0` entry ⇒ 二参 `attachItem` 的自清槽（§18.11 的「自带正控制」），40 次 ＝ 每次收鞘挂回 `back` 前先清 `back`。39/40 近乎相等 ＝ **一个平衡的拔/收循环**，差的那一次是上马时的 `_carryMode` 收鞘。
+
+⇒ **`leaveSheathEquipped` 的白名单是唯一的闸**：它一开，引擎自己的拔刀/收刀循环就正常了（`P43HD gain=37 / loss=38` 对上 39 次 `back` 拆卸，而我们自己只贡献 3 次架势边沿补拔 ＋ 10 级 `P41E` rung 0）⇒ **屏幕上看到的那把刀绝大多数是引擎自己拔的**，我们只是把它一直缺的那个参数补上了。⚠️ **这条只由「次数」支持，时间不支持** —— 见下一段。
+
+⚠️ **「引擎按战斗节律拔/收」这条读法不成立。** 能看到时间的那些 `P43HD` 边沿（DLL 侧预算 `kHdLossLines=8`／趟，所以只看得到每趟最早的几条）**全部落在 t≈95.9–97.6**，也就是**上马之后一两秒、离战斗窗口还很远**（同趟 `P41D` 的 `read` 窗口是 `203.828 .. 415.986`）：7 对 `gain`/`loss`，每对只持续 **29–330 ms**，而且**每次的 Entity 指针都不一样**（`016D6710` / `016E5FB0` / `016DF9D0` / `01702590` / `016F6E90` / `7E4A1700` / `17FD6C2C0`），全程 `st=0 cm=0 bc=1`。⇒ 两条推论：
+- **手槽占用（以及 `weaponInHands` 的 0↔1 边沿）不是「引擎认为在打架」的信号，不能拿来当 `TASK.md` P4-3 第 3 步的触发条件。** 亚秒级抖动 ＋ 每轮换一个 Entity，接上去只会每秒钟触发好几次。
+- **这一串的归属分不清**：候选是我们自己的 `kDrawTryBudget` 梯子（12 次／趟，已知诊断开着时**在上马那一刻就烧完**）与引擎，诊断是开着的 ⇒ 只能靠**不带诊断的那一趟**（`TEST_REQUIRED.md` T17）来分。**次数那半照旧成立**（39 次里我们最多贡献 3＋10＝13 次），所以「大多数是引擎拔的」按次数仍然对；被推翻的只是「按战斗节律」这个读法。
+
+⚠️ **`+0xA90` 因此多了一个窗口外的锚点。** §18.10 原来的范围只到 `0x5CE000-0x5DC000`（三个锚点都在里面），现在 `0x535383` 在 `0x535xxx` 也 `+0xA90` 落在一条**真的 5 字节 call**上、而且目标就是同一个 `detachItem` 入口（raw 那一行明确 `NOT a return address`）⇒ 两个不相交的窗口各有锚点。**成因照旧未解释**，纪律不变：**每个 logged `site=` 都要跑 `callers.py --ret` 重验，永远不许手算。**
+
+**旧不变量照旧成立**：`0x5CBDF8`（＝ `0x5CC883 in CharacterHuman::sheatheWeapon`，§18.11.1）的 `hands=818` **精确等于**同趟四段 `P43SUP pass=` 之和（524＋242＋0＋52＝818），被抑制的 `real=214` 一条都没漏 ⇒ 抑制器与拆手槽的账仍然是一对一的（第十二趟是 293＝293／107＝107）。
+
+## 19. 离线读游戏数据（FCS 记录 / Ogre 资产）—— TASK.md P4-3 前提②
 
 **为什么**：TASK.md 把 P4-3 前提②「挥砍 clip 的层与 `whole` 位」标成必须进游戏。可这两个字段是 **FCS `ANIMATION`(24) 记录的字段**，记录就存在 `data\*.base` / `*.mod` 里 ⇒ **静态可读**。工具 `tools\gamedata.py`（数据文件）与 `tools\skelanims.py`（骨架资产），两个都离线、都进仓库。
 
