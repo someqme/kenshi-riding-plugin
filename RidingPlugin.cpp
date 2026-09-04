@@ -385,6 +385,11 @@ boost::unordered_map<Character*, Ogre::Quaternion> mountSmoothOrient;
 // while the mount stands still so the rider keeps its last heading instead of spinning.
 boost::unordered_map<Character*, Ogre::Vector3> mountHeadingPos;
 boost::unordered_map<Character*, Ogre::Vector3> mountHeadingDir;
+// Frames on which that refresh was VETOED because the travel delta pointed the opposite way
+// from the animal's own facing (see ApplyRiderOrientation).  Per-ride, printed on the ungated
+// P43SW ride line - parked there because that is the one summary line every ride emits, not
+// because it has anything to do with swinging.
+static int gRideHeadVeto = 0;
 
 // mount -> root-bone anchor offset, captured on the first synced frame as
 // (rBip - node).  SyncRiderNode keeps the rider's RENDER root bone at
@@ -758,6 +763,12 @@ static bool         gRungDead[kAtkStages] = { false, false, false, false, false 
 // DRAWN-weapon test), pWpn=0 (getThePreferredWeapon reads NULL in that state), aCW=5
 // SKILL_UNARMED - and it demotes "chooseAttack refuses to name a technique" (ch=0 43/43)
 // from a mystery to a consequence: an unarmed character has no weapon technique to choose.
+// ⚠️ 2026-09-02: THAT ch=0 IS NOW STALE, AND THE CONSEQUENCE ABOVE IS EXACTLY WHY.  T16 (sheath
+// slot) + T18 (stance precondition) put a real weapon in the rider's hand, and a re-read of the
+// trip-13 log shows chooseAttack naming real techniques in a long run - ch=1 with
+// 'downward combo' / 'chop left-3' / 'bigchopv2', alongside wpn=1 and reach=10.50.  ⇒ Do NOT
+// quote ch=0 43/43 as evidence that this route is closed; it is P4-3-4's foundation.  Full
+// reading at the RideSwing block.
 // ⚠ The other half of the same report - "no other action while mounted" - is NOT evidence
 // about the weapon: kRidePose carries wholeBodyAllLayer and PoseLayerPin holds it at 1.0,
 // which P2-1b-1 measured to hold every other clip at w=0.000.  Invisible is by design.
@@ -3049,6 +3060,826 @@ static bool RideCombatStance(Character* rider, Character* mount, const SeatInfo&
     return raw || gRideStanceHold > 0;
 }
 
+// ---- P4-3-4: the swing itself, played by the ENGINE'S own combat dispatch --------------------
+// P4-3 step 3 closed with 「缺的不是机制而是触发条件」 and the experimental 3 s/1 s window was
+// deleted (its full shape is archived in HISTORY.md §U).  Two candidates were left alive: hang the
+// swing on chooseAttack's rhythm, or on an attack event.  A 2026-09-02 re-read of the trip-13 log
+// (offline, no game time) answered it, and the answer is better than the archived window:
+//
+//   * chooseAttack DOES name a technique now.  `P41D read` carries ch=1 in a long run with real
+//     technique names - 'downward combo' (init/minS 10.00/10.00), 'chop left-3' (0.00/-10.00),
+//     'bigchopv2' (25.00/20.00).  ⚠️ The "chooseAttack refuses to name a technique (ch=0 43/43)"
+//     recorded at the P4-1e block is UNARMED-ERA evidence - that block says so itself: an unarmed
+//     character has no weapon technique to choose.  T16 (sheath slot) + T18 (stance precondition)
+//     put a real weapon in the hand, which retired the premise, and nobody re-read the log until
+//     now.
+//   * rung 3 - runCombatAnimation(chTech, 1.0f, "") @0x5B6E80 - really executed, 7 times, with a
+//     non-NULL technique and ZERO access violations (rung=3 at 206.338 / 210.175 / 213.864 /
+//     217.541 / 379.445 / 405.453 ..., same-frame readback tech=1 wpn=1 reach=10.50 cma=1 aCM=1
+//     cst=3/4).  inZ=0 nearZ=0 on every one of them ⇒ the engine will never DISPATCH a swing for a
+//     carried rider on its own, but it will PLAY one when asked.
+//   * 🔑 runCombatAnimation takes a CombatTechniqueData*, NOT a clip name.  That walks straight
+//     past the dead end RE_NOTES §19 documents (43 of 44 technique clip names have no
+//     AnimationData record at all, so FindAnimData/ClipPin can only ever play the 'mid blow'
+//     stand-in).  This route plays the swing the engine itself picked.
+//
+// ⚠️ THE ONE NECESSARY CHANGE, and it is also measured: after rung 3 the guard clip was still
+// `play=1 w=1.000` and only its render-side mainState moved, 1.000 -> 0.909 (P41K @206.280 vs
+// @206.600).  Our per-frame runAnimation(guard) + ClipPin(guard, 1.0, true) held it, and ClipPin's
+// global `target + others <= 1.02f` door then refused the guard's own setWeight.  So the swing WAS
+// playing and the stance was sitting on top of it.  ⇒ while a swing is in flight the guard must not
+// be asserted at all - the same trick §U used to get past that door, applied for the same reason.
+// ⚠️ TWO sites assert it, not one: HaltAndForceSitPass (render side true) and the animUpdate
+// pre-pass (render side false).  §U could leave the second alone because OUR pinned one-shot got
+// the guard EVICTED from the play list (trip 10); an engine-driven swing does not evict it, so this
+// time both sites have to stand down.
+//
+// ⚠️ Deliberately NOT the archived window's unconditional 3 s timer: 「不管眼前这一架在干什么都
+// 照点」 is exactly why that code was not shipping posture.  The trigger is the technique's own
+// opinion of the range it is usable at (initialDistance 0x38 / minDistanceVsStatic 0x3C) plus a
+// minimum interval, so a swing only happens when the engine would consider one usable.
+// ⚠️ TRIP 18 (2026-09-02, diagnostics OFF, log RE_Kenshi_log_trip18_AF771D99_diagoff.txt) proved the
+// MECHANISM and then handed back a purely cosmetic defect, measured to the digit:
+//   * It works.  swing=17 over 4 rides, guardoff=5126 frames, and ZERO `LEGPOSE released grace=`
+//     lines - so 'mid blow' really does become the skeleton's host and trip 17's stand-up is gone.
+//   * It does not look like ONE swing.  「有点像右手给左手割腕」.  Two independent prog= readings
+//     agree on why: prog 0 -> 0.517 took 2.502 s and 0.518 -> 0.900 took 1.828 s, i.e. a rate of
+//     ~0.207/s ⇒ 'mid blow' is a ~4.8 s clip and a 2500 ms window shows ~52% of it.
+//   * 🔑 AND the second window RESUMED at 0.518 where the first stopped at 0.517.  The
+//     SingleAnimation entry survives between windows with its currentFrameTime01 intact (frozen
+//     while unrequested), so every window after the first shows an arbitrary MIDDLE slice - and a
+//     window that happens to open on a leftover prog >= kRideSwingDoneProg closes on its very next
+//     frame, having played nothing at all.
+// ⇒ Three knobs, all three turned here, none of them touching the trigger or the host guarantee:
+//   1) restart the clip at each open (RideSwingRestart below) - fixes both the middle slice and the
+//      instant-close;
+//   2) play it faster, so a full pass is a swing-length event rather than a 4.8 s one;
+//   3) a cap with enough headroom that the CLIP closes the window, not the clock.
+static const int   kRideSwingLenMs    = 3000;  // ⚠️ T27: HARD CAP ONLY, and now a pure safety net -
+                                               // kRideSwingWinMs is what actually closes a window.
+                                               // It survives because a cap is the only thing that
+                                               // bounds a window whose open tick got past the per-ride
+                                               // reset (save/load, a rider swap), and because a second
+                                               // bound costs nothing.  Trip 10: a fixed 1000 ms played
+                                               // ~20% of 'mid blow', and no clip's length can be
+                                               // pre-read - which is why the CLIP no longer decides
+                                               // anything here.
+// 🆕 T27 - THE WINDOW'S HOST IS THE GUARD AGAIN, and the window therefore closes on our own clock.
+// Trip 24 (the T26 aimed arc) got the eyeball to 「有点劈砍的意思了」 and named what is left:
+// 「角色的右手总是想找左手因为原版就是双手劈砍的，所以把动作带崩了」.  That reading is structurally
+// right even though the mechanism it names cannot be the one at work - the right hand's POSITION is
+// ours now (dot= mean 0.9920 over 36 samples, and every sample below 0.99 is a read-lag frame), so no
+// clip is pulling that hand anywhere.  What 'mid blow' still owned was everything the arc does not:
+// the LEFT arm, the right WRIST, the spine.  It is one of the six `blow` records, all of them
+// 「击倒类重击」 carrying whole+action+reloc (doc.md :245) = a two-handed committed strike, so its
+// left-arm track reaches across for a grip that is no longer there and its wrist track rolls the
+// blade to match.  ⇒ the window stops swapping the host at all: 'guard 1h' (UPPER, loop, weapon-class
+// bit 0x04 = ONE-HANDED, no whole/reloc - doc.md :248) stays pinned straight through, and our arc cuts
+// on top of it.  Three things come free: no root motion inside the window, a wrist that keeps a
+// one-handed attitude for the whole stroke, and a swing length that stops being a restatement of
+// 'mid blow's own.  What it costs is the torso whip - if the verdict is 「太僵」 the answer is to
+// author the spine (P4-1M's twist is already ours, :6295), NOT to bring a ground record back.
+static const int   kRideSwingWinMs    = 1650;  // 🆕 T27 - the window's real length.  A LOOP has no
+                                               // progress to close on, so the ARC's clock closes it:
+                                               // kRideSwingArcMs (1400, :5734) plus a ~250 ms tail on
+                                               // the last key, which is the settle pose.
+                                               // ⚠️ INVARIANT: kRideSwingArcMs < kRideSwingWinMs <
+                                               // kRideSwingLenMs < kRideSwingMinGapMs.  Raising the arc
+                                               // without raising this cuts the stroke off before t=1 -
+                                               // trip 23's 1437 ms defect with a new cause.
+static const float kRideSwingSpeed    = 2.5f;  // ⛔ RETIRED BY T27 (nothing one-shot is pinned any
+                                               // more; kept because RideSwingRestart still compiles
+                                               // and §17.11's 「sp=2.50 是真旋钮」 is a measured fact
+                                               // worth not losing).  SingleAnimation::speed for a
+                                               // pinned one-shot.
+                                               // 4.84 s * 0.90 / 2.5 = 1.74 s per swing, which is
+                                               // what a heavy chop should take.  ⚠️ UNVERIFIED knob:
+                                               // nothing in this DLL has ever passed a speed other
+                                               // than 1.0f.  If the engine ignores it the trip still
+                                               // gains - knob 1 alone turns a random middle slice
+                                               // into a swing that starts at the start - and the
+                                               // close line's sp=/t01=/olen= read-back says which.
+static const float kRideSwingDoneProg = 0.90f; // ⛔ RETIRED BY T27: the host is a LOOP now, so its
+                                               // progress cycles and closing on it would end windows
+                                               // at random.  kRideSwingWinMs closes them.  (Kept so
+                                               // the trip-21 reasoning below stays readable.)
+                                               // getAnimationProgress at which the swing is "done".
+                                               // Deliberately NOT raised with the rest: the last 10%
+                                               // is recovery-to-neutral and the guard IS that pose,
+                                               // so it buys nothing and would be one more variable.
+static const int   kRideSwingMinGapMs = 3200;  // floor between swings, so this can never machine-gun
+                                               // ⚠️ INVARIANT: kRideSwingMinGapMs > kRideSwingLenMs.
+                                               // The gap is measured from the OPEN attempt, so a gap
+                                               // below the cap would let a capped window re-open on
+                                               // the frame after it closed - back-to-back swings
+                                               // with one guard frame between them, which is both
+                                               // ugly and unreadable ("did the stance come back" can
+                                               // only be judged on the NEXT open row, trip 10).
+static const int   kRideSwingLines    = 24;    // per-ride log budget (open + close lines share it)
+// 🆕 T22 - driving the TECHNIQUE's own Ogre state (RideSwingDrive).
+static const int   kRideSwingTechMs   = 1700;  // the window the technique's arc is fitted into.
+                                               // MEASURED, not chosen: trip 19's 14 windows closed
+                                               // between 1734 and 1846 ms (avg 1846 incl. one that
+                                               // hit the cap), so one arc per window lands here.
+                                               // ⚠️ If kRideSwingSpeed changes, this changes with it -
+                                               // it is a restatement of when 'mid blow' hits 0.90.
+                                               // ⚠️ T24: a CEILING now, never a stretch - see the
+                                               // clamp in RideSwingDrive.
+static const float kRideSwingTechW    = 1.0f;  // ✅ VERIFIED trip 20: the write reaches the state and
+                                               // 1.0 is really applied (drv>0, en=1 11/11, and the
+                                               // eyeball saw a full-amplitude motion).  It stays at
+                                               // 1.0 because T23 made the split complementary - on
+                                               // the bones this state owns it is now the ONLY
+                                               // contributor, so there is nothing to average with.
+                                               // Lowering it is the remedy for "torso too stiff",
+                                               // not something to pre-empt.
+static const float kRideSwingNoOpinion = 1.0f; // init/minS at or below this = the record has no
+                                               // opinion ('chop left-3' reads 0.00/-10.00), fall
+                                               // back to the weapon's own reach
+
+// 🆕 T23 - the trip-20 fix.  The drive WORKS and the composition does not.  Trip 20: drv>0 on every
+// ride that swung, en=1 on 11/11 closes, w=1.000, arc=100% - and the eyeball says the state very much
+// reaches the skeleton: 「把刀从右手往胸口收，然后刀飘到头顶，整个人缩成一团瞬移到坐骑前面。动作
+// 幅度很大，但是毫无意义」.  That is the OPPOSITE of the pre-registered kill criterion (§17.12: en=1
+// w=1.000 t≈len with nothing visible ⇒ route dead) ⇒ the route lives, it is simply unconstrained.
+// Two unconstrained things, one per symptom:
+//
+//   * 「瞬移到坐骑前面」= the technique is a GROUND clip and its root/pelvis tracks step the whole
+//     skeleton forward.  Kenshi's own AnimationData records carry the whole/reloc bits for exactly
+//     that, and a record-less technique clip has nobody to apply them (§19) ⇒ raw root motion.
+//   * 「整个人缩成一团」= two full-body clips driving the same bones at 1.0 each.  'mid blow' is
+//     pinned at 1.0 as the host and the technique is now enabled at 1.0 with NO blend mask at all -
+//     LegMaskApply only reaches states that own a SingleAnimation entry, and a record-less clip has
+//     none - so every spine/arm bone receives both, which is not a blend of two poses in any mode.
+//
+// The fix is a complementary split, built out of the blend-mask machinery that already carries the
+// straddle (createBlendMask/setBlendMaskEntry on an AnimationState, in this DLL since P2-1b, leak
+// discipline in §21.2).  The TECHNIQUE gets root/pelvis/legs/feet zeroed - it may have the torso,
+// never the seat.  The HOST gets its upper body zeroed for the duration of the window - it keeps the
+// legs, which is the only thing it is load-bearing for (P4-1i / §17.9: assert nothing down there and
+// the engine renders BIND and the rider stands up on the mount's back).  Fingers are in NEITHER list
+// on purpose: the host keeps the grip closed around the weapon.
+//
+// ⚠️ Both tables are resolved BY NAME at the same site as the leg bones and every handle is logged
+// once per DLL load.  A name that is not in this skeleton reads has=0 and is skipped - no handle is
+// ever assumed (the 30-bone rider makes 0/1 look like root/pelvis, and that is exactly the kind of
+// guess this project has been burned by).
+static const char* kRideSwingHoldBones[] = {
+    "Bip01", "Bip01 Pelvis",                  // 「瞬移到坐骑前面」
+    "Bip01 L Thigh", "Bip01 R Thigh",         // the straddle: the technique state has never been
+    "Bip01 L Calf",  "Bip01 R Calf",          // masked here, LegMaskApply structurally cannot see it
+    "Bip01 L Foot",  "Bip01 R Foot"
+};
+static const int   kRideSwingHoldCount = 8;
+static bool            gRideSwingHoldHas[kRideSwingHoldCount];
+static unsigned short  gRideSwingHoldHandle[kRideSwingHoldCount];
+static bool        gRideSwingMaskMine   = false; // WE created the technique's mask ⇒ destroy it back
+static int         gRideSwingHoldN      = 0;     // hold entries written on the last drive (close=)
+static int         gRideSwingFreeFrames = 0;     // frames the HOST's upper body stood down (ride=)
+static int         gRideSwingFitMs      = 0;     // 🆕 T24: ms the last drive fitted the arc into.
+                                                 // < kRideSwingTechMs ⇒ the clip is shorter than the
+                                                 // window and is playing at its OWN rate (fit=).
+// 🆕 T25 - the AUTHORED arm (RideSwingArmPose, :5862).  Declared up here because the close line and
+// the window's open edge both sit above the arc table.
+static bool        gRideSwingArmHeld     = false; // WE currently hold the arm bones manually
+static int         gRideSwingArmFrames   = 0;     // authored frames this ride (ride line's arm=)
+static float       gRideSwingArmT        = -1.0f; // t reached on the last authored frame (armt=)
+static int         gRideSwingArmLines    = 0;     // sample-line budget spent this ride
+// 🆕 T28: the reference pose is captured lazily by the first authored frame of a window (the two node
+// reads already live there), so the FLAG has to be visible to the close edge that invalidates it.  The
+// quaternions themselves sit next to gRideSwingArmWrote, down by the arc table.
+static bool        gRideSwingRefHave     = false; // a capture is live for the CURRENT window
+static int         gRideSwingNoRef       = 0;     // frames refused for want of both bones (noref=)
+
+static Character* gRideSwingWho      = NULL;   // pointer compare only, never dereferenced
+static DWORD      gRideSwingOpenTick = 0;      // GetTickCount() at open; 0 = closed
+static DWORD      gRideSwingLastTick = 0;      // GetTickCount() at the last open ATTEMPT
+static bool        gRideSwingWasOpen = false;  // close-edge detection
+static int         gRideSwingCount   = 0;      // windows this ride (the log's n=)
+static int         gRideSwingTech    = 0;      // times chooseAttack named a technique
+static int         gRideSwingSkip    = 0;      // named, but out of the technique's usable range
+static int         gRideSwingNoClip  = 0;      // in range, but the host clip (T27: the guard) was
+                                               // not resolved yet
+static int         gRideSwingGuardOff = 0;     // 🆕 T27: frames the pin pass saw a LIVE window while
+                                               // keeping the guard as host.  It is printed as
+                                               // `hostkeep=`, NOT as the old `guardoff=` - the guard no
+                                               // longer stands down at all, so reusing the old key
+                                               // would silently change what a reader is judging
+                                               // (HISTORY §U's parsing trap, one level up).  Before
+                                               // T27 this counted frames the guard was WITHHELD.
+static int         gRideSwingLines   = 0;
+static char        gRideSwingName[64] = { 0 }; // the technique the window opened for (probe subject)
+
+// Restart bookkeeping (T21).  The request site runs many times per window, the restart must run
+// ONCE - so it latches the window's own open tick rather than counting frames.  gRideSwingRestarts
+// is the judge's cross-check: it has to equal the window count, or some window played from wherever
+// the previous one stopped (which is the whole trip-18 defect).
+static DWORD       gRideSwingRestartTick = 0;
+static int         gRideSwingRestarts    = 0;
+// 🆕 T22: frames on which RideSwingDrive actually wrote the technique's Ogre state.  drv=0 on a
+// window means the write never happened (state absent, or the SEH shell caught something); drv
+// large with en=0 on the close line means the write happened and the engine undid it - two very
+// different verdicts on the same route, so the counter is not optional.
+static int         gRideSwingDrv         = 0;
+
+// T18's P43FT taught this: when the answer is "it never fired", the log has to say HOW FAR OFF it
+// was, or the trip is undiagnosable.  dmin = the closest any attempt ever measured, limlast = the
+// range the last attempt was judged against.
+static float       gRideSwingMinD    = -1.0f;
+static float       gRideSwingLastLim = -1.0f;
+
+// Pure read, cheap, no state movement - the two guard-assertion sites call this and nothing else.
+// Only RideSwingPass ever opens or closes a window.  DWORD subtraction is wrap-safe, so the
+// 49.7-day GetTickCount rollover needs no special case (same argument as the stance tail).
+static bool RideSwingInFlight(Character* rider)
+{
+    if (!rider || rider != gRideSwingWho || gRideSwingOpenTick == 0) return false;
+    // ⚠️ T27: the SAME bound the close test uses (kRideSwingWinMs, not the kRideSwingLenMs cap).  These
+    // two must name the same number or the mask/pin sites would keep a window alive for the frames
+    // between the two limits, after RideSwingPass had already handed the arm back.
+    // ⚠️ T28 adds one deliberate asymmetry: the close test also requires the STANCE, which this read
+    // cannot see (it has neither mount nor seat).  A window that ends because the fight ended therefore
+    // stays "in flight" here for the one frame between the pin/mask/arm sites (step 1 of the frame) and
+    // RideSwingPass (which runs later and zeroes the tick).  One frame is the whole cost, and it is why
+    // hostkeep= may read one less than arm= per stance-closed window - trip 25's version of this gap was
+    // 32 frames because nothing closed the window at all.
+    return (GetTickCount() - gRideSwingOpenTick) < (DWORD)kRideSwingWinMs;
+}
+
+// Everything the open decision and its log line need, in one POD - no destructors, so the whole
+// thing including the raw-offset reads below can sit inside the __try frame.
+struct RideSwingPick
+{
+    CombatTechniqueData* tech;
+    char  name[64];   // the CLIP we drive - CombatTechniqueData +0x00, a std::string, COPIED
+    char  gate[64];   // 🆕 T24: the technique the GATE question returned (see below).  Equal to
+                      // name[] would mean the engine gives one answer for both distances.
+    float init;       // +0x38 initialDistance      } the engine's opinion of the range, read off
+    float minS;       // +0x3C minDistanceVsStatic  } the GATE technique - that is what lim= uses
+    float d;          // horizontal rider->threat distance that produced it
+    float dq;         // 🆕 T24: the distance the CLIP question was asked with (min(d, reach))
+    float reach;      // the weaponReach fed to chooseAttack
+};
+
+// READ-ONLY technique producer.  ⚠️ NOT ONE ENGINE WRITE IN HERE - that is exactly what lets it
+// live outside the debugContinuous gate while RiderCombatLever, which does write, cannot (:593).
+// RideNearestThreat is T18's four-tier search, so the target may come from the MOUNT's books; in a
+// player build that is the only reason it resolves at all.
+static bool RideSwingChooseImpl(Character* rider, Character* mount, RideSwingPick* out)
+{
+    float d = -1.0f;
+    Character* threat = RideNearestThreat(rider, mount, &d);
+    if (!threat || d < 0.0f) return false;
+
+    // Reach from the rider when it has one, else the enemy's, else the synthetic - the same ladder
+    // the P41D dry run uses (:7427).  ⚠️ The ORDER matters and the meaning has changed: trip 13
+    // measured the rider's own weaponReach() at 10.50, so 9.0f is now the last resort instead of
+    // the normal case it was when P4-1c read 0.00 four times out of four.
+    CombatClass* rcc = rider->getCombatClass();
+    CombatClass* ecc = threat->getCombatClass();
+    float reach = 9.0f;
+    if (rcc && rcc->weaponReach() > 0.01f)      reach = rcc->weaponReach();
+    else if (ecc && ecc->weaponReach() > 0.01f) reach = ecc->weaponReach();
+
+    CharStats* rst = rider->getStats();
+    if (!rst) return false;
+    // chooseAttack takes weaponReach as an ARGUMENT (@0x886880, RE_NOTES §17.2) - that is the whole
+    // reason the CharStats shim exists.  lastAttack=NULL / opponentIsStationary=false, as in the dry
+    // run: we are asking "what would you swing", not continuing a combo.
+    //
+    // 🆕 T24 - TWO questions, one geometry.  Trip 21 answered 9/9 windows with 'bigchopv2'
+    // (init=25.00) and the eyeball read 「双手持刀然后反转刀身把刀朝下然后向下刺去」.  Two measured
+    // facts explain that: init=25.00 is more than DOUBLE the rider's own reach=10.50, and trip 20
+    // (same clip, no mask) slid the rider bodily in front of the mount => that record is a
+    // CLOSING attack whose footwork is half the animation.  A rider cannot step in, and T23 masks
+    // the root off, so what reaches the screen is the arrival half with the travel deleted.
+    //   Why 'bigchopv2' EVERY time: the mount's own body holds the enemy off, so the
+    // rider->threat distance is structurally 12..25 (trip 21 dmin= 12.56 / 13.89 / 21.40 / 15.47)
+    // and never inside reach.  Asked about that distance the engine correctly answers "close the
+    // gap first".  So ask it twice instead of inventing a number:
+    //   * GATE  - chooseAttack(d, reach): the engine's opinion of the ENGAGEMENT.  Its init=/minS=
+    //     are what lim= keeps using below, so the swing RHYTHM is byte-for-byte the one trip 21
+    //     measured (9 windows over 3 fights) - this change must not silently re-tune that.
+    //   * CLIP  - chooseAttack(min(d, reach), reach): what a fighter ALREADY within a blade of the
+    //     enemy throws, i.e. an attack with no footwork to lose.  min() and not `reach` flat so a
+    //     genuinely adjacent enemy is still asked about honestly.
+    // ⚠️ Both numbers are the engine's.  Nothing here invents a distance constant, which is the one
+    // thing this route has been forbidden to do since the plan was written.
+    // ⚠️ If the two questions return the SAME technique the log says so on its own (gate= vs tech=)
+    // and this rung is a clean negative: the next lever would be naming a clip ourselves.
+    CombatTechniqueData* gate = rst->chooseAttack(d, reach, NULL, false);
+    if (!gate) return false;
+    float dq = (d < reach) ? d : reach;
+    CombatTechniqueData* tech = rst->chooseAttack(dq, reach, NULL, false);
+    if (!tech) tech = gate;   // never lose a swing to the second question
+
+    // Raw offsets, read the same way and for the same reason as the P41D read line (:7432-7445):
+    // CombatTechniqueData's own header drags in MedicalSystem.h, which this tree never compiles.
+    const std::string* an = (const std::string*)((const char*)tech + 0x00);
+    _snprintf_s(out->name, sizeof(out->name), _TRUNCATE, "%s", an->c_str());
+    const std::string* gn = (const std::string*)((const char*)gate + 0x00);
+    _snprintf_s(out->gate, sizeof(out->gate), _TRUNCATE, "%s", gn->c_str());
+    out->tech  = tech;
+    // ⚠️ init/minS come off the GATE technique on purpose - see lim= at the open decision.
+    out->init  = *(const float*)((const char*)gate + 0x38);
+    out->minS  = *(const float*)((const char*)gate + 0x3C);
+    out->d     = d;
+    out->dq    = dq;
+    out->reach = reach;
+    return true;
+}
+
+static bool RideSwingChoose(Character* rider, Character* mount, RideSwingPick* out)
+{
+    if (!rider || !out) return false;
+    out->tech = NULL;
+    out->name[0] = 0;
+    out->gate[0] = 0;
+    out->init = out->minS = out->d = out->dq = out->reach = -1.0f;
+    __try { return RideSwingChooseImpl(rider, mount, out); }
+    __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION
+                  ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH)
+    { return false; }
+}
+
+// ⚠️⚠️ TRIP 17 (2026-09-02, diagnostics OFF, 4 rides / 2 fights, log
+// RE_Kenshi_log_trip17_635436E9_diagoff.txt) KILLED THE runCombatAnimation ROUTE, and the way it
+// died is worth more than the route was:
+//   * The trigger works.  swing=5 / tech=17 / skip=12 / fail=0 on the first ride, 6 windows total,
+//     technique names 'bigchopv2' (init 25.00, fired at d=21-23) and 'chop left-3' (no opinion =>
+//     reach 10.50, fired at d=9.95/10.19).  runCombatAnimation was called with a real technique and
+//     never faulted.
+//   * Nothing played.  The player saw the rider STAND UP STRAIGHT on the ox for about the length of
+//     each window, and the log says exactly why: SIX `LEGPOSE released grace=12` lines, one per
+//     window, 110-160 ms after each open (175.748->175.854, 178.256->178.377, 184.745->184.862,
+//     205.297->205.443, 209.798->209.919, 422.040->422.199).  grace=12 means LegPoseFindHost found
+//     NO host - no SingleAnimation owning an AnimationState - for 12 consecutive frames, so the
+//     straddle mask was handed back and the engine's own 'idle_stand_normal' drove the legs.
+//   * ⇒ runCombatAnimation does NOT put the technique into rAnim->layer[] as a state-owning clip.
+//     LegPoseFindHost is an independent detector here and it saw an empty stage.  (It only scans the
+//     layer add/remove lists, so "the engine keeps combat animations somewhere else" is not
+//     excluded - but nothing reached the screen either way.)
+//   * ⇒ AND the real lesson, which is P4-1i's constraint restated: withholding the guard is only
+//     safe if something ELSE becomes the host.  §U got away with it because it pinned 'mid blow',
+//     a clip with a record and therefore a state; this route withheld the guard and put nothing in
+//     its place.  ⇒ never leave the skeleton hostless, not for one frame.
+// The technique lookup below is KEPT - it is a good trigger and it is read-only.  What changed is
+// what the window plays: 'mid blow' through ClipPin, which trip 10 measured end to end.  The dead
+// call is recorded here rather than left in the build:
+//     rAnim->runCombatAnimation(chTech, 1.0f, "");   // @0x5B6E80, RE_NOTES §17.2
+// (its std::string-by-value third argument is why it needed an Impl/shell SEH split at all - C2712).
+// Reviving it needs a reason to believe the clip can reach the layer; the pure-read probe on the
+// technique's own Ogre state, logged below, is what would supply one.
+
+// The in-ride close.  Dismount() already calls endCombatAnimation() unconditionally (:5489); this is
+// the ordinary expiry, and it stays even though we no longer start a combat animation ourselves -
+// it is a no-op when nothing is playing (HISTORY:453) and it costs one call per swing.
+static void RideSwingEnd(AnimationClass* rAnim)
+{
+    if (!rAnim) return;
+    __try { rAnim->endCombatAnimation(); }
+    __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION
+                  ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH)
+    { }
+}
+
+// Pure READ of the Ogre side, by clip name, for the one question trip 17 left open: does a technique
+// clip with NO AnimationData record have an Ogre::AnimationState at all?  §21.1(1) is the call chain
+// (mapper -> id -> hasAnimationState -> getAnimationState, NULL when absent, nothing inserted), and
+// RidingPlugin.cpp:4643 already uses the very same call for the mask handback, so this adds no new
+// address and no new hook.  ⚠️ §21 never claimed a record-less track HAS a state - that is one step
+// past what is written down, and §21.5 forbids settling it from upstream Ogre source.  So it is
+// measured here and nowhere else.  ⚠️ Read-only: not one field is written.
+static Ogre::AnimationState* RideSwingStateImpl(AnimationClass* rAnim, const char* clip)
+{
+    std::string nm(clip);
+    return rAnim->getAnimationState(nm);
+}
+
+// The std::string above needs unwinding, which C2712 forbids in a function holding __try - the same
+// Impl/shell split RideSheatheSuppressed uses, for the same reason.
+static Ogre::AnimationState* RideSwingState(AnimationClass* rAnim, const char* clip)
+{
+    if (!rAnim || !clip || !clip[0]) return NULL;
+    __try { return RideSwingStateImpl(rAnim, clip); }
+    __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION
+                  ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH)
+    { return NULL; }
+}
+
+static void RideSwingProbeState(AnimationClass* rAnim, const char* clip, char* out, size_t cap)
+{
+    if (!out || cap == 0) return;
+    out[0] = 0;
+    if (!rAnim || !clip || !clip[0]) return;
+    Ogre::AnimationState* st = RideSwingState(rAnim, clip);
+    if (!st) { _snprintf_s(out, cap, _TRUNCATE, "ogre=absent"); return; }
+    _snprintf_s(out, cap, _TRUNCATE, "ogre=found en=%d w=%.3f t=%.3f len=%.3f",
+                st->getEnabled() ? 1 : 0, st->getWeight(),
+                st->getTimePosition(), st->getLength());
+}
+
+// 🆕 T22: DRIVE the technique's own Ogre::AnimationState, which is the lever trips 18 and 19
+// opened by measuring `ogre=found` 31/31 - a technique clip with no AnimationData record still
+// owns a state (§17.10 / §19.4 / §21.5).  ClipPin can never reach these clips (43/44 have no
+// record at all, §19), so this is the only route to the motion the ENGINE would play, and the
+// only reason to want it is the trip-19 report: the pinned stand-in now plays whole, but
+// "这个动作实在不像挥砍" - 'mid blow' is not an attack clip and never will be one.
+//
+// ⚠️ ADDITIVE ONLY.  'mid blow' keeps its pin, its weight, its speed and its restart, because it
+// is the HOST that stops the engine rendering BIND (P4-1i / trip 17: assert nothing and the
+// straddle leg mask is handed back and the rider stands up).  Nothing that passed trips 18-19 is
+// bet on this working.  If the write is refused or ignored the close line reads en=0 / w=0.000
+// exactly as it does today and the ride behaves as it does today.
+//
+// ⚠️ Ogre does NOT advance a state by itself - whoever owns it calls addTime.  Kenshi advances
+// the ones IT drives (trip 18 caught the engine playing 'chop left-3' to t=0.251 then disabling
+// it), and it knows nothing about this one, so the time is written outright from the window's own
+// elapsed wall clock.  Writing it absolutely (rather than accumulating) also means a dropped
+// frame cannot desynchronise the arc from the window.
+static bool RideSwingDrive(AnimationClass* rAnim, const char* clip, DWORD elapsedMs)
+{
+    Ogre::AnimationState* st = RideSwingState(rAnim, clip);   // own string + SEH shell
+    if (!st) return false;
+    __try
+    {
+        // The whole arc inside the window, whatever the clip's own length is: 'bigchopv2' is
+        // 2.833 s and 'chop left-3' 1.067 s (§17.10 census) against a window that measured
+        // 1734..1846 ms at kRideSwingSpeed=2.5 (trip 19).  Playing them at 1.0x would show ~61%
+        // of the long one - the same half-slice complaint T21 just closed - so the phase, not the
+        // rate, is what gets driven.  Clamped at the end: a non-looping state holds its last pose.
+        // 🆕 T24 - COMPRESS ONLY, NEVER STRETCH.  kRideSwingTechMs is a ceiling from here on: fitting
+        // 'chop left-3' (1.067 s) into 1700 ms would be 1.6x SLOW MOTION, and T24 exists precisely to
+        // start selecting those shorter in-place records.  A clip that finishes early holds its last
+        // pose for the rest of the window (setLoop(false)), which reads as a follow-through; a clip
+        // played at 0.63x reads as a defect.  ⚠️ No-op for everything measured so far: 'bigchopv2'
+        // 2.833 s > 1.700 s, so trip 21's numbers are unaffected by this line.
+        float len = st->getLength();
+        if (len > 0.001f)
+        {
+            float fitMs = (float)kRideSwingTechMs;
+            if (len * 1000.0f < fitMs) fitMs = len * 1000.0f;
+            gRideSwingFitMs = (int)fitMs;
+            float f = (float)elapsedMs / fitMs;
+            if (f > 1.0f) f = 1.0f;
+            st->setLoop(false);
+            st->setTimePosition(len * f);
+        }
+        st->setEnabled(true);
+        st->setWeight(kRideSwingTechW);
+        // 🆕 T23: and give it the mask it has never had.  Idempotent on purpose - written every frame
+        // like every other assertion in this file, so it self-heals if the engine's own update
+        // rebuilds or resizes the mask mid-window.  `mine` decides the handback: destroy a mask we
+        // created, restore entries in one we did not (§21.2 - a leaked 0.0 here would clamp the
+        // PLAYER's own ground attacks, since an AnimationState belongs to this one entity).
+        unsigned short nb = rAnim->skeleton ? rAnim->skeleton->getNumBones() : 0;
+        if (nb)
+        {
+            if (!st->hasBlendMask())
+            {
+                st->createBlendMask(nb, 1.0f);
+                gRideSwingMaskMine = true;
+            }
+            int hn = 0;
+            for (int i = 0; i < kRideSwingHoldCount; ++i)
+            {
+                if (!gRideSwingHoldHas[i] || gRideSwingHoldHandle[i] >= nb) continue;
+                st->setBlendMaskEntry((size_t)gRideSwingHoldHandle[i], 0.0f);
+                ++hn;
+            }
+            gRideSwingHoldN = hn;
+        }
+        return true;
+    }
+    __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION
+                  ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH)
+    { return false; }
+}
+
+// Hand the state back the way it was found.  Called on the close edge AND from the per-ride
+// reset, so an abnormal end (dismount mid-window, knocked down, load) cannot leave a technique
+// enabled at weight 1 on a character that is no longer riding.
+static void RideSwingUndrive(AnimationClass* rAnim, const char* clip)
+{
+    Ogre::AnimationState* st = RideSwingState(rAnim, clip);
+    if (!st) return;
+    __try
+    {
+        // 🆕 T23: the mask goes back FIRST.  A 0.0 entry left on this state outlives the ride and the
+        // dismount - the same shape as the thigh leak §21.2, except the victim is the player's own
+        // ground swing (dead root ⇒ an attack that no longer steps into the blow).  Re-found by name
+        // on every call, so a rebuilt state set simply reads absent and there is nothing to leak.
+        unsigned short nb = rAnim->skeleton ? rAnim->skeleton->getNumBones() : 0;
+        if (st->hasBlendMask())
+        {
+            if (gRideSwingMaskMine) st->destroyBlendMask();
+            else
+                for (int i = 0; i < kRideSwingHoldCount; ++i)
+                    if (gRideSwingHoldHas[i] && (nb == 0 || gRideSwingHoldHandle[i] < nb))
+                        st->setBlendMaskEntry((size_t)gRideSwingHoldHandle[i], 1.0f);
+        }
+        gRideSwingMaskMine = false;
+        st->setWeight(0.0f);
+        st->setEnabled(false);
+    }
+    __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION
+                  ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH)
+    { }
+}
+
+// Find the live entry for a clip WITHOUT calling into the engine.  ClipPin (:6407) already walks
+// exactly these lists every frame in the shipping build, so this reuses a traversal that has survived
+// every trip since T14 and adds no new address.  (getAnimationPlaying(AnimationData*) does exist in
+// AnimationClass.h, but a brand-new engine call in the shipping path buys nothing over a walk we are
+// doing anyway.)  addList only - same rule as ClipPin's `mine`: an entry on the removeList is on its
+// way out and writing to it would be writing to a corpse.
+static AnimationClassBase::SingleAnimation* RideSwingFindEntry(AnimationClass* rAnim, AnimationData* ad)
+{
+    if (!rAnim || !ad || !rAnim->layer.valid()) return NULL;
+    unsigned int nl = rAnim->layer.size();
+    if (nl == 0 || nl > 32) return NULL;            // garbage/dangling guard, as in ClipPin
+    for (unsigned int li = 0; li < nl; ++li)
+    {
+        AnimationClassBase::AnimationLayer* lay = rAnim->layer[li];
+        if (!lay || !lay->addList.valid()) continue;
+        unsigned int n = lay->addList.size();
+        if (n > 64) continue;
+        for (unsigned int ai = 0; ai < n; ++ai)
+        {
+            AnimationClassBase::SingleAnimation* sa = lay->addList[ai];
+            if (sa && sa->animationData == ad) return sa;
+        }
+    }
+    return NULL;
+}
+
+// 🔑 THE trip-21 fix.  The pinned 'mid blow' entry outlives its window with currentFrameTime01
+// intact, so without this every swing after the first starts wherever the last one stopped (trip 18:
+// window 2 resumed at 0.518 where window 1 stopped at 0.517) - an arbitrary middle slice, and the
+// reason it read as 「右手给左手割腕」 rather than as a chop.  Called once per window, at the request
+// site, before runAnimation.
+//   * currentFrameTime / currentFrameTime01 are the fields the engine's own update drives, so they
+//     are what actually decides which frame plays; zeroing them IS the restart.
+//   * speed is written here as well as passed to runAnimation, because runAnimation only sets it when
+//     it creates the entry - and after the first window the entry already exists.
+//   * mainState->setTimePosition is belt-and-braces for ONE frame: the engine re-derives it from
+//     currentFrameTime01 next update, but this way even the first rendered frame of the window is the
+//     start of the clip instead of the stale pose.  Same pointer, same NULL check, same footing as
+//     ClipPin's mainState->setWeight (:6442) - the only write in here that reaches the render side.
+static bool RideSwingRestart(AnimationClass* rAnim, AnimationData* blow)
+{
+    __try
+    {
+        AnimationClassBase::SingleAnimation* sa = RideSwingFindEntry(rAnim, blow);
+        if (!sa) return false;
+        sa->currentFrameTime   = 0.0f;
+        sa->currentFrameTime01 = 0.0f;
+        sa->speed              = kRideSwingSpeed;
+        if (sa->mainState) sa->mainState->setTimePosition(0.0f);
+        return true;
+    }
+    __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION
+                  ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH)
+    { return false; }
+}
+
+// The genuinely NEW read this trip buys (the technique-side ogre= probe above was already in the
+// shipping build and trip 18 already answered it: ogre=found 17/17, en=0 17/17).  This one reads the
+// clip we actually pin, which no probe has ever looked inside:
+//   sp=   did the speed write survive the engine's next update, or does it re-impose 1.00?
+//   t01=  on the OPEN line this is the leftover the restart is there to erase (trip 18's ~0.52);
+//         on the CLOSE line it is where the clip really got to.
+//   olen= 'mid blow's true length, straight from Ogre.  Trip 18 could only DERIVE ~4.8 s from two
+//         prog readings and a stopwatch; this prints it, and every window-length number above is
+//         only as good as that estimate.
+// ⚠️ Read-only, and deliberately reads the SAME fields RideSwingRestart writes - that is what makes
+// the close line a verdict on the fix rather than a restatement of the intent.
+static void RideSwingProbePin(AnimationClass* rAnim, AnimationData* ad, char* out, size_t cap)
+{
+    if (!out || cap == 0) return;
+    out[0] = 0;
+    __try
+    {
+        AnimationClassBase::SingleAnimation* sa = RideSwingFindEntry(rAnim, ad);
+        if (!sa) { _snprintf_s(out, cap, _TRUNCATE, "pinst=none"); return; }
+        // ⚠️ EVERY key here is spelled differently from RideSwingProbeState's (en=/w=/t=/len=) even
+        // where it means the same thing, and the leading key is `pinst=` rather than `pin=` because
+        // the open line ALREADY carries pin='<clip name>'.  Both probes land on ONE log line, and
+        // HISTORY §U's parsing trap is exactly this: a repeated key makes a kv() reader silently
+        // return the wrong value.  Splitting on " | " is the judge's job, unique keys are the belt.
+        _snprintf_s(out, cap, _TRUNCATE, "pinst=live sp=%.2f pw=%.3f pdw=%.3f pt=%.3f t01=%.3f psw=%d",
+                    sa->speed, sa->weight, sa->desiredWeight,
+                    sa->currentFrameTime, sa->currentFrameTime01, sa->stillWanted ? 1 : 0);
+        size_t used = strlen(out);
+        if (used + 1 >= cap) return;
+        if (!sa->mainState) { _snprintf_s(out + used, cap - used, _TRUNCATE, " ostate=none"); return; }
+        _snprintf_s(out + used, cap - used, _TRUNCATE, " oen=%d ow=%.3f ot=%.3f olen=%.3f",
+                    sa->mainState->getEnabled() ? 1 : 0, sa->mainState->getWeight(),
+                    sa->mainState->getTimePosition(), sa->mainState->getLength());
+    }
+    __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION
+                  ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH)
+    { _snprintf_s(out, cap, _TRUNCATE, "pinst=AV"); }
+}
+
+// The once-per-frame owner of the window.  Called from CombatAndForceDismountPass and nowhere else,
+// for the reason in RideStanceRedraw's header: HaltAndForceSitPass is the last writer before render
+// and owns the pose pins, so an animation mutation belongs in the same pass - and at the same point
+// in the frame - where the P41E ladder has been calling runCombatAnimation all along.
+//
+// No SEH in this function: it builds std::string for its log lines, which C2712 forbids alongside
+// __try.  Every engine call it makes goes through one of the shells above, which is why they exist.
+//
+// ⚠️ ONE clock, and it times ATTEMPTS, not successes: chooseAttack is a deep engine call and this
+// runs in the shipping path, so asking once per kRideSwingMinGapMs (rather than once per frame
+// whenever the range test fails) is what keeps the cost bounded.  A swing may therefore be up to
+// that interval late, which is invisible next to a 3 s window.
+// ⚠️ `host` / `hostNm` are passed in rather than read as globals: gP41kGuard and kP41kGuardAnim are
+// declared further down the file, next to the clip-name constants, and this pass has to sit up here
+// beside the stance it belongs to.  🆕 T27: these used to be gP41kBlow / 'mid blow' - the clip the
+// window swapped ONTO the body.  Nothing swaps any more, so what is passed is the clip that is already
+// there: the guard.  Every read this pass takes off it (prog=, the pinst= block, the !host gate) is
+// therefore a statement about the body's ONE host, which is what trip 17 said a window must never be
+// without.
+static void RideSwingPass(Character* rider, Character* mount, AnimationClass* rAnim, bool stance,
+                          AnimationData* host, const char* hostNm)
+
+{
+    if (!rider) return;
+    if (rider != gRideSwingWho)
+    {
+        gRideSwingWho      = rider;
+        gRideSwingOpenTick = 0;
+        gRideSwingLastTick = 0;
+        gRideSwingWasOpen  = false;
+        gRideSwingRestartTick = 0;     // a stale latch could swallow the first window's restart
+    }
+
+    DWORD now  = GetTickCount();
+    // 🆕 T27 - the window closes on OUR clock again, and this time that is not a guess.  Trip 10's
+    // lesson (a fixed 1000 ms played only ~20% of 'mid blow') was about fitting a window to a CLIP
+    // whose length cannot be pre-read.  The stroke inside the window is the authored arc now, and its
+    // length is kRideSwingArcMs exactly, so kRideSwingWinMs = arc + settle tail restates our own table
+    // instead of guessing at someone else's clip.  The host is a LOOP, so its progress cycles: prog=
+    // below is INFORMATIONAL only (it is what the retired close test used to read).
+    float prog = (rAnim && host) ? rAnim->getAnimationProgress(host) : -1.0f;
+    // 🆕 T28 - `stance` belongs in the OPEN predicate, not only in the open DECISION.  The call site has
+    // always said "the pass has to be able to CLOSE a window it opened, and stance=false is what closes
+    // it" (the reason this pass is called unconditionally), but the predicate below only ever looked at
+    // the clock, so a fight that ended mid-window left the window nominally open: the mask kept freeing
+    // the two arm bones and RideSwingArmPose kept authoring them with the guard already gone from the
+    // body.  Trip 25 caught exactly that - 32 frames of arm=536 swfree=536 against hostkeep=504, and
+    // `pinst=none` on the close line - which is trip 17's hostless-skeleton disease for half a second.
+    // ⚠️ Safe against flicker BY CONSTRUCTION: this pass reads the stance with advance=false, and that
+    // form is sticky (raw || (mine && gRideStanceHold > 0)), so a one-frame dropout of the raw fight
+    // test cannot cut a window short.  Only the hold running out can, which is the intended meaning.
+    bool  open = (gRideSwingOpenTick != 0)
+              && stance
+              && ((now - gRideSwingOpenTick) < (DWORD)kRideSwingWinMs)
+              && ((now - gRideSwingOpenTick) < (DWORD)kRideSwingLenMs);
+
+    // ---- close edge ---------------------------------------------------------------------------
+    if (gRideSwingWasOpen && !open)
+    {
+        DWORD ms = now - gRideSwingOpenTick;   // ⚠️ read BEFORE the reset on the next line
+        gRideSwingOpenTick = 0;
+        // 🆕 T28: the capture dies with the window.  Keeping it would rotate the NEXT window off a pose
+        // the host has since left, which is the one way this model can produce a jump - and it would do
+        // it silently, because every self-check here is relative to the capture.
+        gRideSwingRefHave  = false;
+        RideSwingEnd(rAnim);
+        // Ungated and budgeted, the P43RD discipline: this CHANGES game state, and state-changing
+        // events are never debugContinuous-gated.  🆕 T27: the self-proving field is `hostkeep=` -
+        // the count of frames the pin pass saw a live window AND kept the guard as the body's host.
+        // ⚠️ It is deliberately NOT called `guardoff=` any more even though it is the same counter:
+        // that key meant "frames the guard assertion stood down", and printing the opposite meaning
+        // under the old name is how a reader gets silently misled.  hostkeep=0 with n>0 now means the
+        // window never reached the pin sites at all.  `prog=` is the guard LOOP's phase, so it only
+        // says the host was alive - the swing's own completion is `armt=`.  `ogre=` still answers trip
+        // 17's leftover question about the TECHNIQUE clip (which we no longer drive) - see
+        // RideSwingProbeState.  `ms=` near kRideSwingWinMs is now the EXPECTED close (the arc's clock),
+        // not the trip-18 failure mode; `rst=` is expected 0 because nothing restarts a loop.
+        // 🆕 T28: `noref=` is the arm's own refusal count - frames that wanted to author but could not
+        // resolve BOTH bones.  It must be 0: the two are freed by the same two resolve flags they are
+        // authored by, so a nonzero reading means a freed bone went unwritten (§17.9 at bind).
+        if (gRideSwingLines < kRideSwingLines)
+        {
+            ++gRideSwingLines;
+            char pr[96];
+            RideSwingProbeState(rAnim, gRideSwingName, pr, sizeof(pr));
+            char pn[192];
+            RideSwingProbePin(rAnim, host, pn, sizeof(pn));
+            char b[640];
+            _snprintf_s(b, 640, _TRUNCATE,
+                "Riding: P43SW close n=%d prog=%.3f ms=%u rst=%d drv=%d armt=%.2f noref=%d hold=%d "
+                "fit=%d hostkeep=%d tech=%d skip=%d noclip=%d | tech='%s' %s | %s f=%u",
+                gRideSwingCount, prog, (unsigned)ms, gRideSwingRestarts, gRideSwingDrv,
+                gRideSwingArmT, gRideSwingNoRef, gRideSwingHoldN, gRideSwingFitMs, gRideSwingGuardOff,
+                gRideSwingTech, gRideSwingSkip, gRideSwingNoClip, gRideSwingName, pr, pn, gP3Frames);
+            DebugLog(std::string(b));
+        }
+
+        // ⚠️ AFTER the log block and OUTSIDE its budget.  The close line's tech= en=/w=/t= block is
+        // the entire verdict on T22's drive, so undriving first would print the zeros this call
+        // writes; and a ride that has spent its 24 lines must still hand the state back.
+        RideSwingUndrive(rAnim, gRideSwingName);
+
+        gRideSwingWasOpen = false;
+        // ⚠️ Return on the close frame instead of falling through to the open decision.  Trip 10's
+        // hard finding is that a one-shot is only followed by the loop coming back if WE re-request
+        // it, so the frame after a close has to be a guard frame - otherwise back-to-back swings
+        // would keep the stance from ever being rebuilt, and the "did it come back" criterion (the
+        // NEXT open row) would have nothing to read.
+        return;
+    }
+    gRideSwingWasOpen = open;
+    if (open) return;                  // one swing at a time; the guard keeps the torso meanwhile
+
+
+    // ---- open decision ------------------------------------------------------------------------
+    if (!stance) return;               // the stance is the gate for everything on this route, so a
+                                       // big-mount rider can never reach here (MountCombatEligible
+                                       // runs first inside it) and neither can a rider out of a
+                                       // fight - the same gate the suppressor and the re-draw use.
+    // ⚠️ A paused game must not open a window: a pause freezes exactly what the interval measures
+    // (same discipline as the stance tail and ServicePendingMounts).
+    if (ou && ou->isPaused()) return;
+    if (gRideSwingLastTick != 0 && (now - gRideSwingLastTick) < (DWORD)kRideSwingMinGapMs) return;
+    gRideSwingLastTick = now;          // spent by the ATTEMPT, so a persistent skip or a faulting
+                                       // call cannot turn into a per-frame retry
+
+    RideSwingPick pick;
+    if (!RideSwingChoose(rider, mount, &pick)) return;
+    ++gRideSwingTech;
+
+    // The technique's own numbers decide the range.  A record with no opinion ('chop left-3' reads
+    // init 0.00 / minS -10.00) falls back to the weapon's reach, then to the stance's own distance
+    // gate - every one of those is an engine-supplied number rather than one of ours.  ⚠️ No slack
+    // term on purpose: if the enemy is never this close the log says skip=N, which is a readable
+    // result, where a fudge factor would silently paper over the real geometry.
+    // ⚠️ T24: these are the GATE question's numbers (RideSwingChooseImpl), NOT the clip's.  The gate
+    // asks about the real distance, so lim= still means "the engine would engage from here" and the
+    // rhythm stays the one trip 21 measured.  Judging the real d against the CLIP technique's
+    // opinion would be a category error: that question was deliberately asked about min(d, reach),
+    // so its answer is usable at that distance BY CONSTRUCTION and would skip every window
+    // ('downward combo' reads init 10.00 against a structural d of 12..25).
+    float lim = pick.init;
+    if (lim <= kRideSwingNoOpinion) lim = pick.minS;
+    if (lim <= kRideSwingNoOpinion) lim = pick.reach;
+    if (lim <= kRideSwingNoOpinion) lim = kRideThreatDist;
+    gRideSwingLastLim = lim;
+    if (gRideSwingMinD < 0.0f || pick.d < gRideSwingMinD) gRideSwingMinD = pick.d;
+    if (pick.d > lim) { ++gRideSwingSkip; return; }
+
+    // ⚠️ NEVER open a window without a host on the body.  This is the whole lesson of trip 17: strip
+    // the skeleton of its host and the leg mask has nothing to blend against, so the rider stands up
+    // on the mount's back.  🆕 T27 changes WHICH clip that is, not the rule: the window no longer
+    // swaps 'mid blow' in, so the host it needs is the guard that is already playing - resolved on the
+    // stance's first frame in HaltAndForceSitPass, which normally beats this pass.  If that has not
+    // happened yet, or the clip is genuinely absent from this rider's table, the swing is skipped,
+    // counted, and the stance keeps the body.
+    if (!host) { ++gRideSwingNoClip; return; }
+
+    gRideSwingOpenTick = now;
+    gRideSwingWasOpen  = true;
+    ++gRideSwingCount;
+    gRideSwingHoldN    = 0;   // T23: per WINDOW, or a window whose state came back absent would
+    gRideSwingFitMs    = 0;   // report the previous window's hold count (T24: and its fit=) on its
+    gRideSwingArmT     = -1.0f;   // close line.  T25: armt= likewise - it is the arc's own progress,
+                                  // so carrying it over would report the last window's completion
+    gRideSwingNoRef    = 0;   // 🆕 T28: same rule for noref=, and belt-and-braces for the capture flag -
+    gRideSwingRefHave  = false;   // the close edge clears it, but an open that follows a ride reset
+                                  // (Mount / RestoreRideAfterLoad) never saw a close edge at all.
+    // Remembered for the close line's read-only Ogre probe: it is the TECHNIQUE the engine chose,
+    // which is NOT what we pin.  That gap is exactly what the probe measures.
+    _snprintf_s(gRideSwingName, sizeof(gRideSwingName), _TRUNCATE, "%s", pick.name);
+
+    // `n=` is the self-proving field of the open line: n=0 for a whole ride means no swing was ever
+    // fired, so "I did not see a swing" would say nothing about this route.
+    // T21's `pre=` block is the BEFORE half of the pinned entry's state, sampled here at the open
+    // decision - i.e. before the request site has run for this window.  🆕 T27: it now samples the
+    // GUARD, which has been playing since the stance began, so pre=none would be news (the stance's
+    // own host missing) rather than the routine n=1 reading it used to be, and its t01= cycles with
+    // the loop instead of proving a restart.  What still makes the pair worth printing is `w=`: guard
+    // weight at open vs at close is the direct read on whether holding the host through the window
+    // costs the stance anything.
+    if (gRideSwingLines < kRideSwingLines)
+    {
+        ++gRideSwingLines;
+        char pr[96];
+        RideSwingProbeState(rAnim, pick.name, pr, sizeof(pr));
+        char pn[192];
+        RideSwingProbePin(rAnim, host, pn, sizeof(pn));
+        char b[640];
+        _snprintf_s(b, 640, _TRUNCATE,
+            "Riding: P43SW open n=%d tech='%s' gate='%s' dq=%.2f init=%.2f minS=%.2f lim=%.2f "
+            "d=%.2f reach=%.2f | pin='%s' %s | pre %s f=%u",
+            gRideSwingCount, pick.name, pick.gate, pick.dq, pick.init, pick.minS, lim, pick.d,
+            pick.reach, hostNm ? hostNm : "", pr, pn, gP3Frames);
+        DebugLog(std::string(b));
+    }
+}
+
 // ---- P4-3-2: kill the re-sheathe instead of compensating for it -----------------------------
 // P4-3 step 1 named two writers, both engine trunks: Character::_ragdollMode (real=16 per ride,
 // median gap 22 frames) and Character::_carryMode(on=true) (real=3, ~once per mount), addresses
@@ -3224,6 +4055,11 @@ static void ApplyRiderOrientation(Character* rider, const SeatInfo& seat, Charac
     // swivelling mid-run.  Nearly stationary -> HOLD last heading; never moved yet ->
     // fall back to body-bone forward.
     static const float kHeadingMoveEps = 0.03f;   // per-frame horizontal move to count as "traveling"
+    // ⚠️ Same-hemisphere test between the travel delta and the animal's OWN facing (2026-09-02,
+    // trip 19 report).  0.0f is the only value here that is not invented: it means "the delta is
+    // going the opposite way from where the body points".  Tighten it (0.25 ~= 75 deg) only if a
+    // SIDEWAYS shove gets reported next - a pure sidestep reads dot ~= 0 and is NOT vetoed here.
+    static const float kHeadingFaceMinDot = 0.0f;
     Ogre::Vector3 fwd(0.0f, 0.0f, 1.0f);
     bool haveFwd = false;
     CharMovement* mv = mount->getMovement();
@@ -3238,7 +4074,25 @@ static void ApplyRiderOrientation(Character* rider, const SeatInfo& seat, Charac
             if (d.length() > kHeadingMoveEps)   // moving: refresh the travel heading
             {
                 d.normalise();
-                mountHeadingDir[mount] = d;
+                // ⚠️ Veto a heading that fights the animal's own facing.  Trip 19 report:
+                // "人物在牛背上打架的时候会突然转向牛屁股的方向".  In a fight the mount backs
+                // off, gets knocked back and sidesteps WITHOUT turning its body, so the position
+                // delta reverses while the body does not - and the rider, whose facing IS that
+                // delta, swings round to look at the mount's rear.  kHeadingMoveEps is 0.03 per
+                // frame (~1.8 u/s at 60 fps), so even a shove is enough to refresh it, and the
+                // nlerp below only makes the spin smooth instead of instant.
+                // getFacingDirection() is the engine's own answer to "where is this animal
+                // pointing" (:2499, non-virtual, cannot degenerate), so it is used as an ARBITER,
+                // never as a new facing source: refresh only while the two agree on the
+                // hemisphere, otherwise HOLD the last good heading - which is exactly what
+                // already happens while the mount stands still.  An animal walks where it
+                // points, so on every ordinary frame dot > 0 and nothing changes.
+                Ogre::Vector3 face;
+                if (!GetMountFacingDirection(mount, face)
+                    || d.dotProduct(face) > kHeadingFaceMinDot)
+                    mountHeadingDir[mount] = d;
+                else
+                    ++gRideHeadVeto;
             }
         }
         mountHeadingPos[mount] = cur;
@@ -4149,6 +5003,12 @@ static int            gP41kBudget   = 0;      // weight-sample lines per ride
 // which is TASK.md P4-3 step 3, not a periodic timer.  Full trip-10 readings: TASK.md, and
 // HISTORY §U for the removed code's shape.  'mid blow' itself stays RESOLVED below - that one
 // resolve line is the standing evidence that the rider's own table holds a real swing.
+// ⛔ 2026-09-03, T27: nothing REQUESTS 'mid blow' any more either.  T20/T21 brought the swap back and
+// it shipped for four rungs; trip 24 ruled it out for what it drove BESIDE the arm (left arm, right
+// wrist, spine - it is a two-handed knockdown record), so the guard is the host for the whole window
+// now and gP41kBlow is once again resolve-only.  The three mechanisms above are still the standing
+// constraints on any future ClipPin work; the first two simply no longer apply to this route, because
+// this route no longer pins a one-shot at all.
 
 // Existence-checked lookup.  getAnimationData() has operator[] semantics and inserts a NULL
 // into the engine's own allAnims on a miss, so a name that might be absent must never reach it
@@ -4269,6 +5129,31 @@ static const int          kLegPoseBoneCount   = 6;
 static const int          kLegBoneThighFirst  = 0;   // [0,2)
 static const int          kLegBoneCalfFirst   = 2;   // [2,4)
 static const int          kLegBoneSpineFirst  = 4;   // [4,6)
+
+// 🆕 T23 - the HOST's half of the split, ⚠️ CUT DOWN TO THE ARM BY T25 (2026-09-03, trip 22).
+// These are the bones the host must let go of WHILE A WINDOW IS OPEN: zeroed on every weighted clip
+// for the duration, back to 1.0 the frame it closes.  Written by LegMaskApply, which is already
+// idempotent-per-frame and already hands its entries back on dismount, so this rides on machinery
+// whose leak discipline is settled (§21.2) instead of adding a second table of tracked states.
+//   ⚠️⚠️ THE RULE THAT SIZES THIS TABLE: a bone in here has NO contributor unless somebody writes it.
+// T23/T24 listed eleven (Spine/Neck/Head/both Clavicles/UpperArms/Forearms/Hands) because a whole
+// ground technique clip was being driven onto them.  Trip 22 ruled that clip out for good - a
+// ground record is authored around a standing pelvis and reads 「刀砍不出去，只能在自己肚子那块拉，
+// 动作都挤成一团了」 no matter which record the engine names - and the user's ruling with it:
+// 「不一定非要和原版一样，只要像骑砍那样挥砍的动作就行」.  So the swing is AUTHORED now
+// (RideSwingArmPose) and this table must be exactly the set of bones that authoring writes:
+// the right UpperArm and Forearm.  Everything else goes straight back to the host, which is what
+// un-cramps the torso - and 'Bip01 Spine' leaving this list is why the spine group below is back to
+// `ours = spineMask` alone (P4-1M's twist is the only writer there again).
+//   * The HAND is deliberately NOT here: the blade hangs off it, so leaving the wrist to the host
+//     keeps the grip and the blade's orientation relative to the forearm sane while our arc supplies
+//     the sweep.  Finger bones are in no list at all, same reason.
+static const char* kRideSwingFreeBones[] = {
+    "Bip01 R UpperArm", "Bip01 R Forearm"
+};
+static const int          kRideSwingFreeCount = 2;
+static bool               gRideSwingFreeHas[kRideSwingFreeCount];
+static unsigned short     gRideSwingFreeHandle[kRideSwingFreeCount];
 
 // ---- P4-1M torso side-twist -------------------------------------------------------------
 // The player's requirement: "地面是往正前方砍，我们应该往侧方，测前方砍" - a ground fighter
@@ -4544,7 +5429,8 @@ static void LegMaskTrack(Ogre::AnimationState* st, bool mine, const char* clip)
 // masked to 0 - a bone we are not holding must stay at 1.0 so it keeps receiving its track
 // (that is the borrowed-knee-bend path, and the same rule now covers the spine, which is only
 // ours while the torso twist is engaged).
-static int LegMaskApply(AnimationClass* rAnim, unsigned short nb, bool calfMask, bool spineMask)
+static int LegMaskApply(AnimationClass* rAnim, unsigned short nb, bool calfMask, bool spineMask,
+                        bool swingFree)
 {
     if (!rAnim || !rAnim->layer.valid() || nb == 0) return 0;
     unsigned int nl = rAnim->layer.size();
@@ -4574,9 +5460,18 @@ static int LegMaskApply(AnimationClass* rAnim, unsigned short nb, bool calfMask,
                 bool ours;
                 if (i < kLegBoneCalfFirst)       ours = true;        // thighs: always
                 else if (i < kLegBoneSpineFirst) ours = calfMask;    // calves: on replay
-                else                             ours = spineMask;   // spine: while twisting
+                else ours = spineMask;                               // spine: only when twisting
                 sa->mainState->setBlendMaskEntry((size_t)gLegPoseHandle[i],
                                                  ours ? 0.0f : 1.0f);
+            }
+            // 🆕 T23: the host's upper body, ours only for the length of a swing window.  Same
+            // write-every-frame rule, which is what returns them to 1.0 on the close frame without a
+            // close-edge hook of their own; LegMaskRelease covers a ride that ends mid-window.
+            for (int i = 0; i < kRideSwingFreeCount; ++i)
+            {
+                if (!gRideSwingFreeHas[i] || gRideSwingFreeHandle[i] >= nb) continue;
+                sa->mainState->setBlendMaskEntry((size_t)gRideSwingFreeHandle[i],
+                                                 swingFree ? 0.0f : 1.0f);
             }
             ++touched;
         }
@@ -4652,6 +5547,13 @@ static void LegMaskRelease(AnimationClass* rAnim, unsigned short nb)
             for (int i = 0; i < kLegPoseBoneCount; ++i)
                 if (gLegPoseHas[i] && (nb == 0 || gLegPoseHandle[i] < nb))
                     st->setBlendMaskEntry((size_t)gLegPoseHandle[i], 1.0f);
+            // 🆕 T23: and the swing's upper-body entries.  A ride that ends INSIDE a window (dismount,
+            // knocked down, load) leaves them at 0.0, and LegMaskApply is not going to run again to
+            // put them back - that is a leak with a visible symptom (a walking character whose arms
+            // and head stay at bind).
+            for (int i = 0; i < kRideSwingFreeCount; ++i)
+                if (gRideSwingFreeHas[i] && (nb == 0 || gRideSwingFreeHandle[i] < nb))
+                    st->setBlendMaskEntry((size_t)gRideSwingFreeHandle[i], 1.0f);
         }
     }
     gLegMaskedCount = 0;
@@ -4702,10 +5604,488 @@ static int LegMaskResidueCount(AnimationClass* rAnim)
                     if (sa->mainState->getBlendMaskEntry((size_t)gLegPoseHandle[i]) < 0.999f)
                         ++residue;
                 }
+                // 🆕 T23: the swing's upper-body entries are audited by the same counter, because they
+                // leak the same way and the audit runs after the release either way.
+                for (int i = 0; i < kRideSwingFreeCount; ++i)
+                {
+                    if (!gRideSwingFreeHas[i]) continue;
+                    if ((size_t)gRideSwingFreeHandle[i] >= bmn) continue;
+                    if (sa->mainState->getBlendMaskEntry((size_t)gRideSwingFreeHandle[i]) < 0.999f)
+                        ++residue;
+                }
             }
         }
     }
     return residue;
+}
+
+// ---- P4-3-4g/4h: AUTHOR the swing instead of borrowing one ---------------------------------
+// ⚠️ THE RULING THAT PUT THIS HERE (trip 22, 2026-09-03).  Three rungs tried to play one of the
+// engine's own attack records on a rider: pin a record-backed stand-in ('mid blow', T20/T21), drive
+// the named technique's own Ogre state (T22/T23), then ask the engine for an IN-PLACE technique
+// instead of its closing one (T24).  T24's mechanism worked - the second question returned a
+// different record and it reached the skeleton - and the eyeball verdict was still
+// 「不是劈砍…平地上的动作在马上用有些放不开，刀砍不出去，只能在自己肚子那块拉，动作都挤成一团了」.
+// That is not a mixing problem and not a selection problem: a ground record is authored around a
+// standing pelvis with the shoulders free to travel, and a seated pelvis crushes it.  The user's
+// ruling closes the whole family: 「我们要的其实不一定非要和原版一样，只要像骑砍那样挥砍的动作就行」
+// ⇒ fidelity to vanilla is no longer a requirement, a readable sabre arc is.
+//
+// So: hand-write the right arm, exactly the way the straddle has hand-written the thighs since
+// P2-1b (§16).  Same machine, same three rules - manual control + a blend-mask 0 on every weighted
+// clip (a manually controlled bone survives Skeleton::reset() but STILL receives
+// NodeAnimationTrack::applyToNode, so only the mask protects it), write every frame at the
+// pre-render point, hand back on the close edge and on dismount.
+//   * ⛔ WHAT TRIP 23 KILLED (2026-09-03), and it was not the arc: the first version authored JOINT
+//     ANGLES about each bone's own bind axes (abd/flx/elbow).  Every mechanical criterion passed -
+//     kept=1.0000 on 51/51 samples, arm= on every ride, spans of 7.5..9.1 on a 6.09 arm, armback
+//     man=0x00 minDot=1.0000, zero AV - and the eyeball verdict was 「更像是往下戳，位移像 \ 這個符號」.
+//     `python tools\armarc.py --log <trip23 log>` says why with no model at all: two frames inside ONE
+//     window wrote the SAME three angles (-25/10/-55) and the hand landed 72.3 deg apart, while
+//     |measured|/|predicted| never left 1.04 (so the arm's own geometry was right all along).  A
+//     bind-relative angle only fixes a bone against its PARENT, and the parent here - clavicle,
+//     spine - is host-driven by 'mid blow' at speed 2.5; the shoulder itself travelled 3.0/4.8/5.1
+//     units during the window.  The screen was therefore showing our arc TIMES the host's torso
+//     sweep.  ⇒ authored angles are structurally the wrong parameterisation on a moving torso.
+//   * ✅ WHAT REPLACED IT (T26): author DIRECTIONS IN SKELETON SPACE.  Aim each bone's local +X (which
+//     §16 measured to be the bone axis, and --bind confirms: both child offsets are pure +X,
+//     (2.849,0,0) and (3.244,0,0)) along an authored direction by cancelling whatever its parent is
+//     doing - local = conj(parentDerived) * aim.  (Only the UpperArm reads a parent back; the Forearm's
+//     parent IS the UpperArm, whose derived orientation after our write is its own aim by construction,
+//     so the pair needs exactly one node read and no fresh-cache assumption.)  The host may then heave
+//     the torso as much as it likes; the stroke does not move with it, and the hand sits at exactly
+//     2.849*dirUpper + 3.244*dirForearm.  That makes tools\armarc.py's arithmetic the same arithmetic
+//     the game runs, so the shape is known before the DLL is built - and the log carries its own
+//     falsifier: want= is the intended vector, dot= is intended vs measured, and dot < 0.99 means
+//     this paragraph is wrong (also the one thing that would catch a bad _getDerivedOrientation
+//     vtable slot).
+//   * ✅ TRIP 24 CONFIRMED THIS PARAGRAPH (2026-09-03): dot= mean 0.9920 over 36 samples, the only
+//     sub-0.9 sample being a window's FIRST frame (kept=-1.0000, no derived transform recomputed yet),
+//     kept= worst 0.9998, len= exactly 2.85/3.24 off the live skeleton, want= spans 6.40/6.07/8.81
+//     against the table's 6.20/6.09/8.93, armback clean, zero AV.  Eyeball: 「有点劈砍的意思了」.
+//   * 🆕 T27 - WHAT STILL WENT WRONG, AND IT IS NOT THE ARM.  Same trip: 「我猜测动作奇怪的原因是我们想要
+//     的骑砍动作姿势应该是单手劈砍，但是角色的右手总是想找左手因为原版就是双手劈砍的，所以把动作带崩了」.
+//     One step off on the mechanism (the right HAND's position is ours - that is what dot=0.9920 means),
+//     dead right on the cause: the window was still SWAPPING 'mid blow' onto the body as its host, and
+//     that record drove everything the arc does not - the LEFT arm, the right WRIST, the SPINE.  It is
+//     one of six `blow` records, all of them 'whole,action,norm,reloc,restrict' knockdown heavy strikes
+//     (doc.md:245) = a two-handed committed strike, so the left hand kept reaching across for a hilt
+//     the arc had already carried away.  ⇒ the window stops swapping.  'guard 1h' (UPPER, LOOP,
+//     weaponTypeFlags 0x04 = one-handed, no whole/reloc, doc.md:248) is the host all the way through,
+//     which is also the strongest possible answer to §17.9: the body is never hostless for one frame.
+//     Costs: the window must close on OUR clock (kRideSwingWinMs - a loop has no progress to close on)
+//     and the torso no longer whips at all.  If the verdict is 「太僵」 the answer is P4-1M's own spine
+//     twist (:6295), NOT a ground record coming back - trip 22 closed that family.
+// 🆕 T28/T29 - ONE RIGID ROTATION, RETIRED HERE (why it was built, and trip 25's 「正手变反手」/
+// 「大臂旋转小臂不动」 that forced it, are in HISTORY §V; the axis derivation and the six-key arc table
+// went with them).  It delivered: elbow frozen by construction, 正手 stays 正手, and trip 26 read on
+// screen as 「侧面张开大臂带动刀，简单美观」 with both model-free witnesses far past threshold.
+// ⇒ ITS CEILING IS GEOMETRIC, NOT A TUNING PROBLEM.  A rigid rotation moves the hand on a CIRCLE and
+// leaves the elbow exactly where it was found - witness 1 measured precisely that (`r=` span 0.000 over
+// 13 windows).  But every `chop` Kenshi ships bends the elbow 62..80 deg (`skelanims.py --sweep chop`),
+// so the shape an eye reads as a chop is not on any circle and NO arc table can reach it.  Axis and angle
+// profile were the model's only two dials and both were spent; there was no third one inside it.
+// 🆕 T30 - PLAY THE VANILLA CURVE, TWO BONES, AS A DELTA ON THE CAPTURED POSE.  Ogre stores every
+// keyframe rotation RELATIVE TO THE BONE'S BINDING POSE (local = bind * key, RE_NOTES §19.7) - the same
+// space Bone::setOrientation takes - so `chop down`'s own shoulder and elbow curves can be read OFFLINE
+// out of male_skeleton.skeleton and replayed by OUR writer under OUR bone mask.  ⚠️ This is NOT trip 22's
+// dead family: nothing here drives an engine AnimationState, nothing plays an ANIMATION record, nothing
+// asks the animation system for anything.  Two float tables and a lerp.
+//   local_upper(t) = capturedUpperLocal * Xu(t),   Xu(t) = conj(Ku(0)) * Ku(t)   <- kRideSwingBakeUp
+//   local_fore (t) = capturedForeLocal  * Xf(t),   Xf(t) = conj(Kf(0)) * Kf(t)   <- kRideSwingBakeFo
+// Both tables START AT IDENTITY, so §17.19's 「窗口开在屏幕上已有的姿势上」 survives verbatim - the one
+// property T28 was built to get, and the reason the ABSOLUTE form (local = bind * K(t), vanilla's own
+// frame, the shape the user already accepts on foot) was rejected: measured offline it opens 33.0 deg /
+// 19.0 deg away from the pose on screen = a 3.2 unit hand jump that only a cross-fade could hide.
+// ⚠️ AND IT RETIRES THE PARENT READ-BACK.  A local write needs no conj(parentDerived), so the 7.3 deg
+// settled dot= residual that trips 24->25->26 differenced down to "one frame of stale R Clavicle" has no
+// path into the POSE any more - it survives only in the logged dot=, where the read still happens.
+// The price paid for that: the cut plane now rides the torso instead of being fixed in skeleton space.
+// That is the correct sign for a chop (vanilla authors locals for exactly this reason) and it is measured,
+// not assumed - the anchor block above shows the torso frame itself moving 0..39 deg between windows.
+// ⚠️ WHAT THE DELTA FORM COSTS, STATED UP FRONT: vanilla's stroke is RE-BASED onto whatever pose the
+// saddle guard happens to be holding, so its on-screen direction is that re-basing's, not the standing
+// clip's.  Trip 23 (「往下戳」) is the standing precedent for a correctly measured curve pointing the wrong
+// way ⇒ the direction was PREDICTED OFFLINE, before this build, against trip 26's own log:
+//   `python tools\armarc.py --bake "chop down" --ref-log <trip 26 log>`
+// anchors the offline arm on each window's first measured R Hand frame (bx=/bz= give a full orthonormal
+// frame; out=/fore=/down= on the same row give the target) and lands |err| 0.01..0.03 u on all six
+// windows against r = 5.42 - i.e. ~0.5%, with NOTHING fitted.  The stroke it then predicts, in the game's
+// own frame, is the accept test for this build:
+//   t=0.000  out  1.84 fore  3.69 down  3.52  r 5.42  elbow 126   the pose already on screen
+//   t=0.276  out -1.16 fore -0.32 down -4.94  r 2.90  elbow  56   cocked high AND FOLDED - the fold is
+//                                                                 the point: r travels 2.52 units
+//   t=0.387  out  2.31 fore  3.63 down  1.64  r 5.42  elbow 125   through, arm extended again
+//   t=0.690  out  1.79 fore  4.11 down  1.38  r 4.46  elbow  94   follow-through = vanilla's last key
+//   t=1.000  identity, i.e. back on the captured pose (ONE synthetic key, marked in the table)
+// cut = 6.58 vertical / 3.47 lateral / 3.95 forward (vert/lat 1.90, between T28's accepted 0.83 and
+// T29's 2.17) over 155 ms, chord 8.43 = 54.5 u/s = 1.80x T29's cut - because this is VANILLA'S TEMPO,
+// not a tempo anybody chose.
+// ⚠️ THE ONE OTHER THING THAT MOVED, SAID OUT LOUD: the cut now LANDS 541 ms into the window, where
+// T28's and T29's landed at 1092.  Native tempo puts vanilla's own 387 ms wind-up and 155 ms cut exactly
+// where vanilla puts them and still leaves 433 ms of settle inside kRideSwingArcMs.  1092 was never
+// measured against anything the engine does - it was T29's through-key, kept only to hold the previous
+// trip's one variable still.  If the verdict is 「太早」 or 「和伤害不同步」 the fix is NOT a reshape: it is
+// `python tools\armarc.py --bake "chop down" --map lead`, which slides this same table so the cut lands
+// at 1092 again (and prints what that costs the settle: the clip's last key moves to t=1.084, i.e. the
+// return would be clipped and the handback pop would come back at ~19 deg).
+// ⚠️ THE TABLES BELOW ARE GENERATED, NOT AUTHORED.  Do not hand-edit a row.  `python tools\armarc.py
+// --mirror` RE-BAKES the clip out of male_skeleton.skeleton and diffs every value against these arrays
+// (and the two Keys constants against the row counts), so a hand tweak reads as drift and every armarc
+// mode refuses to report - which is STRICTLY STRONGER than the AXIS/ARC2 hand-mirror it replaces:
+// nothing is copied by hand twice any more, the checker derives its side from the asset.
+// ⚠️ THE FOREARM CURVE IS A PURE HINGE - x and z are exactly 0.0 on all 26 keys, i.e. rotation about the
+// bone's own -Y and nothing else.  That is why the grip survives WITHOUT freezing the elbow: a rotation
+// whose axis is perpendicular to the bone axis induces no twist ABOUT that axis, so 'Bip01 R Hand'
+// (host-driven, in neither mask table by design) keeps the roll it was captured with.  T28 bought 正手 by
+// freezing the elbow; T30 buys it from the hinge, and the elbow is free again.
+// ⚠️ THIS RETIRES T28'S TWO WITNESSES BY CONSTRUCTION: `r=` span 0.000 and a flat angle(bx,arm) were what
+// "the elbow cannot move" looked like.  T30's witnesses have the OPPOSITE SIGN - r= and elbow= must SPAN
+// (offline: 2.52 units and 69 deg within one window) - plus offline-predicted vs measured hand path.
+// Xu(t) and Xf(t): `chop down`'s own 26 keys, delta-form, sign-aligned at bake time so the lerp below
+// can stay dumb (the DISK is not sign-aligned - the forearm track flips between keys 1 and 2 - and an
+// unaligned pair would take the long way round).  Columns: t (0..1 over kRideSwingArcMs), then w, x, y, z.
+// Row 26 of each is SYNTHETIC: the clip's last key sits at t=0.6905 = 967 ms, and this one returns the
+// bone to the captured pose over the remaining 433 ms.  ⚠️ Generated by `armarc.py --bake`; see above.
+static const float kRideSwingBakeUp[][5] = {   // Bip01 R UpperArm
+    //   t            w           x           y           z
+    { 0.0000f,  1.000000f,  0.000000f,  0.000000f,  0.000000f },
+    { 0.0276f,  0.996091f,  0.041457f,  0.013614f,  0.076800f },
+    { 0.0552f,  0.980960f,  0.162531f, -0.044914f,  0.096351f },
+    { 0.0829f,  0.887895f,  0.363582f, -0.279021f, -0.039968f },
+    { 0.1105f,  0.664417f,  0.524255f, -0.506345f, -0.165295f },
+    { 0.1381f,  0.435946f,  0.572361f, -0.642998f, -0.262502f },
+    { 0.1657f,  0.229601f,  0.527301f, -0.733854f, -0.361518f },
+    { 0.1933f,  0.108150f,  0.451166f, -0.785305f, -0.409938f },
+    { 0.2210f,  0.120724f,  0.372523f, -0.828832f, -0.399612f },
+    { 0.2486f,  0.224553f,  0.289659f, -0.852093f, -0.373647f },
+    { 0.2762f,  0.401845f,  0.223365f, -0.815513f, -0.351522f },   // cock: r 2.90, elbow 56
+    { 0.3038f,  0.652823f,  0.158106f, -0.671783f, -0.312304f },
+    { 0.3314f,  0.832258f,  0.142540f, -0.459422f, -0.275609f },
+    { 0.3590f,  0.979448f,  0.090332f, -0.090176f, -0.156175f },
+    { 0.3867f,  0.988246f,  0.108315f,  0.033292f, -0.102611f },   // through: r 5.42, elbow 125
+    { 0.4143f,  0.986522f,  0.134417f,  0.022760f, -0.090490f },
+    { 0.4419f,  0.985148f,  0.147578f, -0.004617f, -0.087658f },
+    { 0.4695f,  0.984804f,  0.146037f, -0.026236f, -0.090264f },
+    { 0.4971f,  0.984535f,  0.137849f, -0.047419f, -0.097168f },
+    { 0.5248f,  0.985682f,  0.126456f, -0.055323f, -0.096849f },
+    { 0.5524f,  0.986727f,  0.116047f, -0.061578f, -0.095456f },
+    { 0.5800f,  0.987381f,  0.108092f, -0.068076f, -0.093606f },
+    { 0.6076f,  0.987532f,  0.102063f, -0.076653f, -0.092138f },
+    { 0.6352f,  0.986333f,  0.097729f, -0.093538f, -0.094061f },
+    { 0.6629f,  0.985768f,  0.093432f, -0.103501f, -0.093920f },
+    { 0.6905f,  0.985420f,  0.088002f, -0.112591f, -0.092343f },   // vanilla's last key
+    { 1.0000f,  1.000000f,  0.000000f,  0.000000f,  0.000000f }    // SYNTHETIC settle - not from the clip
+};
+static const int kRideSwingBakeUpKeys = 27;
+
+static const float kRideSwingBakeFo[][5] = {   // Bip01 R Forearm - x and z are exactly 0: a pure hinge
+    //   t            w           x           y           z
+    { 0.0000f,  1.000000f,  0.000000f,  0.000000f,  0.000000f },
+    { 0.0276f,  0.980113f,  0.000000f, -0.198438f,  0.000000f },
+    { 0.0552f,  0.895055f,  0.000000f, -0.445955f,  0.000000f },
+    { 0.0829f,  0.827780f,  0.000000f, -0.561052f,  0.000000f },
+    { 0.1105f,  0.823227f,  0.000000f, -0.567713f,  0.000000f },
+    { 0.1381f,  0.877018f,  0.000000f, -0.480456f,  0.000000f },
+    { 0.1657f,  0.949341f,  0.000000f, -0.314248f,  0.000000f },
+    { 0.1933f,  0.985244f,  0.000000f, -0.171153f,  0.000000f },
+    { 0.2210f,  0.993028f,  0.000000f, -0.117879f,  0.000000f },
+    { 0.2486f,  0.994411f,  0.000000f, -0.105576f,  0.000000f },
+    { 0.2762f,  0.993916f,  0.000000f, -0.110136f,  0.000000f },
+    { 0.3038f,  0.991797f,  0.000000f, -0.127824f,  0.000000f },
+    { 0.3314f,  0.981459f,  0.000000f, -0.191670f,  0.000000f },
+    { 0.3590f,  0.965756f,  0.000000f, -0.259452f,  0.000000f },
+    { 0.3867f,  0.971196f,  0.000000f, -0.238279f,  0.000000f },
+    { 0.4143f,  0.977331f,  0.000000f, -0.211718f,  0.000000f },
+    { 0.4419f,  0.979153f,  0.000000f, -0.203124f,  0.000000f },
+    { 0.4695f,  0.981446f,  0.000000f, -0.191738f,  0.000000f },
+    { 0.4971f,  0.984463f,  0.000000f, -0.175592f,  0.000000f },
+    { 0.5248f,  0.986269f,  0.000000f, -0.165147f,  0.000000f },
+    { 0.5524f,  0.987619f,  0.000000f, -0.156872f,  0.000000f },
+    { 0.5800f,  0.988765f,  0.000000f, -0.149476f,  0.000000f },
+    { 0.6076f,  0.989808f,  0.000000f, -0.142405f,  0.000000f },
+    { 0.6352f,  0.991546f,  0.000000f, -0.129756f,  0.000000f },
+    { 0.6629f,  0.992640f,  0.000000f, -0.121102f,  0.000000f },
+    { 0.6905f,  0.993931f,  0.000000f, -0.109999f,  0.000000f },
+    { 1.0000f,  1.000000f,  0.000000f,  0.000000f,  0.000000f }    // SYNTHETIC settle - not from the clip
+};
+static const int kRideSwingBakeFoKeys = 27;
+static const int   kRideSwingArcMs   = 1400;  // arc length.  SHORTER than the window on purpose: trip
+                                              // 23 measured windows of 1437..1781 ms and the one
+                                              // 1437 ms window cut the 1700 ms arc off at t=0.85.  At
+                                              // 1400 the arc always finishes and then HOLDS its last
+                                              // key, which (T30: the SYNTHETIC settle row) is also
+                                              // the pose the handback wants to be in.
+                                              // 🆕 T27: the window is no longer whatever a clip's
+                                              // progress happened to give (1437..1781) - it is
+                                              // kRideSwingWinMs = 1650 = this + a 250 ms hold on that
+                                              // last key.  ⚠️ Raise this and kRideSwingWinMs must rise
+                                              // with it, or the arc gets cut again; and armarc.py's
+                                              // ARC_MS/WIN_MS must be edited in the same commit
+                                              // (`armarc.py --mirror` checks both, plus both tables).
+static const int   kRideSwingArmLines = 30;   // per-ride budget for the SWING arm sample lines.  🆕 T28
+                                              // raised it from 18: r= and elbow= are judged WITHIN one
+                                              // window, so a window that spends 3 samples on a 1400 ms
+                                              // arc cannot answer the question this rung asks.  The gap
+                                              // below is deliberately NOT changed - ridelog.py divides
+                                              // by it to bound the read lag.
+static const int   kRideSwingArmLogGap = 12;  // one sample every N authored frames
+
+static Ogre::Quaternion gRideSwingArmWrote[kRideSwingFreeCount];  // last write, for the kept= read-back
+// 🆕 T28, 🆕 T30 re-based it - the captured reference pose, taken on a window's FIRST authored frame and
+// held for the whole stroke.  BOTH are now LOCAL orientations (T28's refUp was DERIVED, because its write
+// was): local is what the baked delta multiplies, so no parent is read to build the pose any more.
+// ⚠️ Cleared at the close edge in RideSwingPass and on every ride boundary; a stale capture would replay
+// the stroke off a pose from the last window.
+static Ogre::Quaternion gRideSwingRefUp;
+static Ogre::Quaternion gRideSwingRefFo;
+
+// nlerp over one baked table, with the hemisphere fold kept even though `armarc.py --bake` already
+// sign-aligns every row: the fold costs one compare and it is the difference between "the long way round"
+// and a correct stroke if a future bake ever emits an unaligned pair.  nlerp, not slerp - Ogre's Slerp is
+// another out-of-line export this DLL has never linked (§21.5), and the error against slerp is bounded by
+// the widest gap in the table: 19.6 deg across the synthetic settle, ~16.6 deg at the fastest clip step,
+// which is under 0.1 deg of angular error.  No easing, for the same reason the retired arc had none: the
+// shape lives in the key TIMES, which here are VANILLA'S OWN.
+static Ogre::Quaternion RideSwingBakeAt(const float tab[][5], int keys, float t)
+{
+    if (keys < 1) return Ogre::Quaternion(1.0f, 0.0f, 0.0f, 0.0f);
+    if (t <= tab[0][0]) return Ogre::Quaternion(tab[0][1], tab[0][2], tab[0][3], tab[0][4]);
+    int i = 1;
+    while (i < keys - 1 && t > tab[i][0]) ++i;
+    const float* a = tab[i - 1];
+    const float* b = tab[i];
+    float span = b[0] - a[0];
+    float u    = (span > 0.0001f) ? ((t - a[0]) / span) : 1.0f;
+    if (u < 0.0f) u = 0.0f;
+    if (u > 1.0f) u = 1.0f;
+    float d = a[1] * b[1] + a[2] * b[2] + a[3] * b[3] + a[4] * b[4];
+    float s = (d < 0.0f) ? -1.0f : 1.0f;
+    float w = a[1] + (b[1] * s - a[1]) * u;
+    float x = a[2] + (b[2] * s - a[2]) * u;
+    float y = a[3] + (b[3] * s - a[3]) * u;
+    float z = a[4] + (b[4] * s - a[4]) * u;
+    float n = sqrtf(w * w + x * x + y * y + z * z);
+    if (n < 1.0e-6f) return Ogre::Quaternion(1.0f, 0.0f, 0.0f, 0.0f);
+    n = 1.0f / n;
+    return Ogre::Quaternion(w * n, x * n, y * n, z * n);   // ctor is (w, x, y, z), fixed by the header
+}
+
+// ⚠️ WHAT LINKS AND WHAT DOES NOT (§21.5, and T30 deleted the one helper that existed because of it -
+// RideSwingRotQ hand-built a FromAngleAxis because that one is a DECLARATION ONLY in the header we link
+// against, OgreQuaternion.h:140).  Still true, and the reason RideQuatXAxis below expands a matrix column
+// instead of calling `Quaternion * Vector3` (OgreQuaternion.h:210) and RideSwingBakeAt above nlerps
+// instead of calling Slerp: those are out-of-line exports this DLL has never linked.  What IS proven to
+// link is Quaternion*Quaternion, Quaternion::Dot, the four-value (w, x, y, z) ctor and the default one -
+// every build since T25 uses all four.  CRT sqrtf/acosf come in with the header the heading pass uses.
+
+// The rotated +X axis of a unit quaternion, done by hand (column 0 of its rotation matrix).  Ogre's
+// own `Quaternion * Vector3` is an out-of-line export this DLL has never linked; four multiplies here
+// cost nothing and cannot fail at link time.
+static Ogre::Vector3 RideQuatXAxis(const Ogre::Quaternion& q)
+{
+    return Ogre::Vector3(1.0f - 2.0f * (q.y * q.y + q.z * q.z),
+                         2.0f * (q.x * q.y + q.w * q.z),
+                         2.0f * (q.x * q.z - q.w * q.y));
+}
+
+// The rotated +Z axis, column 2 of the same matrix, hand-expanded for the same link-time reason.
+// 🆕 T27: with +X along the bone, the hand's OTHER axes are the only read on the blade's ROLL - i.e.
+// whether the edge leads.  getRotationTo gives the minimal rotation and says nothing about twist, so
+// if the next verdict is 「拍上去的」 rather than 「砍上去的」 this is the number that would have to
+// change, and measuring it now costs one line instead of another trip.
+static Ogre::Vector3 RideQuatZAxis(const Ogre::Quaternion& q)
+{
+    return Ogre::Vector3(2.0f * (q.x * q.z + q.w * q.y),
+                         2.0f * (q.y * q.z - q.w * q.x),
+                         1.0f - 2.0f * (q.x * q.x + q.y * q.y));
+}
+
+// Play the two bones.  ⚠️ The bone list is kRideSwingFreeBones itself, not a copy: the set the host
+// lets go of and the set we author MUST be identical, or a freed bone renders at bind (§17.9's
+// disease on a new bone) and an authored-but-unfreed bone is overwritten by the clip.
+// Index 0 is the UpperArm, index 1 the Forearm, and 🆕 T30 writes them by ONE rule each, the same rule:
+//     local(t) = capturedLocal * X(t),  X from that bone's baked table
+// so the whole model is two table lookups and two quaternion products.  What that buys, in order:
+//   * NO PARENT IS READ TO BUILD THE POSE.  T28 wrote the upper arm in DERIVED space and had to divide
+//     out conj(parentDerived) - one frame stale, which trips 24->25->26 differenced down to the 7.3 deg
+//     dot= residual.  A local write has no such term.  The read still happens for the LOG (want=/dot=
+//     are derived-space quantities), and that is now the only place it can bite.
+//   * X(0) = identity on both tables ⇒ the window still opens on the pose already on screen, so trip
+//     25's handover step (first-frame dot 0.8449/0.9711) stays gone.
+//   * THE ELBOW IS ANIMATED AGAIN, and by vanilla's own hinge - the thing T28 could not do at all.
+//   * THE GRIP STILL SURVIVES, but for a new reason: the forearm's baked curve is a pure hinge about the
+//     bone's own -Y (x = z = 0.0 on every key), and a rotation perpendicular to the bone axis induces no
+//     twist about it, so 'Bip01 R Hand' keeps the roll it was captured with.  The upper arm's curve DOES
+//     twist - that is vanilla's shoulder, i.e. part of the chop - so angle(bx,arm) is EXPECTED to move
+//     here where T28 needed it flat.
+// ⚠️ The capture is lazy - the first authored frame of a window does it, right where the two bone reads
+// live - and it is BOTH BONES OR NEITHER: a window that captured the shoulder from one frame and the
+// elbow from another would replay the delta off a pose that never existed.  noref= counts the frames
+// refused, and the mask frees the two by the same two resolve flags, so a refusal cannot leave a freed
+// bone unwritten.
+static void RideSwingArmPose(AnimationClass* rAnim, DWORD elapsedMs, bool logNow)
+{
+    if (!rAnim) return;
+    float t = (kRideSwingArcMs > 0) ? ((float)elapsedMs / (float)kRideSwingArcMs) : 1.0f;
+    if (t > 1.0f) t = 1.0f;
+
+    std::string un(kRideSwingFreeBones[0]), fn(kRideSwingFreeBones[1]);
+    if (!gRideSwingFreeHas[0] || !gRideSwingFreeHas[1]
+        || !rAnim->getHasBone(un) || !rAnim->getHasBone(fn)) { ++gRideSwingNoRef; return; }
+    Ogre::OldBone* bu = rAnim->_getBone(un);   // re-resolve by NAME every frame: a skeleton instance
+    Ogre::OldBone* bf = rAnim->_getBone(fn);   // can be rebuilt under us (§16)
+    if (!bu || !bf) { ++gRideSwingNoRef; return; }
+
+    if (!gRideSwingRefHave)
+    {
+        gRideSwingRefUp   = bu->getOrientation();   // LOCAL both: the baked delta multiplies locals, so
+        gRideSwingRefFo   = bf->getOrientation();   // no parent read is needed to build the pose
+        gRideSwingRefHave = true;
+    }
+
+    Ogre::Quaternion want[kRideSwingFreeCount];
+    want[0] = gRideSwingRefUp * RideSwingBakeAt(kRideSwingBakeUp, kRideSwingBakeUpKeys, t);
+    want[1] = gRideSwingRefFo * RideSwingBakeAt(kRideSwingBakeFo, kRideSwingBakeFoKeys, t);
+
+    // Read back BEFORE writing: |dot| with what we wrote last frame is the direct answer to "does the
+    // mask hold", the same self-check LEGPOSE's kept= has carried since P2-1b.
+    float kept = -1.0f;
+    if (gRideSwingArmHeld)
+    {
+        for (int i = 0; i < kRideSwingFreeCount; ++i)
+        {
+            Ogre::OldBone* b = (i == 0) ? bu : bf;
+            float d = (float)Ogre::Math::Abs(b->getOrientation().Dot(gRideSwingArmWrote[i]));
+            if (kept < 0.0f || d < kept) kept = d;
+        }
+    }
+
+    // Both bones, one rule: the captured local times this frame's baked delta.  No parent read, no
+    // derived space, nothing divided out - which is the whole reason T30 can drop T28's pinv term.
+    bu->setManuallyControlled(true);
+    bu->setOrientation(want[0]);
+    bu->needUpdate();
+    gRideSwingArmWrote[0] = want[0];
+
+    bf->setManuallyControlled(true);
+    bf->setOrientation(want[1]);
+    bf->needUpdate();
+    gRideSwingArmWrote[1] = want[1];
+
+    gRideSwingArmHeld = true;
+    gRideSwingArmT    = t;
+    ++gRideSwingArmFrames;
+
+    // The measurement half.  shoulder->hand in SKELETON space, sign-normalised the way LEGPOSE does
+    // it (+X = rider's left, +Y = up, +Z = forward, so `out` for the RIGHT arm is -X): out/fore/down
+    // is the whole stroke as three numbers per sample.
+    // 🆕 T30'S TWO FALSIFIERS ARE r= AND elbow=, and both are MODEL-FREE - three derived POSITIONS and a
+    // law of cosines, nothing about how the pose was built:
+    //   r=      |shoulder->hand|.  A rigid rotation about the shoulder cannot change it, so T28 needed it
+    //           FLAT (span 0.000 over 13 windows).  T30 needs it to MOVE: offline says 2.90..5.42 = 2.52.
+    //   elbow=  the joint angle at the elbow, 180 = straight arm.  Offline says 56..126 within one window.
+    //           Under T28 this was constant by construction; a flat elbow= here means the forearm table
+    //           never reached the bone, i.e. the model did not land.
+    // 🔑 want= is what out/fore/down SHOULD be - the two bone axes off the DERIVED equivalents of the two
+    // locals just written, times the two BIND BONE LENGTHS READ FROM THE SKELETON (not the offline
+    // constants), exact because both child offsets are pure +X - and dot= is want= against the measured
+    // vector.  ⚠️ The parent read that builds those derived targets is the LAST one left, and it is
+    // LOG-ONLY: T28 needed conj(parentDerived) to write, so its one-frame staleness deformed the pose (the
+    // 7.3 deg residual trips 24->25->26 differenced).  Here it can only blur the printed dot=.  dot= also
+    // scales with angular RATE, and vanilla's cut is 1.80x T29's, so it is EXPECTED to loosen again;
+    // ridelog.py does that division rather than arguing about it.
+    // bx=/bz= are the R Hand bone's own +X and +Z: the wrist is still host-driven (deliberately - it holds
+    // the weapon), so this is the blade proxy for the GRIP question.  ⚠️ Unlike T28, angle(bx,arm) is
+    // EXPECTED to move here: the upper arm's baked curve twists (vanilla's shoulder does), and only the
+    // forearm's is a pure hinge.  The grip claim is now "no twist FROM THE ELBOW", which the table's own
+    // x = z = 0.0 columns prove offline; the log's job is 正手 by eye plus these two vectors for the record.
+    // ⚠️ Hand, elbow and shoulder POSITIONS are read, never written.
+    if (logNow && gRideSwingArmLines < kRideSwingArmLines)
+    {
+        ++gRideSwingArmLines;
+        Ogre::Vector3 sh = bu->_getDerivedPosition();
+        Ogre::Vector3 fe = bf->_getDerivedPosition();
+        Ogre::Vector3 hd = Ogre::Vector3::ZERO, hx = Ogre::Vector3::ZERO, hz = Ogre::Vector3::ZERO;
+        float lFore = bf->getInitialPosition().length();    // UpperArm -> Forearm, 2.849 offline
+        float lHand = 0.0f;
+        if (rAnim->getHasBone(std::string("Bip01 R Hand")))
+        {
+            Ogre::OldBone* h = rAnim->_getBone(std::string("Bip01 R Hand"));
+            if (h)
+            {
+                hd    = h->_getDerivedPosition();
+                lHand = h->getInitialPosition().length();   // Forearm -> Hand, 3.244 offline
+                hx    = RideQuatXAxis(h->_getDerivedOrientation());
+                hz    = RideQuatZAxis(h->_getDerivedOrientation());
+            }
+        }
+        Ogre::Quaternion dUp = want[0];
+        Ogre::OldNode*   par = bu->getParent();
+        if (par) dUp = par->_getDerivedOrientation() * want[0];
+        Ogre::Quaternion dFo = dUp * want[1];
+        Ogre::Vector3 rel = hd - sh;
+        Ogre::Vector3 wnt = RideQuatXAxis(dUp) * lFore + RideQuatXAxis(dFo) * lHand;
+        float dotWant = -2.0f;
+        if (wnt.squaredLength() > 1.0e-6f && rel.squaredLength() > 1.0e-6f)
+            dotWant = wnt.normalisedCopy().dotProduct(rel.normalisedCopy());
+        Ogre::Vector3 eu = sh - fe, eh = hd - fe;
+        float elbow = -1.0f;
+        if (eu.squaredLength() > 1.0e-6f && eh.squaredLength() > 1.0e-6f)
+        {
+            float c = eu.normalisedCopy().dotProduct(eh.normalisedCopy());
+            if (c < -1.0f) c = -1.0f;
+            if (c >  1.0f) c =  1.0f;
+            elbow = acosf(c) * 57.2957795f;
+        }
+        char ln[512];
+        _snprintf_s(ln, 512, _TRUNCATE,
+            "Riding: SWING arm f=%u t=%.2f elbow=%.1f r=%.3f kept=%.4f "
+            "out=%.2f fore=%.2f down=%.2f want=(%.2f,%.2f,%.2f) dot=%.4f len=%.2f/%.2f "
+            "bx=(%.2f,%.2f,%.2f) bz=(%.2f,%.2f,%.2f) sh=(%.2f,%.2f,%.2f)",
+            gP3Frames, t, elbow, rel.length(), kept,
+            -rel.x, rel.z, -rel.y, -wnt.x, wnt.z, -wnt.y, dotWant, lFore, lHand,
+            -hx.x, hx.z, -hx.y, -hz.x, hz.z, -hz.y, sh.x, sh.y, sh.z);
+        DebugLog(std::string(ln));
+    }
+}
+
+// Hand the arm back.  Same three steps and the same self-proof as LegPoseRestoreImpl: clear the
+// manual flag, reset() to the binding pose, then READ BOTH BACK - a bone still manual, or still away
+// from bind, is a rider who walks off with a raised sword arm for the rest of the session.
+// ⚠️ Returns WITHOUT clearing the flag when there is no AnimationClass to work on, so a later call
+// with a live one still does the release.
+static void RideSwingArmRelease(AnimationClass* rAnim)
+{
+    if (!gRideSwingArmHeld) return;
+    if (!rAnim) return;
+    gRideSwingArmHeld = false;
+    gRideSwingRefHave = false;   // 🆕 T28: a released arm has no reference pose.  Third net on the same
+                                 // rule (close edge, ride reset, here), and the local one: whatever the
+                                 // reason for the handback, the next authored frame re-captures.
+    int   man    = 0;
+    float minDot = -1.0f;
+    int   seen   = 0;
+    for (int i = 0; i < kRideSwingFreeCount; ++i)
+    {
+        if (!gRideSwingFreeHas[i]) continue;
+        std::string bn(kRideSwingFreeBones[i]);
+        if (!rAnim->getHasBone(bn)) continue;
+        Ogre::OldBone* b = rAnim->_getBone(bn);
+        if (!b) continue;
+        b->setManuallyControlled(false);
+        b->reset();
+        b->needUpdate();
+        if (b->isManuallyControlled()) man |= (1 << i);
+        float d = (float)Ogre::Math::Abs(b->getOrientation().Dot(b->getInitialOrientation()));
+        if (seen == 0 || d < minDot) minDot = d;
+        ++seen;
+    }
+    char ln[160];
+    _snprintf_s(ln, 160, _TRUNCATE,
+        "Riding: SWING armback man=0x%02X minDot=%.4f seen=%d lastt=%.2f f=%u",
+        (unsigned)man, minDot, seen, gRideSwingArmT, gP3Frames);
+    DebugLog(std::string(ln));
 }
 
 // Hand the legs back: clear the manual flags, return the bones to the binding pose and
@@ -4717,6 +6097,11 @@ static int LegMaskResidueCount(AnimationClass* rAnim)
 static void LegPoseRestoreImpl(AnimationClass* rAnim, AnimationData* poseData)
 {
     if (!rAnim) return;
+    // 🆕 T25: the authored arm rides on the same custody rule as the legs, so it is released from the
+    // same place.  First, and unconditionally: this is the path a ride that ended INSIDE a swing
+    // window takes (dismount, knocked down, load), and it is the only thing standing between that and
+    // a rider who walks around with a raised sword arm for the rest of the session.
+    RideSwingArmRelease(rAnim);
     int   man    = 0;       // bones STILL manually controlled after we cleared them
     float minDot = -1.0f;   // worst |dot(orientation, initialOrientation)| after reset()
     int   seen   = 0;
@@ -4871,6 +6256,40 @@ static void LegPosePassImpl(AnimationClass* rAnim, AnimationData* poseData, Char
                         (unsigned int)gLegPoseHandle[i]);
             DebugLog(std::string(bn));
         }
+        // 🆕 T23: the two swing tables, resolved by the same call pair and logged the same way -
+        // once per DLL load, ungated, because a has=0 here silently disables half the split and the
+        // only place that can be seen is this line.  hold= protects the seat on the TECHNIQUE state
+        // (RideSwingDrive), free= releases the host's upper body while a window is open (LegMaskApply).
+        for (int i = 0; i < kRideSwingHoldCount; ++i)
+        {
+            gRideSwingHoldHandle[i] = 0;
+            gRideSwingHoldHas[i] = rAnim->getHasBone(std::string(kRideSwingHoldBones[i]));
+            if (gRideSwingHoldHas[i])
+            {
+                Ogre::OldBone* b = rAnim->_getBone(std::string(kRideSwingHoldBones[i]));
+                if (b) gRideSwingHoldHandle[i] = b->getHandle(); else gRideSwingHoldHas[i] = false;
+            }
+            char sn[176];
+            _snprintf_s(sn, 176, _TRUNCATE, "Riding: SWING hold bone '%s' has=%d handle=%u",
+                        kRideSwingHoldBones[i], gRideSwingHoldHas[i] ? 1 : 0,
+                        (unsigned int)gRideSwingHoldHandle[i]);
+            DebugLog(std::string(sn));
+        }
+        for (int i = 0; i < kRideSwingFreeCount; ++i)
+        {
+            gRideSwingFreeHandle[i] = 0;
+            gRideSwingFreeHas[i] = rAnim->getHasBone(std::string(kRideSwingFreeBones[i]));
+            if (gRideSwingFreeHas[i])
+            {
+                Ogre::OldBone* b = rAnim->_getBone(std::string(kRideSwingFreeBones[i]));
+                if (b) gRideSwingFreeHandle[i] = b->getHandle(); else gRideSwingFreeHas[i] = false;
+            }
+            char sn[176];
+            _snprintf_s(sn, 176, _TRUNCATE, "Riding: SWING free bone '%s' has=%d handle=%u",
+                        kRideSwingFreeBones[i], gRideSwingFreeHas[i] ? 1 : 0,
+                        (unsigned int)gRideSwingFreeHandle[i]);
+            DebugLog(std::string(sn));
+        }
     }
 
     // ---- knocked-out rider: hand the legs back at once -------------------------------
@@ -5008,7 +6427,30 @@ static void LegPosePassImpl(AnimationClass* rAnim, AnimationData* poseData, Char
                 && gLegPoseHas[kLegBoneSpineFirst] && gLegPoseHas[kLegBoneSpineFirst + 1];
 
     // Mask our bones out of every weighted contributor, not just the pose.
-    int msk = LegMaskApply(rAnim, nb, calfReplay, twistOn);
+    // 🆕 T23: the fifth argument is the window itself - while a swing is in flight the host's upper
+    // body is masked out too, so the driven technique is the only thing on those bones.  Counted per
+    // frame (not per clip) into the ride line's swfree=, which is this half's self-proving field the
+    // way hostkeep= is the pin's: swfree=0 with swing>0 means the split never happened.
+    // ⚠️ T26/T27: the free table is down to the two bones the arc writes (upper arm + forearm) and it
+    // must stay EXACTLY equal to what RideSwingArmPose authors - freed-but-unwritten renders at BIND
+    // (§17.9), written-but-unfreed is overwritten by the host.  T27 does not touch either table: the
+    // host clip changed, the split did not.
+    bool swingFree = RideSwingInFlight(rider);
+    int msk = LegMaskApply(rAnim, nb, calfReplay, twistOn, swingFree);
+    if (swingFree && msk > 0) ++gRideSwingFreeFrames;
+
+    // 🆕 T25: author the arm on exactly the frames the host has let go of it.  ⚠️ ORDER IS
+    // LOAD-BEARING: LegMaskApply above must have written this frame's zeros before we write the
+    // bones, for the same reason the thighs are written here and not earlier - this pass runs after
+    // the game's update and before render, which is the only point where a manual write is what the
+    // frame actually draws (§16).  The release side is an else, so a window that ends for ANY reason
+    // (close edge, stance dropped, rider knocked down) hands the arm back on the very next frame;
+    // a ride that ends inside a window is covered by LegPoseRestoreImpl.
+    if (swingFree && gRideSwingOpenTick != 0)
+        RideSwingArmPose(rAnim, GetTickCount() - gRideSwingOpenTick,
+                         (gRideSwingArmFrames % kRideSwingArmLogGap) == 0);
+    else
+        RideSwingArmRelease(rAnim);
 
     bool takeover = !gLegPoseArmed;
     if (takeover) gLegPoseBudget = kRideLegLogBudget;
@@ -5384,6 +6826,33 @@ void Mount(Character* rider, Character* mount)
     gStanceDrawFail    = 0;
     gStanceDrawNoWpn   = 0;
     gStanceDrawLines   = 0;
+    gRideSwingWho      = NULL;               // P4-3-4: no window, and no stale wall-clock baseline,
+    gRideSwingOpenTick = 0;                  // into a new ride - a leftover tick would open a swing
+    gRideSwingLastTick = 0;                  // on frame 1 (the same hazard gRideStanceTick guards)
+    gRideSwingWasOpen  = false;
+    gRideSwingCount    = 0;
+    gRideSwingTech     = 0;
+    gRideSwingSkip     = 0;
+    gRideSwingNoClip   = 0;
+    gRideSwingGuardOff = 0;
+    gRideSwingLines    = 0;
+    gRideSwingName[0]  = 0;
+    gRideSwingMinD     = -1.0f;
+    gRideSwingLastLim  = -1.0f;
+    gRideSwingRestartTick = 0;               // T21: the latch and its counter are per-ride, like the
+    gRideSwingRestarts    = 0;               // rest of this block - rst= is read against that ride's n=
+    gRideSwingDrv         = 0;               // T22: drv= and hdveto= are read per ride too
+    gRideHeadVeto         = 0;
+    gRideSwingFreeFrames  = 0;               // T23: swfree= is per ride, hold= is per window, and
+    gRideSwingHoldN       = 0;               // gRideSwingMaskMine must never survive a ride
+    gRideSwingFitMs       = 0;               // T24: fit= likewise per window
+    gRideSwingArmFrames   = 0;               // T25: arm= per ride, armt= per window, and the arm
+    gRideSwingArmLines    = 0;               // must never be believed held across a ride boundary
+    gRideSwingArmT        = -1.0f;           // (LegPoseRestoreImpl released it on the way out)
+    gRideSwingArmHeld     = false;
+    gRideSwingRefHave     = false;           // 🆕 T28: and neither may the captured reference pose -
+    gRideSwingNoRef       = 0;               // it belongs to one window of one ride's skeleton
+    gRideSwingMaskMine    = false;
     // Route A straddle bookkeeping, per ride.  gLegCalfSnap holds a knee bend captured from
     // whoever rode last, gLegHostLast would swallow the first host line, and a stale mask
     // table would have LegMaskRelease pointer-validating against a dead AnimationClass - so
@@ -5487,6 +6956,11 @@ void Dismount(Character* rider)
     {
         AnimationClass* cAnim = rider->getAnimationClass();
         if (cAnim) cAnim->endCombatAnimation();
+        // 🆕 T22: and hand back the technique's own Ogre state, for the same reason and with the
+        // same unconditional discipline - a dismount inside a swing window (knocked down, forced
+        // off, player key) skips RideSwingPass's close edge, and an enabled state at weight 1
+        // would ride along on a character that is walking again.  No-op when nothing was driven.
+        if (cAnim && gRideSwingName[0]) RideSwingUndrive(cAnim, gRideSwingName);
     }
 
     // stop the ride pose.  Only one pose exists now (P2-0, 2026-08-29); the companion
@@ -5589,6 +7063,26 @@ void Dismount(Character* rider)
             gStanceDrawOk, gStanceDrawFail, gStanceDrawNoWpn);
         DebugLog(std::string(shs));
     }
+    // P4-3-4: the swing's own per-ride summary, unconditional and on its own line so it can be read
+    // without disturbing the P43SUP judge.  `swing=` is the load-bearing number - swing=0 means no
+    // swing was ever fired this ride, so a "no swing visible" observation says nothing about this
+    // route (the same way real=0 invalidates the suppressor and late=0 the mask rescue).
+    // T21 adds `rst=`, and it is ungated for the same reason.  🆕 T27: `rst=0` is now the EXPECTED
+    // value - the guard is a loop and nothing restarts it - so the old "rst= must equal swing=" rule
+    // is retired with the one-shot it judged.  The per-ride number that carries the swing is `arm=`
+    // (frames the authored arc actually wrote), and `hostkeep=` (renamed from `guardoff=`, same
+    // counter, opposite meaning: frames the pin pass saw a live window AND kept the guard as host).
+    {
+        char sws[352];
+        _snprintf_s(sws, 352, _TRUNCATE,
+            "Riding: P43SW ride swing=%d rst=%d drv=%d arm=%d swfree=%d tech=%d skip=%d noclip=%d "
+            "hostkeep=%d hdveto=%d dmin=%.2f limlast=%.2f",
+            gRideSwingCount, gRideSwingRestarts, gRideSwingDrv, gRideSwingArmFrames,
+            gRideSwingFreeFrames, gRideSwingTech, gRideSwingSkip,
+            gRideSwingNoClip, gRideSwingGuardOff, gRideHeadVeto,
+            gRideSwingMinD, gRideSwingLastLim);
+        DebugLog(std::string(sws));
+    }
     DebugLog("Riding: dismounted");
 }
 
@@ -5666,6 +7160,33 @@ void RestoreRideAfterLoad(Character* rider, Character* mount)
     gStanceDrawFail    = 0;
     gStanceDrawNoWpn   = 0;
     gStanceDrawLines   = 0;
+    gRideSwingWho      = NULL;               // P4-3-4: no window, and no stale wall-clock baseline,
+    gRideSwingOpenTick = 0;                  // into a new ride - a leftover tick would open a swing
+    gRideSwingLastTick = 0;                  // on frame 1 (the same hazard gRideStanceTick guards)
+    gRideSwingWasOpen  = false;
+    gRideSwingCount    = 0;
+    gRideSwingTech     = 0;
+    gRideSwingSkip     = 0;
+    gRideSwingNoClip   = 0;
+    gRideSwingGuardOff = 0;
+    gRideSwingLines    = 0;
+    gRideSwingName[0]  = 0;
+    gRideSwingMinD     = -1.0f;
+    gRideSwingLastLim  = -1.0f;
+    gRideSwingRestartTick = 0;               // T21: the latch and its counter are per-ride, like the
+    gRideSwingRestarts    = 0;               // rest of this block - rst= is read against that ride's n=
+    gRideSwingDrv         = 0;               // T22: drv= and hdveto= are read per ride too
+    gRideHeadVeto         = 0;
+    gRideSwingFreeFrames  = 0;               // T23: swfree= is per ride, hold= is per window, and
+    gRideSwingHoldN       = 0;               // gRideSwingMaskMine must never survive a ride
+    gRideSwingFitMs       = 0;               // T24: fit= likewise per window
+    gRideSwingArmFrames   = 0;               // T25: arm= per ride, armt= per window, and the arm
+    gRideSwingArmLines    = 0;               // must never be believed held across a ride boundary
+    gRideSwingArmT        = -1.0f;           // (LegPoseRestoreImpl released it on the way out)
+    gRideSwingArmHeld     = false;
+    gRideSwingRefHave     = false;           // 🆕 T28: and neither may the captured reference pose -
+    gRideSwingNoRef       = 0;               // it belongs to one window of one ride's skeleton
+    gRideSwingMaskMine    = false;
     // Route A straddle bookkeeping, per ride.  gLegCalfSnap holds a knee bend captured from
     // whoever rode last, gLegHostLast would swallow the first host line, and a stale mask
     // table would have LegMaskRelease pointer-validating against a dead AnimationClass - so
@@ -6071,8 +7592,31 @@ static void AnimUpdateImpl(AnimationClass* thisptr, float frameTIME)
                             // gP41kGuard is resolved later, in HaltAndForceSitPass, so on the
                             // very first frame of a ride this is still NULL - ClipPin tolerates
                             // it, but the explicit test documents that the ordering is known.
+                            // ⛔ T27: the swing-window SWAP is gone from this site.  Trip 24 read
+                            // 「有点劈砍的意思了…原版就是双手劈砍的，所以把动作带崩了」, and 'mid blow' is
+                            // the two-handed knockdown record that was doing the pulling: our arc owns
+                            // the right upper arm and forearm, but the host still drove the LEFT arm,
+                            // the right wrist and the spine, so the left hand kept reaching for the
+                            // hilt.  The guard ('guard 1h', weaponTypeFlags 0x04 = one-handed, a LOOP
+                            // with no whole/reloc - doc.md:248) stays the host straight through the
+                            // window instead.  §U's original reason for leaving this site alone does
+                            // NOT come back: nothing gets evicted now, because this site keeps
+                            // asserting the same clip it always did.
                             if (gP41kGuard)
                                 ClipPin(thisptr, gP41kGuard, 1.0f, false);
+                            // ⛔ T25: the T22/T24 technique-state drive is GONE from here.  Trip 22
+                            // ruled the whole "play one of the engine's records" family out - a
+                            // ground record is authored around a standing pelvis and reads
+                            // 「刀砍不出去，只能在自己肚子那块拉」 whichever record is named - and the
+                            // swing is AUTHORED now (RideSwingArmPose, in the leg-pose pass, which is
+                            // the pre-render write point a manual bone needs).  RideSwingDrive and
+                            // RideSwingUndrive stay compiled: Undrive still runs on the close edge
+                            // and on dismount so any state an older build left enabled is handed
+                            // back, and drv=0 on the ride line is the self-proof that this site is
+                            // quiet.  ⚠️ Do NOT re-arm it alongside the arc: the technique's mask
+                            // only spares the eight hold bones, so it would fight our arm writes.
+
+
                         }
                     }
                 }
@@ -6639,20 +8183,52 @@ static void HaltAndForceSitPass()
                             }
                             // 'guard 1h' is UPPER without 'whole' and loops, so it is the one
                             // clip that can hold a combat upper body indefinitely while the legs
-                            // stay ours - it drives the STANCE.  'mid blow' is only RESOLVED
-                            // (that line is the evidence the rider's table holds a real swing);
-                            // the swing window that used to request it came out with T13, see
-                            // the retired-window note next to the two clip names.
-                            // Route A gives it the whole body; there is no other route left.
+                            // stay ours - it drives the STANCE.  🆕 T27: it now also holds the body
+                            // THROUGH a swing window, so this is the body's only host, full stop.
+                            // 'mid blow' is only RESOLVED (that line is the evidence the rider's
+                            // table holds a real swing record) - nothing requests it any more.
+                            // Route A gives the guard the whole body; there is no other route left.
                             AnimationData* want   = gP41kGuard;
                             const char*    wantNm = kP41kGuardAnim;
                             float          wantW  = 1.0f;
+                            float          wantSpd = 1.0f;
+                            // ⛔ T27: §U's `want` SWITCH is gone.  Trip 24: 「有点劈砍的意思了，我猜测
+                            // 动作奇怪的原因是我们想要的骑砍动作姿势应该是单手劈砍，但是角色的右手总是想找
+                            // 左手因为原版就是双手劈砍的，所以把动作带崩了」.  The mechanism is one step off
+                            // the user's reading - the right HAND's position is ours (trip 24 measured
+                            // dot mean 0.9920, so no clip pulls it) - but the conclusion holds: what
+                            // 'mid blow' still drove was the LEFT arm, the right WRIST and the SPINE,
+                            // and it is a two-handed knockdown record ('whole,action,norm,reloc,
+                            // restrict', doc.md:245), so the left hand kept reaching across for a hilt
+                            // that our arc had already taken away.  The guard is one-handed
+                            // (weaponTypeFlags 0x04, doc.md:248) and has no whole/reloc at all.
+                            //
+                            // ⚠️ §U's door-dodging reason for the switch does NOT apply now: two clips
+                            // both asking 1.0 is what trips ClipPin's `target + others <= 1.02f` door
+                            // (:5998), and after this change there is only ever ONE clip asking.  And
+                            // trip 17's warning is satisfied the strongest way available - the host is
+                            // never withheld for even one frame, so the skeleton cannot go hostless.
+                            //
+                            // The counter stays, because "did the window reach the pin sites" is still
+                            // the thing that has to be provable; it is printed as `hostkeep=`, never as
+                            // the old `guardoff=` (see the close line).
+                            if (RideSwingInFlight(rider) && gP41kGuard)
+                                ++gRideSwingGuardOff;   // counted HERE only: one frame, one count
+                                                        // (the animUpdate site pins too, but counting
+                                                        //  both would double every frame)
+
                             if (want)
                             {
                                 // Requested EVERY frame, exactly the way the ride pose is
                                 // requested out of stance: a single request would not distinguish
                                 // "refused" from "accepted then continuously drained".
-                                rAnim->runAnimation(want, 1.0f, 1.0f);
+                                // ⚠️ wantSpd is 1.0, always: the guard is a held pose, speed is
+                                // meaningless on it, and any other value would be a change to
+                                // shipping behaviour.  🆕 T27 retired the one-shot that wanted
+                                // kRideSwingSpeed, so the variable is left in place only because
+                                // runAnimation's signature needs it - do not reintroduce a speed here
+                                // without a clip whose length is actually being fitted.
+                                rAnim->runAnimation(want, wantSpd, 1.0f);
                                 // ...and the request alone cannot ask for a weight (runAnimation's
                                 // two floats are speed and blend), so the pin owns it - render
                                 // side included, this pass being the last writer before render.
@@ -7735,6 +9311,23 @@ static void CombatAndForceDismountPass()
             {
                 gStanceDrawPend = false;
                 RideStanceRedraw(rider);
+            }
+
+            // ---- P4-3-4: the swing, ungated ---------------------------------------------------
+            // Same pass and same point in the frame as the re-draw above and as the P41E ladder,
+            // for the reason in RideStanceRedraw's header.  Called UNCONDITIONALLY for every
+            // tracked pair, including the big tier and a rider whose fight just ended: the pass
+            // has to be able to CLOSE a window it opened, and `stance=false` is what closes it.
+            // The stance is read with advance=false - HaltAndForceSitPass owns the hold counter, so
+            // the two passes can never disagree inside one frame.
+            {
+                bool swStance = (sit != mountSeat.end())
+                             && RideCombatStance(rider, mount, sit->second, false);
+                RideSwingPass(rider, mount, rider->getAnimationClass(), swStance,
+                              gP41kGuard, kP41kGuardAnim);   // 🆕 T27: the body's host is the GUARD,
+                                                             // straight through the window (was
+                                                             // gP41kBlow, the clip the window used to
+                                                             // swap in - see the pin sites)
             }
 
             if (!riderFights)

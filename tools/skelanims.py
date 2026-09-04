@@ -1,11 +1,23 @@
-# skelanims.py - list the animation TRACKS inside an Ogre .skeleton, offline.  No game, no Blender.
+# skelanims.py - read an Ogre .skeleton OFFLINE: bones, clip names, and KEYFRAME CURVES.  No game.
 #
 #   python tools\skelanims.py                       # male_skeleton: bone count + every clip name
 #   python tools\skelanims.py --find "chop"         # ...only clips whose name contains a substring
 #   python tools\skelanims.py --skel Crab           # another skeleton by filename substring
 #   python tools\skelanims.py --list                # every .skeleton under data\, with clip counts
+#   python tools\skelanims.py --bones               # handle / parent / name / bind quat
+#   python tools\skelanims.py --sweep [chop]        # per clip: shoulder sweep + ELBOW bend, degrees
+#   python tools\skelanims.py --track "chop down"   # one clip's curve for one bone (--bone <name>)
 #
-# Why this exists: `gamedata.py --tech` showed that 43 of 44 COMBAT TECHNIQUE(17) records name a
+# Why the curve half exists: Kenshi ships every humanoid animation as tracks in ONE file, and an
+# Ogre track's keyframe rotation is RELATIVE TO THE BONE'S BINDING POSE (Skeleton::reset() then
+# Node::rotate(key, TS_LOCAL) => local = bind * key).  That is the same space RideSwingArmPose
+# writes into, so a vanilla arm curve can be read here and replayed by OUR writer with OUR bone
+# mask - which is NOT the family trip 22 killed (that one drove an engine AnimationState through
+# the animation system).  Measured proof the rotations really are bind-relative: in `guard 1h` the
+# track for `Bip01 L Toe0Nub` - whose bind quat is a distinctive (0,1,0,0) - is exactly identity on
+# all 3 keys.  Absolute-local storage could not do that.
+#
+# Why it exists at all: `gamedata.py --tech` showed that 43 of 44 COMBAT TECHNIQUE(17) records name a
 # clip (`chop left`, `attack1`, `blk right`, `dodgeback`) that has NO ANIMATION(24) record anywhere
 # in the four data files.  A clip with no record has no `layer` string and no `wholeBodyAllLayer`
 # bool - those two fields live on the RECORD, not on the skeleton track.  So the question "which
@@ -34,6 +46,7 @@
 # exists and gives its duration.  It says NOTHING about layer, `whole`, blending or runtime weight
 # - none of those are stored here.
 
+import math
 import os
 import struct
 import sys
@@ -66,42 +79,86 @@ def _line(b, o):
     return b[o:e].decode('utf-8', 'replace'), e + 1
 
 
-def read(path):
-    """-> (version, [boneName], [(animName, seconds)]).  See the layout note above for why this
-    walks structurally instead of trusting each chunk's recorded length."""
+class Skel(object):
+    """One file, fully read.  Quaternions are (x, y, z, w) - the DISK order.  (armarc.py's
+    read_bones() reorders to (w,x,y,z) for its own math; do not move numbers between the two
+    tools without converting.)
+
+    bones   [(handle, name, pos, quat)] in file order
+    parents {handle: parentHandle}
+    anims   [(name, seconds, {boneHandle: [(t, quat, xlat)]})]
+    """
+
+    def __init__(self, version):
+        self.version = version
+        self.bones = []
+        self.parents = {}
+        self.anims = []
+
+    def by_handle(self):
+        return dict((h, n) for (h, n, _p, _q) in self.bones)
+
+    def by_name(self):
+        return dict((n, h) for (h, n, _p, _q) in self.bones)
+
+
+def parse(path):
+    """The one parser in this file.  Flat single pass: a TRACK belongs to the animation last
+    seen and a KEYFRAME to the track last seen, so no container end offset is ever needed -
+    which is what makes it immune to the length quirk described at the top."""
     b = open(path, 'rb').read()
     if len(b) < 8 or _u16(b, 0) != 0x1000:
         raise ValueError('%s: not an Ogre .skeleton (first chunk 0x%04X)' % (path, _u16(b, 0)))
     ver, o = _line(b, 2)
-    bones, anims = [], []
+    sk = Skel(ver)
+    track = None
     while o + 6 <= len(b):
         cid, ln = _u16(b, o), _u32(b, o + 2)
         p = o + 6
         if cid == C_BONE:
             nm, p = _line(b, p)
-            bones.append(nm)
+            pos = (_f32(b, p + 2), _f32(b, p + 6), _f32(b, p + 10))
+            quat = (_f32(b, p + 14), _f32(b, p + 18), _f32(b, p + 22), _f32(b, p + 26))
+            sk.bones.append((_u16(b, p), nm, pos, quat))
             p += 2 + 12 + 16 + (12 if ln >= 48 else 0)  # handle, pos, rot, optional scale
         elif cid == C_PARENT:
+            sk.parents[_u16(b, p)] = _u16(b, p + 2)
             p += 4
         elif cid == C_BLEND:
             p += 2
         elif cid == C_ANIM:
             nm, p = _line(b, p)
-            anims.append((nm, _f32(b, p)))
+            sk.anims.append((nm, _f32(b, p), {}))
+            track = None
             p += 4                                      # nested chunks follow, keep walking flat
         elif cid in (C_BASEINFO, C_LINK):
             _, p = _line(b, p)
             p += 4
         elif cid == C_TRACK:
+            if not sk.anims:
+                raise ValueError('%s: TRACK at 0x%X with no ANIMATION open' % (path, o))
+            track = sk.anims[-1][2].setdefault(_u16(b, p), [])
             p += 2
         elif cid == C_KEYFRAME:
+            if track is None:
+                raise ValueError('%s: KEYFRAME at 0x%X with no TRACK open' % (path, o))
+            track.append((_f32(b, p),
+                          (_f32(b, p + 4), _f32(b, p + 8), _f32(b, p + 12), _f32(b, p + 16)),
+                          (_f32(b, p + 20), _f32(b, p + 24), _f32(b, p + 28))))
             p = o + ln                                  # no string inside -> length is honest
         else:
             raise ValueError('%s: unknown chunk 0x%04X at 0x%X' % (path, cid, o))
         if p <= o:
             raise ValueError('%s: no progress at 0x%X (chunk 0x%04X)' % (path, o, cid))
         o = p
-    return ver, bones, anims
+    return sk
+
+
+def read(path):
+    """Names-only view, kept for --list / --tech / gamedata cross-checks:
+    (version, [boneName], [(animName, seconds)])."""
+    sk = parse(path)
+    return sk.version, [n for (_h, n, _p, _q) in sk.bones], [(n, s) for (n, s, _t) in sk.anims]
 
 
 def _pick(pat):
@@ -209,11 +266,105 @@ def cmd_tech():
     return 0
 
 
-USAGE = 'usage: skelanims.py [--skel <nameSubstr>] [--find <clipSubstr>] | --list | --tech'
+UPPER, FORE = 'Bip01 R UpperArm', 'Bip01 R Forearm'
+
+
+def _qangle(a, b):
+    """Degrees between two unit quaternions; |dot| folds q and -q together."""
+    d = abs(a[0] * b[0] + a[1] * b[1] + a[2] * b[2] + a[3] * b[3])
+    return 2.0 * math.degrees(math.acos(min(1.0, d)))
+
+
+def cmd_bones(skel):
+    p = _pick(skel)
+    if not p:
+        return 2
+    sk = parse(p)
+    bh = sk.by_handle()
+    print('%s\n  version=%s  bones=%d  animations=%d' % (p, sk.version, len(sk.bones), len(sk.anims)))
+    print('handle  name                          parent                    bind quat (x,y,z,w)')
+    for (h, n, _pos, q) in sorted(sk.bones):
+        par = sk.parents.get(h, -1)
+        print('%6d  %-28s  %-22s  %7.4f %7.4f %7.4f %7.4f'
+              % (h, n, 'ROOT' if par < 0 else bh.get(par, '?%d' % par),
+                 q[0], q[1], q[2], q[3]))
+    print('NOTE bind LOCAL orientation, i.e. the pose every track\'s keys are relative to.')
+    return 0
+
+
+def cmd_sweep(skel, find):
+    """How much SHAPE does each clip carry for the two bones our writer owns?
+
+    up    = the R UpperArm's largest departure from its OWN first key (shoulder sweep)
+    elbow = the same for R Forearm - the thing the T28 one-rigid-rotation model cannot do at
+            all, because it rewrites the captured forearm local verbatim every frame.
+    Both are measured against key 0, which is the normalisation a replay would use anyway
+    (the window opens on the pose already on screen => deltas from the first key)."""
+    p = _pick(skel)
+    if not p:
+        return 2
+    sk = parse(p)
+    bn = sk.by_name()
+    up, fo = bn.get(UPPER, -1), bn.get(FORE, -1)
+    rows = []
+    for (name, secs, tracks) in sk.anims:
+        if find and find.lower() not in name.lower():
+            continue
+        vals = []
+        for h in (up, fo):
+            keys = tracks.get(h, [])
+            vals.append(max(_qangle(keys[0][1], k[1]) for k in keys) if len(keys) > 1 else 0.0)
+        rows.append((name, secs, len(tracks.get(up, [])), vals[0], vals[1]))
+    print('%s\n  %s handle=%d   %s handle=%d' % (p, UPPER, up, FORE, fo))
+    print('  len(s) keys   up(deg)  elbow(deg)  name')
+    for (name, secs, nk, u, f) in sorted(rows, key=lambda r: -r[3]):
+        print('  %6.3f %4d   %7.1f  %10.1f  %s' % (secs, nk, u, f, name))
+    print('\n%d clip(s)%s; elbow(deg) > 0 is shape one rigid rotation cannot reach'
+          % (len(rows), (' containing %r' % find) if find else ''))
+    return 0
+
+
+def cmd_track(skel, clip, bone):
+    p = _pick(skel)
+    if not p:
+        return 2
+    sk = parse(p)
+    want = [a for a in sk.anims if a[0].lower() == clip.lower()]
+    if not want:
+        print('no clip named %r - run --find %r to see the near misses' % (clip, clip[:6]))
+        return 2
+    name, secs, tracks = want[0]
+    h = sk.by_name().get(bone, -1)
+    if h < 0:
+        print('no bone named %r - run --bones' % bone)
+        return 2
+    keys = tracks.get(h, [])
+    print('%s\n  clip %r  length=%.3fs   bone %r (handle %d)  keys=%d'
+          % (p, name, secs, bone, h, len(keys)))
+    print('    t(s)  t/len  ang(deg)       qx       qy       qz       qw     tx     ty     tz')
+    k0 = keys[0][1] if keys else (0.0, 0.0, 0.0, 1.0)
+    for (t, q, tr) in keys:
+        print('  %6.3f  %5.3f  %8.1f %8.5f %8.5f %8.5f %8.5f  %5.2f %5.2f %5.2f'
+              % (t, (t / secs) if secs > 0 else 0.0, _qangle(k0, q),
+                 q[0], q[1], q[2], q[3], tr[0], tr[1], tr[2]))
+    print('\nNOTE rotations are RELATIVE TO BIND (local = bind * key) - the space')
+    print('     Bone::setOrientation takes.  ang(deg) = distance from THIS clip\'s key 0,')
+    print('     i.e. the arc table the clip implies for that bone.')
+    return 0
+
+
+
+
+USAGE = ('usage: skelanims.py [--skel <nameSubstr>] [--find <clipSubstr>]\n'
+         '                    | --list | --tech | --bones | --sweep [<clipSubstr>]\n'
+         '                    | --track "<clip>" [--bone "<boneName>"]')
 
 
 def main(argv):
     skel = find = ''
+    clip = ''
+    bone = UPPER
+    mode = ''
     i = 0
     while i < len(argv):
         a = argv[i]
@@ -221,12 +372,20 @@ def main(argv):
             return cmd_list()
         if a == '--tech':
             return cmd_tech()
-        if a == '--skel' and i + 1 < len(argv):
-            skel = argv[i + 1]
-            i += 2
+        if a in ('--bones', '--sweep'):
+            mode = a
+            i += 1
             continue
-        if a == '--find' and i + 1 < len(argv):
-            find = argv[i + 1]
+        if a in ('--skel', '--find', '--track', '--bone') and i + 1 < len(argv):
+            v = argv[i + 1]
+            if a == '--skel':
+                skel = v
+            elif a == '--find':
+                find = v
+            elif a == '--track':
+                clip, mode = v, '--track'
+            else:
+                bone = v
             i += 2
             continue
         if not a.startswith('--') and not find:        # bare arg = --find, the common case
@@ -235,6 +394,12 @@ def main(argv):
             continue
         print(USAGE)
         return 2
+    if mode == '--bones':
+        return cmd_bones(skel)
+    if mode == '--sweep':
+        return cmd_sweep(skel, find)
+    if mode == '--track':
+        return cmd_track(skel, clip, bone)
     return cmd_dump(skel, find)
 
 

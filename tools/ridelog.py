@@ -17,6 +17,7 @@ missing entirely almost always means continuous diagnostics were never turned
 on (Ctrl+NUM.) - it does NOT mean the value was zero.
 """
 
+import math
 import os
 import re
 import sys
@@ -105,6 +106,89 @@ def fnum(d, k, default=None):
         return float(v)
     except ValueError:
         return default
+
+
+def triple(d, k):
+    """Parse a "(a,b,c)" field into three floats, e.g. T26's want=/bx=/sh=.
+
+    Returns None unless all three parsed - a truncated tuple is dropped rather
+    than padded, the same rule the rest of this file follows (a missing field
+    must never look like a measured zero).
+    """
+    v = d.get(k)
+    if not v or not v.startswith("(") or not v.endswith(")"):
+        return None
+    parts = v[1:-1].split(",")
+    if len(parts) != 3:
+        return None
+    try:
+        return tuple(float(p) for p in parts)
+    except ValueError:
+        return None
+
+
+def tri_angle(a, b):
+    """Angle in degrees between two (x,y,z) tuples, or None if either is degenerate.
+
+    Used to turn adjacent want= samples into "how far the intended direction moved
+    between these two log rows", which is what separates a read-lag deficit from a
+    real aim error in -- T26 -- / -- T27 --.
+    """
+    if not a or not b:
+        return None
+    na = math.sqrt(sum(c * c for c in a))
+    nb = math.sqrt(sum(c * c for c in b))
+    if na < 1e-6 or nb < 1e-6:
+        return None
+    d = sum(x * y for x, y in zip(a, b)) / (na * nb)
+    return math.degrees(math.acos(max(-1.0, min(1.0, d))))
+
+
+def hostkeep(d, default=None):
+    """The window's pin-site frame counter, under whichever key this build used.
+
+    ⚠️ SAME COUNTER, OPPOSITE MEANING.  T20..T26 printed `guardoff=` = frames the
+    guard assertion was WITHHELD so a pinned one-shot could own the torso.  T27
+    stopped swapping the host at all, so the identical counter now means frames the
+    window kept the GUARD as host, and it prints as `hostkeep=`.  The number is read
+    the same way by every check that only asks "did the window reach the pin sites",
+    which is all of them - but the KEY had to change so that nobody reads
+    「guard 让开了 5126 帧」 off a build where the guard never let go.  Use
+    hostkeep_key() when the answer is being printed back at a human.
+    """
+    v = d.get("hostkeep")
+    if v is None:
+        v = d.get("guardoff")
+    if v is None:
+        return default
+    try:
+        return float(v)
+    except ValueError:
+        return default
+
+
+def hostkeep_key(d):
+    """'hostkeep' / 'guardoff' / None - which of the two this row actually carries."""
+    if "hostkeep" in d:
+        return "hostkeep"
+    if "guardoff" in d:
+        return "guardoff"
+    return None
+
+
+def is_t27(s):
+    """True when this log came from a build whose window keeps its host clip (T27+).
+
+    Dispatch on the FIELD NAME, never on a byte count or a trip number: the close
+    line prints hostkeep= only in T27 and later, and guardoff= only in T20..T26, so
+    one key answers "which family of criteria applies" with no lookup table to keep
+    in sync.  Mixed (a log spanning a redeploy) counts as T27 if any close row does -
+    the newer criteria are the stricter statement about the newer build.
+    """
+    for d in s.sw_close:
+        if "hostkeep" in d:
+            return True
+    return False
 
 
 def fnum_flagged(d, k, default=None):
@@ -290,10 +374,34 @@ class Session(object):
         # changes game state).  One line per 0 -> 1 stance edge that actually
         # issued a drawWeapon; post= is the self-proving field, exactly like
         # real= for the suppressor and late= for the mask rescue (RE_NOTES 21).
-        # The swing window that used to be read here (P43SW, kP43Sw*) was taken
-        # out of the DLL on the user's ruling after trip 10 answered it; its
-        # findings live in HISTORY §U, and no build carries it any more.
         self.rd = []             # dicts of "P43RD edge ..." lines
+        # P4-3-4, THE SWING (DLL 308224 B and later, UNGATED - it changes game
+        # state, same discipline as P43RD).  ⚠️ The prefix P43SW is REUSED: trip
+        # 10's deleted experiment window logged under it too (kP43Sw*, archived in
+        # HISTORY §U).  The two are told apart by shape, not by name - the old one
+        # printed "P43SW <open|hold|close|after> n= blow play= ... | guard play= ..."
+        # with the two clips repeating field names on one line, this one prints
+        # "P43SW open n= tech='..' init= minS= lim= d= reach=" plus a "P43SW ride"
+        # summary the old one never had.  A log that has "P43SW ride" is this one.
+        self.sw_rides = []       # "P43SW ride swing= tech= skip= fail= guardoff="
+        self.sw_open  = []       # "P43SW open n= tech='..' init= minS= lim= d= reach="
+        self.sw_close = []       # "P43SW close n= guardoff= tech= skip= fail="
+        self.sw_legacy = 0       # lines that look like the trip-10 window instead
+        self.sw_hold_bones = []  # T23 "SWING hold bone '<name>' has= handle="
+        self.sw_free_bones = []  # T23 "SWING free bone '<name>' has= handle="
+        self.sw_arm     = []     # T25 "SWING arm ... abd= flx= elb= kept= out= fore= down="
+                                 # T26 "SWING arm ... kept= out= fore= down= want= dot= len= bx="
+        self.sw_armback = []     # T25/T26 "SWING armback man= minDot= seen= lastt="
+        # "P41K resolve guard='guard 1h' found blow='mid blow' found" - printed once
+        # per DLL load on the stance's first frame and UNGATED (verified present in
+        # the trip-24 diagnostics-OFF log).  It used to be background information;
+        # T27 makes the guard half load-bearing, because the guard is now the body's
+        # host for the whole window, so guard=ABSENT means nothing in -- T27 -- can
+        # be judged at all.  Two strings, not a kv() dict: both values are "found" or
+        # "ABSENT" under repeated key-less positions.
+        self.k_guard = None      # "found" / "ABSENT" / None (line never printed)
+        self.k_blow  = None      # ditto for 'mid blow', which T27 only RESOLVES
+
         # P4-3 step 2's THIRD probe (DLL 309760 B and later): who takes the hand
         # slot away AFTER attachItem put the weapon there.  Trip 11 closed the
         # data-layer half (post=1 4/4, wih=0->1, wpn=1 on 52/56 reads) while the
@@ -400,7 +508,14 @@ def parse(path, s):
                 d["_why"] = "down" if "(rider down)" in line else "grace"
                 s.released.append(d)
                 continue
-            if "kept=" in line:
+            # ⚠️ SHAPE-BASED, so it needs an exclusion list.  This branch owns the
+            # STRADDLE's mask audit (LEGPOSE's kept=), and T25's "SWING arm" line
+            # carries a kept= of its own with the same meaning but a different
+            # subject - the arm, not the thighs.  Letting it in here counted a
+            # first-frame kept=-1.0000 as a straddle mask failure and hid the arm
+            # samples from -- T25 -- at the same time (the same class of trap as
+            # HISTORY §U's two-clips-one-line).
+            if "kept=" in line and "SWING arm" not in line:
                 d = kv(line)
                 k = fnum(d, "kept")
                 s.kept.add(k)
@@ -547,6 +662,75 @@ def parse(path, s):
                 else:
                     s.sup_skips.append(d)
                 continue
+            if "Riding: P43SW " in line:
+                d = kv(line)
+                d["_ts"] = ts(line)
+                # ⚠️ SHAPE, not keyword: trip 10's deleted window also printed
+                # "P43SW open" and "P43SW close".  Its lines carry two clips'
+                # fields separated by " | guard " and have no tech= / guardoff=;
+                # kv() would silently hand back the guard's numbers for the blow's
+                # (HISTORY §U records exactly this pitfall).  So a row only counts
+                # as P4-3-4 when it carries a field the old one never had.
+                # ⚠️ T27 RENAMED that field: the close line now prints hostkeep=
+                # (frames the window kept the GUARD as host) where T20..T26 printed
+                # guardoff= (frames the guard was WITHHELD).  Same counter, opposite
+                # meaning - which is exactly why the key changed, and why BOTH have to
+                # be accepted here or a T27 log falls into sw_legacy and every swing
+                # section goes blind at once.
+                if "P43SW ride" in line:
+                    s.sw_rides.append(d)
+                elif "P43SW open" in line and "tech" in d:
+                    s.sw_open.append(d)
+                elif "P43SW close" in line and ("guardoff" in d or "hostkeep" in d):
+                    s.sw_close.append(d)
+                else:
+                    s.sw_legacy += 1
+                continue
+            # T23: the two bone tables of the complementary split, printed once per
+            # DLL load.  "SWING hold bone '<name>' has=N handle=N" protects the seat
+            # on the TECHNIQUE's state; "SWING free bone ..." releases the host's
+            # upper body while a window is open.  A has=0 here disables half the
+            # split silently, which is why the line exists at all.
+            if "Riding: SWING hold bone " in line or "Riding: SWING free bone " in line:
+                d = kv(line)
+                d["_ts"] = ts(line)
+                m = re.search(r"bone '([^']*)'", line)
+                d["_bone"] = m.group(1) if m else "?"
+                if "hold bone" in line:
+                    s.sw_hold_bones.append(d)
+                else:
+                    s.sw_free_bones.append(d)
+                continue
+            # T25/T26: the AUTHORED arm.  One sample of the arc (budgeted, one per
+            # kRideSwingArmLogGap authored frames).  T25 printed the joint angles
+            # (abd=/flx=/elb=); T26 prints what it MEANT instead - want= is the intended
+            # shoulder->hand vector and dot= is it against the measured one, which is the
+            # only field that can tell a landed write apart from a CORRECT one.
+            # "SWING armback man= minDot= seen= lastt=" is the custody handback, the same
+            # proof LEGPOSE's handback line carries.  ⚠️ Both are ungated - they are the only
+            # evidence that a hand-written pose reached the skeleton at all.
+            if "Riding: SWING arm " in line:
+                d = kv(line)
+                d["_ts"] = ts(line)
+                s.sw_arm.append(d)
+                continue
+            if "Riding: SWING armback " in line:
+                d = kv(line)
+                d["_ts"] = ts(line)
+                s.sw_armback.append(d)
+                continue
+            # The two clip names the stance resolves once per DLL load.  Pulled with a
+            # regex rather than kv(): the "found"/"ABSENT" verdicts are positional, not
+            # key=value.  On T27 the guard half is the host guarantee (-- T27 -- section
+            # 1), and the blow half is only kept as standing evidence that the rider's
+            # own table really does hold a swing record - nothing requests it any more.
+            if "Riding: P41K resolve " in line:
+                m = re.search(r"guard='[^']*' (found|ABSENT) blow='[^']*' (found|ABSENT)",
+                              line)
+                if m:
+                    s.k_guard, s.k_blow = m.group(1), m.group(2)
+                continue
+
             if "Riding: P43FT ride" in line:
                 d = kv(line)
                 d["_ts"] = ts(line)
@@ -3115,6 +3299,2868 @@ def report_redraw(s):
         print("       apart by timestamp.")
 
 
+def report_swing(s):
+    """T20 - P4-3-4: did the rider actually swing, and did the guard stand down?
+
+    Three inherited pieces of judging discipline, all of them load-bearing:
+      * swing=0 for a ride means NO swing was ever fired, so a "saw nothing"
+        observation says nothing about this route - the same way real=0 voids the
+        suppressor's reading and late=0 voids the mask rescue's (RE_NOTES 21).
+      * guardoff=0 together with swing>0 means the window opened but the guard
+        assertion never stood down, i.e. the swing played UNDERNEATH the stance.
+        That is the exact shape trip 13 measured before this phase existed (guard
+        play=1 w=1.000 with mainState 1.000 -> 0.909 right after rung 3), and it
+        is the one failure this design is built to avoid.
+        ⚠️ T27 KEEPS THE COUNTER AND DROPS THE MEANING: it prints hostkeep= for
+        frames the window kept the GUARD as host (nothing stands down any more),
+        so what >0 proves on a T27 log is only "the window reached the pin sites".
+        The read goes through hostkeep(); the LABEL is whatever the row carries.
+      * "did the stance come back" may ONLY be judged on the NEXT open row, never
+        on the frames just after a close: the dying one-shot is still inside
+        ClipPin's `others`, so for ~0.3 s the guard's ms structurally cannot climb
+        back.  That was trip 10's judging-criterion error (HISTORY §U).
+        (On T27 there is no dying one-shot at all - see -- T27 --.)
+    """
+    print("")
+    print("== T20 - P4-3-4: the swing (P43SW) ==")
+    if not (s.sw_rides or s.sw_open or s.sw_close):
+        if s.sw_legacy:
+            print("  %d line(s) of the TRIP-10 experiment window (P43SW open/hold/"
+                  "close/after)." % s.sw_legacy)
+            print("  That code was deleted on the user's ruling once trip 10"
+                  " answered it, so this")
+            print("  log predates P4-3-4.  Its findings are archived in HISTORY"
+                  " §U - this tool")
+            print("  deliberately does not re-judge them (the old line repeats"
+                  " field names for")
+            print("  two clips, which kv() cannot read without splitting on"
+                  " ' | guard ' first).")
+            return
+        print("  no P43SW line at all: this log predates the swing (DLL 308224 B"
+              " and later).")
+        print("  NOT a failure - there is simply nothing to judge here.")
+        return
+
+    t27 = is_t27(s)
+    hk_lbl = "hostkeep" if t27 else "guardoff"
+    tot = dict(swing=0, tech=0, skip=0, noclip=0)
+    tot_hk = 0
+    print("  %d ride summary line(s) (ungated, one per dismount):" % len(s.sw_rides))
+    for d in s.sw_rides:
+        for k in tot:
+            v = fnum(d, k, 0)
+            tot[k] += int(v) if v is not None else 0
+        hk = hostkeep(d, 0)
+        tot_hk += int(hk) if hk is not None else 0
+        print("    %8s  swing=%-3s tech=%-3s skip=%-3s noclip=%-3s %s=%-5s"
+              " dmin=%-6s limlast=%s"
+              % (d.get("_ts", "?"), d.get("swing", "-"), d.get("tech", "-"),
+                 d.get("skip", "-"), d.get("noclip", "-"), hk_lbl,
+                 d.get(hostkeep_key(d) or "hostkeep", "-"),
+                 d.get("dmin", "-"), d.get("limlast", "-")))
+    tot[hk_lbl] = tot_hk
+
+
+    # ---- the three verdicts ------------------------------------------------
+    swings = tot["swing"]
+    if swings:
+        print("  " + verdict(True, "%d swing(s) fired across %d ride(s) (tech=%d"
+                                   " named, skip=%d out of range)"
+                                   % (swings, len(s.sw_rides), tot["tech"],
+                                      tot["skip"])))
+    else:
+        print("  " + verdict(False, "swing=0 on every ride - NO swing was ever"
+                                    " fired"))
+        if not tot["tech"]:
+            print("        tech=0 too: chooseAttack never named a technique."
+                  "  Check the weapon")
+            print("        first (P43RD drawn=/post= above, and aCW= on those"
+                  " rows) - trip 13's")
+            print("        ch=1 run had wpn=1, and an UNARMED rider has no"
+                  " weapon technique to")
+            print("        choose, which is what ch=0 43/43 meant back in P4-1d.")
+        elif tot["skip"]:
+            dmins = [x for x in (fnum(d, "dmin") for d in s.sw_rides)
+                     if x is not None and x >= 0.0]
+            lims = [x for x in (fnum(d, "limlast") for d in s.sw_rides)
+                    if x is not None and x >= 0.0]
+            print("        tech=%d but every attempt was out of the technique's"
+                  " own range." % tot["tech"])
+            if dmins and lims:
+                print("        closest approach dmin=%.2f vs limlast=%.2f =>"
+                      " the enemy never came" % (min(dmins), max(lims)))
+                print("        inside the range the ENGINE says this swing is"
+                      " usable at.  That is a")
+                print("        geometry finding, not a bug in the trigger -"
+                      " read it before touching")
+                print("        the range test, and do NOT add a slack term to"
+                      " make it fire.")
+        elif tot["noclip"]:
+            print("        noclip=%d: the range test passed but 'mid blow' was"
+                  " never resolved." % tot["noclip"])
+            print("        Read the `P41K resolve` line - ABSENT there and this"
+                  " route has no clip.")
+    print("  " + verdict(tot["noclip"] == 0,
+                         "'mid blow' was resolved every time a window opened"
+                         " (noclip=%d)" % tot["noclip"]))
+    if tot["noclip"]:
+        if t27:
+            print("        noclip>0 means the range test passed but the HOST clip"
+                  " was still NULL - on")
+            print("        T27 that host is gP41kGuard, resolved on the stance's"
+                  " first frame, so this")
+            print("        should be rare and bounded.  Check `P41K resolve"
+                  " guard='guard 1h'` - ABSENT")
+            print("        there means the stance itself has no host and nothing"
+                  " below is judgeable.")
+        else:
+            print("        noclip>0 means the range test passed but gP41kBlow was"
+                  " still NULL, so the")
+            print("        window refused to open rather than drop the guard with"
+                  " nothing to replace it.")
+            print("        Check the `P41K resolve ... blow='mid blow'` line -"
+                  " ABSENT there kills the route.")
+
+    # ---- the regression trip 17 was killed by -------------------------------
+    # Six swings, six `LEGPOSE released grace=12` lines 110-160 ms later, and the
+    # player watched the rider stand up on the ox in 'idle_stand_normal'.  The
+    # window withholds the guard, so if what replaces it is not a real host the
+    # skeleton has none and LegPoseFindHost hands the straddle mask back.  This
+    # correlation is therefore the acceptance test for the whole design, not a
+    # side note - keep it even when it passes.
+    rel_grace = [r for r in s.released if r.get("_why") != "down"]
+    if s.sw_open:
+        opens = [t for t in (tsnum(d.get("_ts")) for d in s.sw_open) if t is not None]
+        graces = [t for t in (tsnum(r.get("_ts")) for r in rel_grace) if t is not None]
+        hits = []
+        for g in graces:
+            near = [o for o in opens if 0.0 <= g - o <= 1.0]
+            if near:
+                hits.append((near[-1], g))
+        print("  " + verdict(not hits,
+                             "no host-lost leg release follows a swing (%d"
+                             " grace release(s), %d window(s))"
+                             % (len(graces), len(opens))))
+        if hits:
+            print("        %d grace release(s) land within 1 s of a window"
+                  " opening:" % len(hits))
+            for o, g in hits[:6]:
+                print("          open %.3f -> released %.3f  (+%.0f ms)"
+                      % (o, g, (g - o) * 1000.0))
+            if t27:
+                print("        ⚠️ ON T27 THIS SHOULD BE STRUCTURALLY IMPOSSIBLE: the"
+                      " window keeps the guard")
+                print("        as host for every frame of its life, so LegPoseFindHost"
+                      " cannot come up empty")
+                print("        because of the swing.  A hit here means the host was"
+                      " lost for some OTHER")
+                print("        reason (stance dropped mid-window, rider knocked down,"
+                      " ClipPin refused the")
+                print("        guard) - read the P41K weight rows around that"
+                      " timestamp before anything else.")
+            else:
+                print("        THAT IS TRIP 17's FAILURE: the window drops the guard,"
+                      " so whatever replaces")
+                print("        it must be a clip that owns an AnimationState -"
+                      " otherwise LegPoseFindHost")
+                print("        finds no host, the straddle mask goes back, and the"
+                      " rider STANDS UP on the")
+                print("        mount ('idle_stand_normal').  Do not read anything"
+                      " else in this section")
+                print("        until this line passes.")
+
+    if swings:
+        bad_off = [d for d in s.sw_rides
+                   if (fnum(d, "swing", 0) or 0) > 0
+                   and (hostkeep(d, 0) or 0) <= 0]
+        if t27:
+            # ⚠️ SAME TEST, DIFFERENT CLAIM.  On T27 nothing swaps, so >0 no longer
+            # proves the swing outranked the stance - it proves the window was LIVE
+            # when the pin pass ran, which is the precondition for the mask and the
+            # authored arm alike.  Stating the old claim here would be a lie about a
+            # build that never withholds the guard.
+            print("  " + verdict(not bad_off,
+                                 "every window reached the pin sites (hostkeep=%d"
+                                 " frame(s) total, guard kept as host)" % tot_hk))
+            if bad_off:
+                print("        %d ride(s) fired a swing with hostkeep=0 => RideSwing"
+                      "InFlight was false at" % len(bad_off))
+                print("        the pin site while RideSwingPass thought a window was"
+                      " open.  The two read")
+                print("        the SAME bound (kRideSwingWinMs) by construction, so"
+                      " this can only be a")
+                print("        rider mismatch (gRideSwingWho) or a pass-order change"
+                      " - not a tuning issue.")
+        else:
+            print("  " + verdict(not bad_off,
+                                 "the one-shot really got the torso (guardoff=%d"
+                                 " frame(s) total)" % tot_hk))
+            if bad_off:
+                print("        %d ride(s) fired a swing with guardoff=0 => the pin"
+                      " swap never happened, so" % len(bad_off))
+                print("        'guard 1h' kept the body and ClipPin's global door"
+                      " refused the swing its")
+                print("        render weight (trip 13's shape).  Both swap sites have"
+                      " to be reached -")
+                print("        HaltAndForceSitPass AND the animUpdate pre-pass; only"
+                      " the first counts frames.")
+
+    # ---- the individual windows -------------------------------------------
+    if s.sw_open:
+        print("  %d open row(s), %d close row(s) (budget kRideSwingLines=24 per"
+              " ride, shared):" % (len(s.sw_open), len(s.sw_close)))
+        names = {}
+        for d in s.sw_open[:24]:
+            nm = (d.get("tech", "") or "").strip("'")
+            names[nm] = names.get(nm, 0) + 1
+            print("    %8s  n=%-3s tech='%s' init=%-6s minS=%-7s lim=%-6s"
+                  " d=%-6s reach=%s"
+                  % (d.get("_ts", "?"), d.get("n", "-"), nm,
+                     d.get("init", "-"), d.get("minS", "-"), d.get("lim", "-"),
+                     d.get("d", "-"), d.get("reach", "-")))
+        print("    techniques seen: "
+              + ", ".join("%s x%d" % (k or "?", v)
+                          for k, v in sorted(names.items())))
+        # The close row carries prog= (did the clip run out, or did the wall-clock
+        # cap cut it in half - trip 10 measured a fixed 1000 ms playing only ~20%
+        # of 'mid blow') and the read-only Ogre probe on the TECHNIQUE name, which
+        # is NOT the clip we pin.  ogre=found on a record-less technique clip is
+        # the one reading that would put runCombatAnimation back on the table;
+        # ogre=absent closes it for good.  ⚠️ RE_NOTES 21 never claimed either way.
+        if s.sw_close:
+            print("    close rows:")
+            for d in s.sw_close[:12]:
+                print("      %8s  n=%-3s prog=%-6s noclip=%-3s tech='%s' %s"
+                      % (d.get("_ts", "?"), d.get("n", "-"), d.get("prog", "-"),
+                         d.get("noclip", "-"),
+                         (d.get("tech", "") or "").strip("'"),
+                         "ogre=" + (d.get("ogre", "?") or "?")))
+            og = [(d.get("ogre", "") or "").strip("'") for d in s.sw_close]
+            found = [x for x in og if x == "found"]
+            absent = [x for x in og if x == "absent"]
+            if found:
+                print("    NOTE  ogre=found on %d/%d close row(s): a technique clip"
+                      " with NO AnimationData" % (len(found), len(og)))
+                print("          record DOES own an Ogre::AnimationState (§21.1"
+                      " chain, reached by name).")
+                print("          ⇒ driving that state's own weight is a live"
+                      " option again - read en=/w=/t=")
+                print("          to see whether anything ever started it.")
+            elif absent:
+                print("    NOTE  ogre=absent on %d/%d close row(s): the engine"
+                      " never built a state for the" % (len(absent), len(og)))
+                print("          technique clip, so nothing can play it by name"
+                      " and runCombatAnimation had")
+                print("          nothing to put on the body either.  'mid blow'"
+                      " stays the only pinnable swing.")
+        # By construction the open row can only exist when d <= lim; a violation
+        # means the range test was edited, not that the engine did something odd.
+        viol = []
+        for d in s.sw_open:
+            dd, ll = fnum(d, "d"), fnum(d, "lim")
+            if dd is not None and ll is not None and dd > ll + 0.01:
+                viol.append(d.get("_ts", "?"))
+        print("  " + verdict(not viol,
+                             "every open row satisfies d <= lim (%d row(s)"
+                             " checked)" % len(s.sw_open)))
+        if viol:
+            print("        rows at %s have d > lim - the range test in"
+                  " RideSwingPass no longer" % ", ".join(viol[:6]))
+            print("        matches what the log prints; fix one of the two"
+                  " before reading anything")
+            print("        else in this section.")
+        # An open without its close is the ride that ended mid-swing: Dismount()
+        # calls endCombatAnimation() unconditionally (RidingPlugin.cpp:5489) but
+        # prints no close line, so exactly one missing close per such ride is the
+        # healthy shape - it is not a leak.
+        gap = len(s.sw_open) - len(s.sw_close)
+        if gap:
+            print("  NOTE  %d open row(s) have no close row.  One per ride that"
+                  " ended mid-swing is" % gap)
+            print("        expected: Dismount() closes the swing"
+                  " unconditionally but prints nothing.")
+    print("  NOTE  \"did the stance come back\" is judged on the NEXT open row or"
+          " the next P41K")
+    print("        sample, NEVER on the frames right after a close - the dying"
+          " one-shot is")
+    print("        still inside ClipPin's `others` for ~0.3 s, so the guard's ms"
+          " structurally")
+    print("        cannot climb back there (trip 10's judging error, HISTORY §U).")
+
+
+def report_swing_look(s):
+    """T21 - P4-3-4b: is the swing ONE swing, from the start of the clip?
+
+    T20 proved the mechanism (swing=17, guardoff=5126, zero grace releases) and
+    then handed back a purely cosmetic defect the player described as
+    "right hand slitting the left wrist".  Trip 18 measured why, twice over:
+      * 'mid blow' advanced ~0.207 prog/s => a ~4.8 s clip, of which a 2500 ms
+        window shows ~52%.
+      * window 2 RESUMED at prog 0.518 where window 1 stopped at 0.517.  The
+        pinned SingleAnimation outlives its window with currentFrameTime01
+        intact, so every window after the first plays an arbitrary MIDDLE slice
+        - and a window that opens on a leftover prog >= kRideSwingDoneProg
+        closes on its very first frame having played nothing at all.
+    So this section judges three writes, and one of them is optional:
+      rst=   RideSwingRestart zeroed the clip - MUST equal swing= (load-bearing)
+      ms=    the window ended because the CLIP ran out, not the wall clock
+      sp=    the speed write survived the engine's update (nice-to-have: if the
+             engine re-imposes 1.00 the swing is still start-aligned, just slow)
+    ⛔ ALL THREE ARE RETIRED BY T27, and this section says so instead of judging
+    them: every one is a statement about a one-shot clip pinned INSIDE the window,
+    and T27 stopped swapping the host, so there is no such clip.  rst=0 / sp on a
+    loop / prog cycling are the designed shapes, and reporting them as failures
+    would be the tool contradicting the build it was written after.
+    """
+    print("")
+    print("== T21 - P4-3-4b: one whole swing (restart + speed) ==")
+    if not (s.sw_rides or s.sw_close):
+        print("  no P4-3-4 P43SW row at all - nothing to judge (see T20 above).")
+        return
+    if is_t27(s):
+        print("  RETIRED for this build (close rows carry hostkeep=): the window no"
+              " longer swaps a")
+        print("  one-shot onto the body, so there is no clip to restart, no speed to"
+              " impose and no")
+        print("  progress to close on.  rst=0 is the EXPECTED value here, not a"
+              " miss - the window's")
+        print("  length is kRideSwingWinMs and the stroke's own completion is armt="
+              " in -- T25/T26 --.")
+        print("  Judge this build in -- T27 -- below.")
+        return
+    has_t21 = any("rst" in d for d in s.sw_rides) or \
+              any("pinst" in d for d in s.sw_close)
+    if not has_t21:
+        print("  P43SW rows carry no rst= / pinst= field: this log predates the")
+        print("  restart+speed fix.  NOT a failure - T20 above is the whole of")
+        print("  what this log can say about the swing.")
+        return
+
+    # ---- 1) one restart per window (the load-bearing check) -----------------
+    # Checked per ride, not on the totals: two rides of 3+1 and 1+3 would sum
+    # correctly while one of them played from wherever the other stopped.
+    bad_rst, tot_sw, tot_rst = [], 0, 0
+    for d in s.sw_rides:
+        # ⚠️ No `or` default on either read: fnum returns 0.0 for a genuine rst=0,
+        # and `0.0 or -1` is -1, which flagged every ride that had no fight at all
+        # (trip 19's third ride: swing=0 rst=0 printed as "swing=0 but rst=-1").
+        sw = fnum(d, "swing")
+        rs = fnum(d, "rst")
+        if sw is None:
+            continue
+        sw = int(sw)
+        rs = -1 if rs is None else int(rs)
+        tot_sw += sw
+        tot_rst += max(rs, 0)
+        if rs != sw:
+            bad_rst.append((d.get("_ts", "?"), sw, rs))
+    print("  " + verdict(not bad_rst,
+                         "one restart per window on every ride (rst=%d,"
+                         " swing=%d)" % (tot_rst, tot_sw)))
+    if bad_rst:
+        for t, sw, rs in bad_rst[:6]:
+            print("        %8s  swing=%d but rst=%d" % (t, sw, rs))
+        print("        rst < swing means RideSwingFindEntry could not find the"
+              " pinned entry while")
+        print("        the window was open, so that window played from wherever"
+              " the previous one")
+        print("        stopped - the trip-18 half-slice, unfixed.  Read pinst="
+              " on the close rows:")
+        print("        pinst=none there and the layer walk is looking in the"
+              " wrong list; pinst=AV")
+        print("        and the SEH shell caught a dangling layer.")
+
+    # ---- 2) the clip ended the window, not the clock ------------------------
+    # A close row is the only place both halves are visible.  prog >= 0.90 is
+    # kRideSwingDoneProg, i.e. "the clip finished"; a ms= at the 3000 ms cap
+    # means it was cut off instead - which is exactly what trip 18 looked like.
+    closes = [d for d in s.sw_close if "pinst" in d]
+    capped, instant, progs, mss = [], [], [], []
+    for d in closes:
+        p, m = fnum(d, "prog"), fnum(d, "ms")
+        if p is not None:
+            progs.append(p)
+        if m is not None:
+            mss.append(m)
+            if m >= 2950.0:
+                capped.append((d.get("_ts", "?"), p, m))
+            if m < 200.0:
+                instant.append((d.get("_ts", "?"), p, m))
+    print("  " + verdict(not capped,
+                         "every window closed on the CLIP, not the 3000 ms cap"
+                         " (%d close row(s))" % len(closes)))
+    if capped:
+        for t, p, m in capped[:6]:
+            print("        %8s  ms=%.0f prog=%s  <- clock cut it off"
+                  % (t, m, p))
+        print("        The swing is still a fraction of the clip.  Two knobs,"
+              " in this order: raise")
+        print("        kRideSwingSpeed (check sp= below actually took), then"
+              " kRideSwingLenMs - and if")
+        print("        you raise the cap you MUST raise kRideSwingMinGapMs with"
+              " it (cap < gap, or a")
+        print("        window re-opens on the frame after it closed).")
+    print("  " + verdict(not instant,
+                         "no window closed on its first frame (the trip-18"
+                         " leftover-progress bug)"))
+    if instant:
+        for t, p, m in instant[:6]:
+            print("        %8s  ms=%.0f prog=%s  <- opened already finished"
+                  % (t, m, p))
+        print("        A window that opens on a leftover prog >= 0.90 closes"
+              " immediately: the restart")
+        print("        did not land BEFORE RideSwingPass read prog.  It has to"
+              " run in")
+        print("        HaltAndForceSitPass, which the pass order (:7037-7040)"
+              " puts first.")
+    if progs and mss:
+        print("    prog at close: min=%.3f max=%.3f | window ms: min=%.0f"
+              " max=%.0f avg=%.0f"
+              % (min(progs), max(progs), min(mss), max(mss),
+                 sum(mss) / float(len(mss))))
+    return _swing_look_tail(s, closes)
+
+
+def _swing_look_tail(s, closes):
+    """The read-back half of T21: what the two probes say about the pinned clip.
+
+    Split out only to keep one screenful per idea - it is the same section.
+    """
+    # ---- 3) did the speed write survive? -----------------------------------
+    # NOTE, not CHECK: nothing in this DLL had ever passed a speed other than
+    # 1.0f before T21, so "the engine re-imposes 1.00" is an unknown being
+    # measured here, not a failure.  Knob 1 (the restart) is what makes the
+    # swing start at the start; speed only decides whether it FITS the cap.
+    sps = [x for x in (fnum(d, "sp") for d in closes) if x is not None]
+    if sps:
+        took = [x for x in sps if x > 1.05]
+        if took and len(took) == len(sps):
+            print("  NOTE  sp=%.2f on %d/%d close row(s): the speed write"
+                  " SURVIVED the engine's" % (took[0], len(took), len(sps)))
+            print("        own update, so kRideSwingSpeed is a real knob.")
+        elif took:
+            print("  NOTE  sp>1.05 on only %d/%d close row(s) (min=%.2f"
+                  " max=%.2f): the engine takes"
+                  % (len(took), len(sps), min(sps), max(sps)))
+            print("        the speed sometimes and drops it otherwise - read"
+                  " ms= per row before")
+            print("        trusting the knob.")
+        else:
+            print("  NOTE  sp=1.00 on all %d close row(s): the engine RE-IMPOSES"
+                  " speed 1.0, so" % len(sps))
+            print("        kRideSwingSpeed is dead as a knob (both the"
+                  " runAnimation argument and the")
+            print("        SingleAnimation field).  The swing is still"
+                  " start-aligned - only the cap")
+            print("        decides how much of a ~4.8 s clip is visible, so"
+                  " kRideSwingLenMs is the")
+            print("        only lever left (and cap < gap must hold).")
+
+    # ---- 4) 'mid blow's true length, printed rather than derived -----------
+    # Trip 18 could only infer ~4.8 s from two prog readings and a stopwatch.
+    # olen= is Ogre's own number for the clip we pin, and every window-length
+    # constant in the source is only as good as that estimate was.
+    olens = [x for x in (fnum(d, "olen") for d in closes) if x is not None]
+    if olens:
+        ol = max(olens)
+        print("    'mid blow' olen=%.3f s (Ogre, measured - trip 18 could only"
+              " derive ~4.8 s)" % ol)
+        sp = max([x for x in sps if x is not None] or [1.0])
+        need = ol * 0.90 / max(sp, 0.01) * 1000.0
+        print("      => 0->90%% at sp=%.2f needs %.0f ms; the cap is 3000 ms"
+              % (sp, need))
+        if need > 3000.0:
+            print("      " + verdict(False, "the cap CANNOT fit a whole swing"
+                                            " - raise speed, or cap and gap"
+                                            " together"))
+
+    # ---- 5) the restart's before/after pair --------------------------------
+    # The open row samples the entry BEFORE the request site has run for that
+    # window, so from n=2 on its t01= is the leftover the restart erases.  This
+    # is the one place the defect and its fix sit on two adjacent lines.
+    pres = [(d.get("_ts", "?"), d.get("n", "-"), d.get("pinst", "?"),
+             fnum(d, "t01"))
+            for d in s.sw_open if "pinst" in d]
+    leftover = [(t, n, v) for t, n, st, v in pres
+                if st == "live" and v is not None and v > 0.02]
+    if pres:
+        print("    open-row leftover (pre-restart t01, %d row(s) sampled):"
+              % len(pres))
+        for t, n, st, v in pres[:8]:
+            print("      %8s  n=%-3s pinst=%-5s t01=%s"
+                  % (t, n, st, "-" if v is None else "%.3f" % v))
+        if leftover:
+            print("    NOTE  %d open row(s) found a leftover t01>0.02 waiting"
+                  " for them - that is the" % len(leftover))
+            print("          trip-18 defect being caught in the act; rst="
+                  " above says it was erased.")
+
+    # ---- 6) the pin still held at close, and Ogre agreed -------------------
+    held = [d for d in closes
+            if (fnum(d, "pw", 0) or 0) >= 0.95 and d.get("psw") == "1"]
+    if closes:
+        print("  " + verdict(len(held) == len(closes),
+                             "the pin still held at every close (pw>=0.95 and"
+                             " psw=1 on %d/%d)"
+                             % (len(held), len(closes))))
+        oen = [d for d in closes if d.get("oen") == "1"]
+        print("  " + verdict(len(oen) == len(closes),
+                             "the pinned clip's Ogre state was enabled at close"
+                             " (oen=1 on %d/%d)" % (len(oen), len(closes))))
+        if len(oen) != len(closes):
+            print("        oen=0 means the render side was not driving 'mid"
+                  " blow' even though our")
+            print("        fields said it was wanted - that is the same"
+                  " ClipPin door (target+others")
+            print("        <= 1.02f) the guard stand-down exists to get past."
+                  "  Check guardoff= in T20.")
+    print("  NOTE  the eyeball half of T21 is not in this file: \"it reads as"
+          " one swing\" and the")
+    print("        four v1.6 behaviours (draw / stance / keep held / sheathe)"
+          " can only be judged")
+    print("        in game.  This section only proves the clip started at 0"
+          " and ran to the end.")
+
+
+def swing_authored(s):
+    """True when the build AUTHORS the swing (T25) instead of playing one of the
+    engine's records.
+
+    The ride line's arm= only exists from that build onward, and its arrival retires
+    three fields at once: drv= (T22's drive of the technique's own Ogre state), hold=
+    (T23's mask on that state) and fit= (T24's phase fitting) are all zero BY DESIGN
+    afterwards, because both assertion sites were removed.  Every section that judges
+    one of those three has to check this first or it reports a design decision as a
+    regression.
+    """
+    return any("arm" in d for d in s.sw_rides) or bool(s.sw_arm)
+
+
+def report_swing_drive(s):
+    """T22 - two independent trip-19 answers.
+
+    (A) The rider stopped facing the mount's REAR.  Trip 19: "人物在牛背上打架的
+        时候会突然转向牛屁股的方向".  The rider's facing is the mount's per-frame
+        position delta, refreshed above a 0.03 threshold - so a mount that backs
+        off or is knocked back in a fight reverses it without turning its body.
+        The fix vetoes a delta pointing the opposite way from the animal's own
+        getFacingDirection() and HOLDS the last good heading instead.
+    (B) Can the TECHNIQUE's own Ogre::AnimationState be driven?  Trips 18+19
+        measured ogre=found 31/31 - the record-less clips DO own a state - and
+        trip 19 handed back the one thing 'mid blow' can never fix: it is not an
+        attack clip ("这个动作实在不像挥砍").  This is additive: the pin, its
+        weight, its speed and its restart are untouched, so a refusal here costs
+        nothing that trips 18-19 proved.
+    """
+    print("")
+    print("== T22 - rear-facing veto (A) + driving the technique's state (B) ==")
+    if not (s.sw_rides or s.sw_close):
+        print("  no P43SW row at all - nothing to judge (see T20/T21 above).")
+        return
+    has_a = any("hdveto" in d for d in s.sw_rides)
+    has_b = any("drv" in d for d in s.sw_rides) or any("drv" in d for d in s.sw_close)
+    if not (has_a or has_b):
+        print("  P43SW rows carry neither hdveto= nor drv=: this log predates the")
+        print("  veto and the state drive.  NOT a failure.")
+        return
+
+    # ---- A) the heading veto ------------------------------------------------
+    print("  A) heading veto (hdveto= = frames the travel delta was NOT taken):")
+    if not has_a:
+        print("     field absent - this log predates the veto.")
+    else:
+        tot_v = 0
+        for d in s.sw_rides:
+            v = fnum(d, "hdveto")
+            if v is None:
+                continue
+            tot_v += int(v)
+            print("     %8s  hdveto=%d" % (d.get("_ts", "?"), int(v)))
+        print("  NOTE  there is no pass/fail here and hdveto=0 is not a failure:"
+              " it means no")
+        print("        reversal happened on those rides at all.  hdveto>0 proves"
+              " the veto fired")
+        print("        (%d frame(s) held the last good heading), and the eyeball"
+              " half - \"did the" % tot_v)
+        print("        rider still swing round to look at the mount's rear\" - is"
+              " the verdict.")
+        print("        ⚠️ A sideways shove reads dot ~= 0 and is NOT vetoed at"
+              " kHeadingFaceMinDot=0;")
+        print("        if the report becomes \"turns sideways\", that constant is"
+              " the knob.")
+
+    # ---- B) the technique-state drive ---------------------------------------
+    print("  B) technique state drive (drv= frames written, en=/w=/t= at close):")
+    if not has_b:
+        print("     field absent - this log predates the drive.")
+        return
+    if swing_authored(s):
+        print("     ⛔ RETIRED BY T25 (this log has arm=): the technique drive was removed"
+              " from both")
+        print("        assertion sites, so drv=0 / hold=0 / fit=0 are the EXPECTED shape"
+              " here and none")
+        print("        of the checks below apply.  Trip 22 ruled the whole"
+              " play-one-of-the-engine's-records")
+        print("        family out - 「刀砍不出去，只能在自己肚子那块拉，动作都挤成一团了」"
+              " on a record the")
+        print("        engine itself picked for the distance - and the user's ruling with it:")
+        print("        「不一定非要和原版一样，只要像骑砍那样挥砍的动作就行」."
+              "  Judge the swing in -- T25 --.")
+        for d in s.sw_rides:
+            sw, dv = fnum(d, "swing"), fnum(d, "drv")
+            if sw is None or dv is None:
+                continue
+            print("     %8s  swing=%d drv=%d%s"
+                  % (d.get("_ts", "?"), int(sw), int(dv),
+                     "" if int(dv) == 0 else "   ⚠️ non-zero: a drive site came back!"))
+        return
+    # drv=0 on a ride that swung at all means not one write landed.
+    dead = []
+    for d in s.sw_rides:
+        sw, dv = fnum(d, "swing"), fnum(d, "drv")
+        if sw is None or dv is None:
+            continue
+        print("     %8s  swing=%d drv=%d" % (d.get("_ts", "?"), int(sw), int(dv)))
+        if int(sw) > 0 and int(dv) == 0:
+            dead.append(d.get("_ts", "?"))
+    print("  " + verdict(not dead,
+                         "the write reached the state on every ride that swung"))
+    if dead:
+        print("        drv=0 with swing>0 on: %s" % ", ".join(dead[:6]))
+        print("        Not one write landed, so nothing below means anything."
+              "  Two causes, and the")
+        print("        close row separates them: ogre=absent means"
+              " getAnimationState() returned NULL")
+        print("        for that clip name (§21.1 chain), anything else means"
+              " RideSwingDrive's SEH")
+        print("        shell swallowed an access violation writing it.")
+        return
+    closes = [d for d in s.sw_close if "en" in d]
+    gone = [d for d in s.sw_close if "en" not in d]
+    if gone:
+        print("     ⚠️ %d close row(s) print ogre=absent: getAnimationState()"
+              " handed back NULL for" % len(gone))
+        print("        that clip name at the close, so en=/w=/t= are missing"
+              " there by construction.")
+    if not closes:
+        print("     no close row carries en= - budget exhausted or no window"
+              " closed.")
+        return
+    en1 = [d for d in closes if d.get("en") == "1"]
+    print("  " + verdict(len(en1) == len(closes),
+                         "the state was still enabled at the close (en=1 on"
+                         " %d/%d)" % (len(en1), len(closes))))
+    if len(en1) != len(closes):
+        print("        🔑 THE decisive reading of this trip: the write landed"
+              " (drv>0) and the engine")
+        print("        cleared it again.  Both assertion sites run BEFORE"
+              " animUpdate_orig, so the")
+        print("        next rung is asserting after it - not a new address, the"
+              " same hook.")
+    ws = [x for x in (fnum(d, "w") for d in closes) if x is not None]
+    if ws:
+        print("     weight at close: min=%.3f max=%.3f  (asked for"
+              " kRideSwingTechW)" % (min(ws), max(ws)))
+        print("        ⚠️ w= is NOT evidence on its own: trip 19 already read"
+              " w=1.000 with en=0")
+        print("        and t=0.000, i.e. that is the state's DEFAULT weight,"
+              " untouched.  Only")
+        print("        drv= and en= say whether our write happened and stuck.")
+        if max(ws) < 0.001:
+            print("        w=0.000 with en=1 means the weight write specifically"
+                  " was reverted -")
+            print("        the state is in the set and switched on but"
+                  " contributes nothing.")
+    arc = []
+    for d in closes:
+        t, ln = fnum(d, "t"), fnum(d, "len")
+        if t is None or ln is None or ln <= 0.001:
+            continue
+        arc.append(t / ln)
+    if arc:
+        print("     arc reached at close: min=%.0f%% max=%.0f%% avg=%.0f%%"
+              " over %d row(s)"
+              % (100.0 * min(arc), 100.0 * max(arc),
+                 100.0 * sum(arc) / len(arc), len(arc)))
+        if max(arc) < 0.01:
+            print("        0% across the board is the trip-19 BASELINE shape"
+                  " (t=0.000): the state")
+            print("        was never started, so this says nothing about window"
+                  " length - read en= above.")
+        elif min(arc) < 0.90:
+            print("        under 90% means the window closed before the arc"
+                  " finished: the window")
+            print("        still ends on 'mid blow' (prog 0.90 at"
+                  " kRideSwingSpeed), and kRideSwingTechMs")
+            print("        is the restatement of that length - raise it and the"
+                  " arc gets cut, lower")
+            print("        it and the arc finishes early and holds its last"
+                  " pose.")
+    print("  NOTE  what this section CANNOT say: whether an enabled, weighted"
+          " state actually")
+    print("        reaches the skeleton.  🔑 TRIP 20 ANSWERED THAT, and the answer"
+          " is YES: with")
+    print("        drv>0 / en=1 11/11 / w=1.000 / arc=100% the eyeball read"
+          " 「动作幅度很大」 -")
+    print("        the sword left the hand for the chest, floated overhead, the"
+          " body balled up and")
+    print("        the rider slid in front of the mount.  So the pre-registered"
+          " kill criterion")
+    print("        (\"looks unchanged ⇒ this route is finished\") never fired: the"
+          " route is alive")
+    print("        and UNCONSTRAINED.  Everything after that is T23 below."
+          "  The straddle")
+    print("        regression that matters is in T20: grace releases must stay"
+          " 0 (this change")
+    print("        is additive, so a non-zero count there would be a surprise"
+          " worth chasing).")
+
+
+def report_swing_split(s):
+    """T23 - the complementary split.
+
+    Trip 20 answered T22(B) the other way round from the branch that was
+    pre-registered as its kill criterion.  drv>0 on every ride that swung,
+    en=1 11/11, w=1.000, arc=100% - and the eyeball read「把刀从右手往胸口收，
+    然后刀飘到头顶，整个人缩成一团瞬移到坐骑前面。动作幅度很大，但是毫无意义」.
+    So the driven state DOES reach the skeleton (§17.12's "nothing visible ⇒
+    route finished" branch never happened); what it lacked was any constraint:
+
+      * root/pelvis tracks of a GROUND clip stepped the whole skeleton forward
+        (nobody applies the whole/reloc bits for a record-less clip, §19);
+      * 'mid blow' (pinned host, weight 1.0) and the technique (weight 1.0, no
+        blend mask at all) both drove every spine/arm bone.
+
+    The split: the technique gets root/pelvis/legs/feet masked to 0 (it may have
+    the torso, never the seat); the host gets its upper body masked to 0 for the
+    length of the window (it keeps the legs, which is the only thing it is
+    load-bearing for - §17.9).  Fingers are in neither list, so the grip stays.
+    """
+    print("")
+    print("== T23 - the split: technique holds the seat, host frees the torso ==")
+    has_tab = bool(s.sw_hold_bones or s.sw_free_bones)
+    has_hold = any("hold" in d for d in s.sw_close)
+    has_free = any("swfree" in d for d in s.sw_rides)
+    if not (has_tab or has_hold or has_free):
+        print("  no SWING bone row and no hold= / swfree= field: this log predates")
+        print("  the split.  NOT a failure - T22 above is that build's whole verdict.")
+        return
+
+    # ---- 1) did the two bone tables resolve at all --------------------------
+    for label, rows, why in (
+            ("hold", s.sw_hold_bones,
+             "the technique is masked OFF these (seat + straddle + the teleport)"),
+            ("free", s.sw_free_bones,
+             "the host is masked off these while a window is open (the swing)")):
+        if not rows:
+            print("  %s table: no row.  Either the build predates it or the leg-pose"
+                  " pass never ran." % label)
+            continue
+        ok = [d for d in rows if d.get("has") == "1"]
+        bad = [d for d in rows if d.get("has") != "1"]
+        print("  %s table (%s):" % (label, why))
+        if ok:
+            print("     " + ", ".join("%s=%s" % (d["_bone"].replace("Bip01 ", ""),
+                                                 d.get("handle", "?")) for d in ok))
+        else:
+            print("     none resolved")
+        print("  " + verdict(not bad, "every %s bone resolved by name (%d/%d)"
+                             % (label, len(ok), len(rows))))
+        if bad:
+            print("        MISSING: %s" % ", ".join(d["_bone"] for d in bad))
+            if label == "hold":
+                print("        ⚠️ 'Bip01' or 'Bip01 Pelvis' missing = the teleport guard"
+                      " is not armed at all,")
+                print("        so「瞬移到坐骑前面」would be expected to survive this"
+                      " build.  Names come")
+                print("        from the P2-1b inventory (DumpRiderSkeleton, Ctrl+NUM.)"
+                      " - read it, do not")
+                print("        guess a handle: this rider has 30 bones and 0/1 only"
+                      " LOOK like root/pelvis.")
+            else:
+                print("        A missing free bone stays under the host, so the"
+                      " technique fights it there")
+                print("        for the whole window - that is the 「缩成一团」 half,"
+                      " unfixed on that bone.")
+
+    # ---- 2) hold= : did the technique's own mask get written, per window -----
+    want_hold = len([d for d in s.sw_hold_bones if d.get("has") == "1"])
+    if has_hold and swing_authored(s):
+        print("  hold= is RETIRED BY T25 (this log has arm=): the technique's state is no longer"
+              " driven,")
+        print("        so nothing creates a mask on it and hold=0 is the expected shape."
+              "  The free")
+        print("        table above is NOT retired - it shrank to the two bones T25 authors,"
+              " and that")
+        print("        equality (freed set == authored set) is what -- T25 -- checks.")
+    elif has_hold:
+        rows = [d for d in s.sw_close if "hold" in d]
+        vals = [int(fnum(d, "hold")) for d in rows if fnum(d, "hold") is not None]
+        full = [v for v in vals if want_hold and v == want_hold]
+        print("  hold= per window (entries zeroed on the TECHNIQUE's state):")
+        print("     " + " ".join("%s:%d" % (d.get("_ts", "?"),
+                                            int(fnum(d, "hold") or 0)) for d in rows[:14]))
+        if want_hold:
+            print("  " + verdict(len(full) == len(vals),
+                                 "every window masked the whole hold table"
+                                 " (%d/%d rows at %d entries)"
+                                 % (len(full), len(vals), want_hold)))
+        if vals and max(vals) == 0:
+            print("        hold=0 on every window with the table resolved means"
+                  " getNumBones() read 0,")
+            print("        so createBlendMask was skipped - the technique ran"
+                  " UNMASKED exactly as it")
+            print("        did on trip 20, and 「瞬移」/「缩成一团」 are expected"
+                  " to be unchanged.")
+    else:
+        print("  hold= absent from the close rows: no technique mask in this build.")
+
+    # ---- 3) swfree= : did the host actually stand down, per ride -------------
+    if has_free:
+        print("  swfree= per ride (frames the host's upper body was released):")
+        bad_free = []
+        for d in s.sw_rides:
+            sw, fr = fnum(d, "swing"), fnum(d, "swfree")
+            if sw is None or fr is None:
+                continue
+            hk = hostkeep(d)
+            hkk = hostkeep_key(d) or "hostkeep"
+            print("     %8s  swing=%d swfree=%d%s"
+                  % (d.get("_ts", "?"), int(sw), int(fr),
+                     "" if hk is None else "  (%s=%d)" % (hkk, int(hk))))
+            if int(sw) > 0 and int(fr) == 0:
+                bad_free.append(d.get("_ts", "?"))
+        print("  " + verdict(not bad_free,
+                             "the host stood down on every ride that swung"))
+        if bad_free:
+            print("        swfree=0 with swing>0 on: %s" % ", ".join(bad_free[:6]))
+            print("        The window opened and the leg-pose pass never saw it"
+                  " (RideSwingInFlight is")
+            print("        pointer-compared against gRideSwingWho), so the host"
+                  " kept the torso for the")
+            print("        whole swing - the 「缩成一团」 half is untested by this"
+                  " trip, not disproved.")
+        if is_t27(s):
+            print("  NOTE  ON T27 THESE TWO ARE NOT COMPLEMENTARY ANY MORE.  swfree="
+                  " is still the mask")
+            print("        (the two arm bones taken off the host), hostkeep= is now"
+                  " the frames the guard")
+            print("        was KEPT as host - so both non-zero means \"the host holds"
+                  " the body and has")
+            print("        let go of exactly the arm\", which is the whole T27 design"
+                  " on one row.")
+        else:
+            print("  NOTE  swfree= and guardoff= count different things and need not"
+                  " match: guardoff is")
+            print("        the two guard-assertion sites, swfree is the one leg-pose"
+                  " pass.  Both being")
+            print("        non-zero on the same ride is the shape to expect.")
+    else:
+        print("  swfree= absent from the ride rows: the host is never released"
+              " in this build.")
+
+    # ---- 4) the leak this change can cause, and where it is already measured -
+    print("  NOTE  the regression to fear here is a LEAKED 0.0 entry, not a crash:"
+          " 11 upper-body")
+    print("        entries are now zeroed on every weighted clip mid-window, and a"
+          " ride that ends")
+    print("        INSIDE a window (dismount, knocked down, load) leaves them"
+          " there.  Two places")
+    print("        already judge it and BOTH must stay clean: the handback audit's"
+          " residue= and")
+    print("        dropped= (straddle section above - residue now counts the free"
+          " bones too), and")
+    print("        the eyeball on a character who has just dismounted (arms and"
+          " head frozen at bind")
+    print("        while walking = the leak, §21.2's disease on new bones).  The"
+          " technique state's")
+    print("        own mask leaks onto the PLAYER'S GROUND SWING instead (dead"
+          " root ⇒ an attack that")
+    print("        no longer steps into the blow), and nothing in this file can"
+          " see that - only")
+    print("        fighting on foot after a ride can.")
+    print("  NOTE  what this section cannot say, again: whether the result LOOKS"
+          " like a swing.")
+    print("        Four eyeball outcomes, each with its own next rung:")
+    print("          1. it reads as a chop            ⇒ P4-3-4 is done, close it.")
+    print("          2. no teleport, but the torso is dead/stiff ⇒ the technique's"
+          " tracks need the")
+    print("             host underneath after all: put the arms back under the"
+          " host (shrink the")
+    print("             free table to the spine) and lower kRideSwingTechW instead"
+          " of masking.")
+    print("          3. still 「瞬移到坐骑前面」 ⇒ the root motion is not in"
+          " 'Bip01'/'Bip01 Pelvis'.")
+    print("             Read the hold table's handles above against the P2-1b bone"
+          " inventory before")
+    print("             adding names - a fourth guess at which bone carries it is"
+          " not evidence.")
+    print("          4. torso still 「缩成一团」 while swfree>0 ⇒ two clips is not"
+          " the mechanism;")
+    print("             the technique alone is that shape, and only lowering its"
+          " weight can soften it.")
+
+
+def report_swing_gate(s):
+    """T24 - two chooseAttack questions, one geometry.
+
+    Trip 21 closed T23's mechanism (no teleport, no balled-up torso, no leaked
+    mask - the ground swings after dismounting were normal) and left exactly one
+    gap: 9/9 windows played 'bigchopv2' and the eyeball read 「双手持刀然后反转刀身
+    把刀朝下然后向下刺去」.  Two measured facts explain that shape:
+
+      * init=25.00 is more than double the rider's own reach=10.50, and trip 20
+        (same record, no mask) slid the rider bodily in front of the mount ⇒
+        'bigchopv2' is a CLOSING attack whose footwork is half the animation.
+        T23 masks the root off, so the screen gets the arrival half only.
+      * the mount's own body holds the enemy off, so rider->threat is
+        structurally 12..25 (trip 21 dmin= 12.56 / 13.89 / 21.40 / 15.47) and
+        never inside reach ⇒ asked about that distance the engine correctly
+        keeps answering "close the gap first".
+
+    So the producer now asks twice: chooseAttack(d, reach) for the GATE (its
+    init=/minS= still drive lim=, so the rhythm stays trip 21's) and
+    chooseAttack(min(d, reach), reach) for the CLIP.  Both numbers are the
+    engine's; no distance constant was invented.  gate= vs tech= on the open row
+    is the whole verdict, and it can come back negative on its own terms.
+    """
+    print("")
+    print("== T24 - two questions: gate the engagement, play the in-place attack ==")
+    opens = [d for d in s.sw_open if "gate" in d]
+    fits = [d for d in s.sw_close if "fit" in d]
+    if not (opens or fits):
+        print("  no gate= on any open row and no fit= on any close row: this log")
+        print("  predates the two-question producer.  NOT a failure - T20..T23 above")
+        print("  are that build's whole verdict.")
+        return
+
+    # ---- 1) did the second question return something else -------------------
+    if opens:
+        print("  open rows (gate= is what lim= is read off, tech= is what gets played):")
+        pairs = {}
+        for d in opens[:24]:
+            g = (d.get("gate", "") or "").strip("'")
+            t = (d.get("tech", "") or "").strip("'")
+            pairs[(g, t)] = pairs.get((g, t), 0) + 1
+            print("    %8s  n=%-3s d=%-6s dq=%-6s reach=%-6s gate='%s' -> tech='%s'"
+                  % (d.get("_ts", "?"), d.get("n", "-"), d.get("d", "-"),
+                     d.get("dq", "-"), d.get("reach", "-"), g, t))
+        print("    pairs seen: "
+              + ", ".join("%s -> %s x%d" % (g or "?", t or "?", n)
+                          for (g, t), n in sorted(pairs.items())))
+        moved = [d for d in opens
+                 if (d.get("gate", "") or "").strip("'")
+                 != (d.get("tech", "") or "").strip("'")]
+        if moved:
+            print("  PASS  the second question returned a DIFFERENT record on %d/%d"
+                  " window(s)" % (len(moved), len(opens)))
+            print("        ⇒ asking about min(d, reach) really does move the engine"
+                  " off its closing")
+            print("        attack.  Whether the new record LOOKS like a chop is the"
+                  " eyeball half.")
+        else:
+            print("  CHECK the two questions returned the SAME record on all %d"
+                  " window(s)." % len(opens))
+            print("        This is a CLEAN NEGATIVE, not a code fault: for this"
+                  " rider's technique set")
+            print("        the engine's answer does not depend on the distance it is"
+                  " asked about.")
+            print("        ⇒ the remaining lever is naming a clip ourselves.  Take it"
+                  " from the §17.10")
+            print("        census ONLY ('downward combo' init 10.00/10.00 is the"
+                  " rider-shaped one);")
+            print("        ⚠️ a clip name has never once survived being guessed in"
+                  " this project.")
+
+        # ---- 2) dq= must literally be min(d, reach) -------------------------
+        bad_dq = []
+        for d in opens:
+            dv, rv, qv = fnum(d, "d"), fnum(d, "reach"), fnum(d, "dq")
+            if dv is None or rv is None or qv is None:
+                continue
+            if abs(qv - min(dv, rv)) > 0.011:
+                bad_dq.append(d)
+        print("  " + verdict(not bad_dq,
+                             "dq= is min(d, reach) on every row (%d checked)"
+                             % len(opens)))
+        if bad_dq:
+            print("        %d row(s) disagree, e.g. %s: d=%s reach=%s dq=%s."
+                  % (len(bad_dq), bad_dq[0].get("_ts", "?"),
+                     bad_dq[0].get("d", "-"), bad_dq[0].get("reach", "-"),
+                     bad_dq[0].get("dq", "-")))
+            print("        That is the clamp itself misreading, so the CLIP question"
+                  " was asked about the")
+            print("        wrong distance - everything below is void until it is fixed.")
+
+        # ---- 3) the rhythm must not have moved ------------------------------
+        # lim= is the ladder init -> minS -> reach -> kRideThreatDist, and after
+        # T24 it MUST still be read off the GATE technique.  If it ever comes off
+        # the clip's opinion instead, an in-place record ('chop left-3' 0.00/-10.00,
+        # 'downward combo' 10.00/10.00) silently refuses every window against a
+        # structural d of 12..25 - i.e. the swing disarms and the trip is wasted.
+        bad_lim = []
+        for d in opens:
+            iv, mv, rv, lv = (fnum(d, "init"), fnum(d, "minS"),
+                              fnum(d, "reach"), fnum(d, "lim"))
+            if lv is None:
+                continue
+            if iv is not None and iv > 1.0:
+                want = iv
+            elif mv is not None and mv > 1.0:
+                want = mv
+            elif rv is not None and rv > 1.0:
+                want = rv
+            else:
+                want = 60.0            # kRideThreatDist, the last rung
+            if abs(lv - want) > 0.011:
+                bad_lim.append((d, want))
+        print("  " + verdict(not bad_lim,
+                             "lim= still comes off the ladder's first real opinion"
+                             " (%d row(s) checked)" % len(opens)))
+        if bad_lim:
+            d0, w0 = bad_lim[0]
+            print("        %d row(s) disagree, e.g. %s: init=%s minS=%s reach=%s"
+                  " lim=%s, expected %.2f."
+                  % (len(bad_lim), d0.get("_ts", "?"), d0.get("init", "-"),
+                     d0.get("minS", "-"), d0.get("reach", "-"),
+                     d0.get("lim", "-"), w0))
+            print("        ⚠️ THE failure mode of this rung: judge the real d against"
+                  " the CLIP record's")
+            print("        opinion and every window is refused (swing=0) with nothing"
+                  " visible to explain it.")
+
+    # ---- 4) the arc must never be STRETCHED ---------------------------------
+    if fits and swing_authored(s):
+        print("  fit= is RETIRED BY T25 (this log has arm=): no record is played, so there is no"
+              " phase")
+        print("        to fit and fit=0 is the expected shape.  The three checks above still"
+              " stand - the")
+        print("        producer keeps NAMING a technique every window, which is what gate=/dq=/lim="
+              " read.")
+    elif fits:
+        print("  fit= per window (ms the arc was fitted into; kRideSwingTechMs=1700"
+              " is a ceiling now):")
+        rows = []
+        for d in fits[:12]:
+            fv = fnum(d, "fit")
+            lv = fnum(d, "len")          # the technique state's own Ogre length
+            rows.append("%s:%s%s" % (d.get("_ts", "?"), d.get("fit", "-"),
+                                     "" if lv is None else "/len=%.3f" % lv))
+        print("     " + " ".join(rows))
+        over = [d for d in fits if (fnum(d, "fit") or 0.0) > 1700.5]
+        print("  " + verdict(not over,
+                             "no window fitted the arc into more than"
+                             " kRideSwingTechMs (%d checked)" % len(fits)))
+        if over:
+            print("        %d row(s) over the ceiling - the clamp is inverted."
+                  % len(over))
+        # And when the clip is SHORTER than the window, fit must be its own length:
+        # that is the whole point (1.067 s stretched to 1700 ms = 0.63x slow motion,
+        # which reads as a defect and is what T24 must never introduce).
+        checked, bad_fit, natural = 0, [], 0
+        for d in fits:
+            fv, lv = fnum(d, "fit"), fnum(d, "len")
+            if fv is None or lv is None or lv <= 0.001:
+                continue
+            checked += 1
+            want = min(1700.0, lv * 1000.0)
+            if abs(fv - want) > 2.0:
+                bad_fit.append((d, want))
+            elif lv * 1000.0 < 1700.0:
+                natural += 1      # only a row that AGREES may be counted as
+                                  # "played at its own rate"
+        if checked:
+            print("  " + verdict(not bad_fit,
+                                 "fit= is min(1700, clip length) on every window"
+                                 " (%d checked)" % checked))
+            if bad_fit:
+                d0, w0 = bad_fit[0]
+                print("        e.g. %s: len=%s fit=%s, expected %.0f."
+                      % (d0.get("_ts", "?"), d0.get("len", "-"),
+                         d0.get("fit", "-"), w0))
+            if natural:
+                print("  NOTE  %d/%d window(s) played the clip at its OWN rate"
+                      " (fit<1700) - the record" % (natural, checked))
+                print("        the new question selects is shorter than the window,"
+                      " which is exactly the")
+                print("        case the no-stretch clamp exists for.  It then holds"
+                      " its last pose for the")
+                print("        remainder (setLoop(false)) - a follow-through, not a"
+                      " freeze bug.")
+            else:
+                print("  NOTE  no window played at its own rate ⇒ every record"
+                      " selected this trip is")
+                print("        still LONGER than the window (fit=kRideSwingTechMs"
+                      " throughout), so the")
+                print("        no-stretch clamp was inert - or the fit= check above"
+                      " already failed.")
+        else:
+            print("  NOTE  no close row carried both fit= and len=, so the clamp is"
+                  " unmeasured this trip.")
+
+    # ---- 5) what this file cannot say --------------------------------------
+    if swing_authored(s):
+        print("  ⛔ TRIP 22 ANSWERED THIS SECTION, and the answer retires the whole family:"
+              " the second")
+        print("        question DID return a different record and it DID reach the skeleton,"
+              " and the")
+        print("        eyeball still read 「不是劈砍…平地上的动作在马上用有些放不开，刀砍不出去，"
+              "只能在")
+        print("        自己肚子那块拉，动作都挤成一团了」.  A ground record is authored around"
+              " a STANDING")
+        print("        pelvis; a seated one crushes it, whichever record is named."
+              "  ⇒ the swing is")
+        print("        authored now - judge it in -- T25 --.  gate=/dq=/lim= above are kept"
+              " because the")
+        print("        producer still names a technique per window (it is what lim= gates on).")
+        return
+    print("  NOTE  the verdict is the eyeball, as always.  Five outcomes:")
+    print("          1. it reads as a chop ⇒ P4-3-4 is DONE.  Close T24, and the"
+          " release decision")
+    print("             (does this build replace v1.6 in release\\) becomes the"
+          " next question.")
+    print("          2. gate= == tech= on every row ⇒ see the CHECK above: the"
+          " engine has one")
+    print("             answer, so naming a clip from the §17.10 census is the"
+          " only lever left.")
+    print("          3. the blade is STILL held/pointed wrong ⇒ it is the WRIST,"
+          " not the record:")
+    print("             move 'Bip01 R Hand' (and if that is not enough 'Bip01 R"
+          " Forearm') out of")
+    print("             the T23 free table and into the hold table, so grip and"
+          " blade orientation")
+    print("             stay with 'mid blow' while the arm sweep stays with the"
+          " technique.")
+    print("          4. the new motion is legible but TOO SMALL ⇒ an in-place"
+          " record has less")
+    print("             amplitude by nature; prefer the longer of the two answers"
+          " rather than")
+    print("             raising a weight that is already 1.0.")
+    print("          5. swing=0 for the whole trip ⇒ read the lim= check above"
+          " FIRST; that is the")
+    print("             one way this rung disarms the swing without anything"
+          " visible saying so.")
+
+
+def swing_aimed(s):
+    """True when the build authors DIRECTIONS in skeleton space (T26) rather than
+    joint angles about each bone's bind axes (T25).
+
+    The two are the same machinery with a different parameterisation, so every
+    mechanical criterion (freed==authored, arm=, armt=, kept=, armback) is shared and
+    lives in -- T25/T26 --; only want=/dot=/bx= are T26's own, and they are what
+    -- T26 -- judges.  Dispatch on want=, never on the build's byte count.
+    """
+    return any("want" in d for d in s.sw_arm)
+
+
+def swing_dot_split(s):
+    """Split the dot= samples into (settled, first_frame, unread).
+
+    A sample whose kept= is negative is the FIRST authored frame of its window
+    (RideSwingArmPose sets kept=-1.0 and only overwrites it when gRideSwingArmHeld was
+    already true), and on that frame the cached derived transform we read still holds the
+    HOST's pose ⇒ it measures the read, not the aim.  dot=-2.0000 means a zero-length
+    vector on one side, i.e. never measured.  Both -- T26 -- and -- T27 -- judge only the
+    settled population, so the partition lives here rather than in either of them.
+    """
+    settled, first, unread = [], [], []
+    for d in s.sw_arm:
+        v = fnum(d, "dot")
+        if v is None:
+            continue
+        if v <= -1.5:
+            unread.append((d, v))
+        elif fnum(d, "kept") is not None and fnum(d, "kept") < 0.0:
+            first.append((d, v))
+        else:
+            settled.append((d, v))
+    return settled, first, unread
+
+
+def report_swing_arm(s):
+    """T25/T26 - the authored swing, the half both parameterisations share.
+
+    Trip 22 closed the "play one of the engine's own records" family: the record was
+    named, driven, masked and reached the skeleton, and it still read
+    「不是劈砍…刀砍不出去，只能在自己肚子那块拉，动作都挤成一团了」, because a ground
+    record is authored around a standing pelvis.  The user's ruling
+    (「不一定非要和原版一样，只要像骑砍那样挥砍的动作就行」) drops the fidelity
+    requirement, so the arm is hand-written now - the same machine as the straddle:
+    manual control + a blend-mask 0 on every weighted clip, written at the pre-render
+    point, handed back on the close edge and on dismount (§16, §21.2).
+
+    Two self-proofs matter here and neither existed before: kept= (our write survived
+    the clip's applyToNode) and out=/fore=/down= (where the hand actually went, in
+    skeleton space).  ⚠️ They say the WRITE landed, not that the write was the right
+    one: trip 23 passed every criterion in this section with an eyeball verdict of
+    「往下戳」.  What that log was missing is want=/dot=, which is -- T26 --.
+    """
+    print("")
+    print("== T25/T26 - the AUTHORED swing: we write the arm ourselves ==")
+    if not (s.sw_arm or s.sw_armback or swing_authored(s)):
+        print("  no SWING arm / armback line and no arm= on any ride line: this log predates")
+        print("  the authored swing.  NOT a failure - T20..T24 above are that build's verdict.")
+        return
+    print("  parameterisation: %s"
+          % ("DIRECTIONS in skeleton space (T26 - want=/dot= present)"
+             if swing_aimed(s) else
+             "joint angles about the bind axes (T25 - ⛔ retired by trip 23)"))
+
+    # ---- 1) the freed set must be exactly the authored set ------------------
+    rows = s.sw_free_bones
+    if rows:
+        names = [d.get("_bone", "?") for d in rows]
+        bad = [d for d in rows if d.get("has") != "1"]
+        print("  authored/freed bones: " + ", ".join(
+            "%s=%s" % (n.replace("Bip01 ", ""), d.get("handle", "?"))
+            for n, d in zip(names, rows)))
+        print("  " + verdict(not bad and len(rows) == 2,
+                             "the table is the two arm bones and both resolved by name"
+                             " (%d row(s))" % len(rows)))
+        if bad:
+            print("        has=0 on: %s - that bone is freed from the host and never written,"
+                  % ", ".join(d.get("_bone", "?") for d in bad))
+            print("        so it renders at BIND for the whole window (§17.9's disease).")
+        if len(rows) != 2:
+            print("        ⚠️ %d entries, not 2.  The freed set and the authored set MUST be"
+                  " identical:" % len(rows))
+            print("        a freed-but-unwritten bone renders at bind, an authored-but-unfreed"
+                  " one is")
+            print("        overwritten by the clip.  An 11-row table is the T23/T24 shape.")
+    else:
+        print("  no SWING free bone row: the bone table never resolved (the leg-pose pass")
+        print("  prints it once per DLL load), so nothing below can be trusted.")
+
+    # ---- 2) did the arm get authored on the rides that swung ---------------
+    bad_arm = []
+    any_arm = False
+    for d in s.sw_rides:
+        sw, ar = fnum(d, "swing"), fnum(d, "arm")
+        if sw is None or ar is None:
+            continue
+        any_arm = True
+        print("     %8s  swing=%d arm=%d" % (d.get("_ts", "?"), int(sw), int(ar)))
+        if int(sw) > 0 and int(ar) == 0:
+            bad_arm.append(d.get("_ts", "?"))
+    if any_arm:
+        print("  " + verdict(not bad_arm,
+                             "the arm was authored on every ride that swung"))
+        if bad_arm:
+            print("        arm=0 with swing>0 on: %s" % ", ".join(bad_arm[:6]))
+            print("        The window opened and the leg-pose pass never authored a frame -"
+                  " same cause")
+            print("        as swfree=0 (RideSwingInFlight compares gRideSwingWho by pointer),"
+                  " or")
+            print("        gRideSwingOpenTick was 0 on every one of those frames.")
+
+    # ---- 3) did the arc run to the end of every window ----------------------
+    armts = [d for d in s.sw_close if "armt" in d]
+    if armts:
+        vals = [(d.get("_ts", "?"), fnum(d, "armt")) for d in armts]
+        print("  armt= at close (arc progress, 1.00 = the last key was reached):")
+        print("     " + " ".join("%s:%s" % (t, "-" if v is None else "%.2f" % v)
+                                 for t, v in vals[:14]))
+        short = [t for t, v in vals if v is not None and v < 0.95]
+        never = [t for t, v in vals if v is not None and v < 0.0]
+        print("  " + verdict(not short,
+                             "every window ran the arc to its last key (%d checked)"
+                             % len(vals)))
+        if never:
+            print("        armt=-1.00 means NOT ONE frame was authored in that window.")
+        elif short:
+            print("        cut short on: %s - the window closed before the arc did."
+                  % ", ".join(short[:6]))
+            print("        The window closes on 'mid blow' reaching kRideSwingDoneProg, so"
+                  " kRideSwingArcMs")
+            print("        has to stay under the SHORTEST window, not the average:"
+                  " trip 23 measured")
+            print("        1437..1781 ms and its 1437 ms window cut the 1700 ms arc off at"
+                  " t=0.85, which")
+            print("        is why the arc is 1400 now (it finishes, then HOLDS the last key ="
+                  " ready).")
+            print("        Lower the arc or lower the pinned clip's speed - do NOT raise"
+                  " kRideSwingLenMs")
+            print("        alone (it is a cap, and raising it needs kRideSwingMinGapMs raised"
+                  " with it).")
+
+    # ---- 4) THE self-proof: did our write survive the clip ------------------
+    keeps = [v for v in (fnum(d, "kept") for d in s.sw_arm) if v is not None and v >= 0.0]
+    if keeps:
+        worst = min(keeps)
+        print("  " + verdict(worst >= 0.99,
+                             "our write held on every sample (worst kept=%.4f over %d"
+                             " sample(s))" % (worst, len(keeps))))
+        if worst < 0.99:
+            print("        kept< 1 means the clip is writing these bones AFTER we do:"
+                  " the blend-mask")
+            print("        entry is not 0 for them on some weighted clip.  A manually"
+                  " controlled bone")
+            print("        survives Skeleton::reset() but STILL receives applyToNode -"
+                  " only the mask")
+            print("        protects it (§16).  Check that the freed table above and the"
+                  " authored table")
+            print("        are the same list.")
+    elif s.sw_arm:
+        print("  NOTE  every kept= sample is negative (-1.0000) = first authored frame of a"
+              " window,")
+        print("        which carries no previous write to compare against.  Unmeasured,"
+              " not clean.")
+
+    # ---- 5) where the hand actually went ------------------------------------
+    if s.sw_arm:
+        print("  arc samples (out = away from the body, fore = forward, down = downward,")
+        print("               all in skeleton space, shoulder -> hand):")
+        aimed = swing_aimed(s)
+        for d in s.sw_arm[:18]:
+            if aimed:
+                print("     %8s  t=%-5s | out=%-7s fore=%-7s down=%-7s want=%-18s dot=%s"
+                      % (d.get("_ts", "?"), d.get("t", "-"), d.get("out", "-"),
+                         d.get("fore", "-"), d.get("down", "-"),
+                         d.get("want", "-"), d.get("dot", "-")))
+            else:
+                print("     %8s  t=%-5s abd=%-7s flx=%-7s elb=%-7s | out=%-7s fore=%-7s down=%s"
+                      % (d.get("_ts", "?"), d.get("t", "-"), d.get("abd", "-"),
+                         d.get("flx", "-"), d.get("elb", "-"), d.get("out", "-"),
+                         d.get("fore", "-"), d.get("down", "-")))
+        spans = {}
+        for k in ("out", "fore", "down"):
+            v = [x for x in (fnum(d, k) for d in s.sw_arm) if x is not None]
+            spans[k] = (min(v), max(v), max(v) - min(v)) if v else None
+        line = []
+        for k in ("out", "fore", "down"):
+            if spans[k] is None:
+                line.append("%s=?" % k)
+            else:
+                line.append("%s %.2f..%.2f (span %.2f)" % ((k,) + spans[k]))
+        print("     travel: " + " | ".join(line))
+        widest = max((spans[k][2] for k in spans if spans[k]), default=0.0)
+        print("  " + verdict(widest >= 1.0,
+                             "the hand really travelled (widest span %.2f units)" % widest))
+        if widest < 1.0:
+            print("        The writes hold (kept above) but the hand barely moves ⇒ the"
+                  " rotation is")
+            print("        going somewhere that does not carry the hand: wrong bone handles,"
+                  " or the")
+            print("        amplitude is being cancelled by a parent.  Read the handles in"
+                  " section 1")
+            print("        against the P2-1b bone inventory BEFORE changing any angle.")
+        if not aimed:
+            print("        ⚠️ A BIG SPAN IS NOT A GOOD SWING, and trip 23 is the proof: spans of")
+            print("        7.55/9.12/7.64 on a 6.09 arm with kept=1.0000 read as 「往下戳」,"
+                  " because")
+            print("        bind-relative angles ride the host's torso.  Only want=/dot= (T26)"
+                  " tells")
+            print("        travel apart from the RIGHT travel, and this log has no want=.")
+
+    # ---- 6) custody: the arm must be handed back ---------------------------
+    if s.sw_armback:
+        bad_man = [d for d in s.sw_armback if d.get("man") not in (None, "0x00")]
+        dots = [v for v in (fnum(d, "minDot") for d in s.sw_armback) if v is not None]
+        print("  armback: %d handback(s), worst minDot=%s, man!=0: %d"
+              % (len(s.sw_armback),
+                 "-" if not dots else "%.4f" % min(dots), len(bad_man)))
+        print("  " + verdict(not bad_man and (not dots or min(dots) >= 0.999),
+                             "every handback cleared the manual flag and returned to bind"))
+        if bad_man or (dots and min(dots) < 0.999):
+            print("        THIS is the leak that walks off the mount: an arm bone still under")
+            print("        manual control keeps our last pose forever (Skeleton::reset() does"
+                  " not")
+            print("        touch it), which is a rider walking around with the sword up.")
+    elif swing_authored(s):
+        print("  CHECK no armback line at all.  If any window opened this trip, the arm was"
+              " taken")
+        print("        and never given back on the record - look for a rider with a raised"
+              " arm.")
+
+    # ---- 7) the shared part ends here; T26's own criteria are next ----------
+    print("  NOTE  everything above says the WRITE landed, not that it was the right write.")
+    print("        Trip 23 passed all of it and still read 「往下戳」.  The shape question is")
+    print("        -- T26 -- (want=/dot=) plus the eyeball; the regressions that must hold")
+    print("        alongside are: the four v1.6 behaviours, the straddle (takeovers ==")
+    print("        restored + released, minDot=1.0000, residue=0), no standing upright, no")
+    if is_t27(s):
+        print("        sudden turn to the mount's rear, and the HOST still pinned - which on")
+        print("        this build is 'guard 1h' for the whole window (hostkeep>0, pw>=0.95,")
+        print("        judged in -- T27 --).  It owns everything the arm does not.")
+    else:
+        print("        sudden turn to the mount's rear, and 'mid blow' swapped in and pinned")
+        print("        (guardoff>0, pw>=0.95) - it is the host for everything the arm does")
+        print("        not own.")
+    print("  NOTE  one eyeball check belongs to THIS section, not to T26: LOOK AT THE RIGHT ARM")
+    print("        AFTER DISMOUNTING.  Section 6 is its log-side proof, but a manually")
+    print("        controlled bone that is never released keeps our last pose for the rest of")
+    print("        the session, which is a session-long disfigurement and outranks the shape.")
+
+
+def report_swing_aim(s):
+    """T26 - is the authored arc the arc that reached the screen?
+
+    ⛔ WHY THIS SECTION EXISTS.  T25 authored JOINT ANGLES about each bone's bind axes,
+    and trip 23 passed every mechanical criterion in -- T25/T26 -- with an eyeball
+    verdict of 「更像是往下戳，位移像 \\ 這個符號」.  `tools\\armarc.py --log` found the
+    reason with no model at all: two frames inside ONE window wrote the SAME three
+    angles and the hand landed 72.3 deg apart, while |measured|/|predicted| never left
+    1.04.  A bind-relative angle only fixes a bone against its PARENT, and the parent -
+    clavicle, spine - is host-driven by 'mid blow' at speed 2.5 (the shoulder itself
+    travelled 3.0/4.8/5.1 units inside a window).  The screen was showing our arc TIMES
+    the host's torso sweep.
+
+    ✅ T26 aims each bone's own +X along a direction in SKELETON space instead, by
+    cancelling the parent: local = conj(parentDerived) * UNIT_X.getRotationTo(dir).  The
+    hand then sits at exactly lenFore*dirUpper + lenHand*dirForearm - both bind child
+    offsets are pure +X - so the DLL can compute the vector it MEANT (want=) and dot it
+    against the vector it MEASURED.
+
+    🔑 dot>=0.99 is the headline criterion, and it is a real falsifier, not a tautology:
+    want= is arithmetic on the authored table, the measured half is two
+    _getDerivedPosition() reads through the live skeleton.  A low dot says the parent
+    cancellation did not work - which is also the one thing that would catch a wrong
+    _getDerivedOrientation vtable slot.
+
+    ⚠️ ONE carve-out, and it is stated in section 1 rather than applied quietly: samples
+    with kept<0 are a window's FIRST authored frame, where the cached derived transform
+    still holds the HOST's pose, so they are counted and printed separately instead of
+    judged.  Trip 24's worst sample (0.8268) is exactly one of those.
+    """
+    print("")
+    print("== T26 - the aimed swing: did the arc we authored reach the skeleton ==")
+    if not s.sw_arm:
+        print("  no SWING arm sample at all: nothing to judge here (see -- T25/T26 -- above).")
+        return
+    if not swing_aimed(s):
+        print("  no want= on any SWING arm sample: this log predates the aimed swing (T26).")
+        print("  NOT a failure - it is a T25 log, and -- T25/T26 -- above is its verdict.")
+        print("  ⚠️ Passing that section is NOT passing this one: trip 23 did exactly that.")
+        return
+
+    # ---- 1) THE criterion: intended vs measured ----------------------------
+    # ⚠️ ONE CARVE-OUT, pre-registered here BEFORE the trip it will be applied to, and
+    # narrow on purpose: a sample whose kept= is negative is the FIRST authored frame of
+    # its window (RideSwingArmPose sets kept=-1 when gRideSwingArmHeld was false), and on
+    # that frame the hand position we read is still the one the HOST left there.
+    # `_getDerivedPosition` is const in the linked header (§21.5) and returns the cached
+    # transform, so every sample is really one frame behind - which is ~2 deg at arc rates
+    # but a whole pose on the frame the host hands over.  Such a sample measures the READ,
+    # not the aim, so it is reported with its own count instead of being folded into the
+    # headline.  Trip 24 is exactly this shape: worst 0.8268 on a t=0.00 kept=-1.0000
+    # sample, mean 0.9920 over 36.  ⚠️ It is a carve-out, not a pardon: if the FIRST-frame
+    # numbers are bad AND the settled ones are only just passing, read both.
+    settled, first, unread = swing_dot_split(s)
+    dots = [v for _, v in settled]
+    if dots:
+        worst = min(dots)
+        print("  dot= (intended vs measured shoulder->hand): worst %.4f, mean %.4f, %d sample(s)"
+              % (worst, sum(dots) / len(dots), len(dots)))
+        print("  " + verdict(worst >= 0.99,
+                             "the hand went where the table said, on every settled sample"))
+        if worst < 0.99:
+            print("        worst dot=%.4f = %.1f deg off the intended direction."
+                  % (worst, math.degrees(math.acos(max(-1.0, min(1.0, worst))))))
+            print("        This falsifies the T26 paragraph in RidingPlugin.cpp, so read it in"
+                  " this order:")
+            print("          a. is kept= still ~1.0000 above?  If not, the mask is the bug,"
+                  " not the aim.")
+            print("          b. len= below: the two bind bone lengths must be ~2.85 / ~3.24."
+                  "  A zero")
+            print("             means the bone was not resolved and want= was computed from a"
+                  " short arm.")
+            print("          c. a CONSTANT offset on every sample ⇒ the parent cancellation is"
+                  " inverted")
+            print("             (conj vs the quaternion itself); an offset that GROWS with the"
+                  " torso ⇒")
+            print("             _getDerivedOrientation returned a stale or wrong value ="
+                  " the vtable slot.")
+            print("          d. only the LAST bone is off ⇒ the Forearm is reading its parent"
+                  " back from")
+            print("             the node instead of using the UpperArm's own aim (see the ⚠️ in"
+                  " the")
+            print("             RideSwingArmPose header) - that is a fresh-cache assumption,"
+                  " and it fails.")
+            # ---- lag or aim? -------------------------------------------------
+            # Every sample is one frame behind by construction (const _getDerivedPosition,
+            # §21.5), so SOME deficit is expected wherever the arc is moving fast.  The
+            # separator is arithmetic, not another trip: the intended direction's own motion
+            # between two adjacent log rows, divided by the rows' spacing in authored frames
+            # (kRideSwingArmLogGap in the DLL - ⚠️ change that constant and change ARM_GAP),
+            # is what ONE frame of lag on OUR write can cost.  A deficit near that estimate
+            # is the read; a deficit far above it is not ours to explain by lag, and the next
+            # suspect is the PARENT read (R Clavicle, host-driven - see (c) above).
+            ARM_GAP = 12.0
+            prev = None
+            rows = []
+            for d, v in settled:
+                w = triple(d, "want")
+                step = tri_angle(prev, w) if prev is not None else None
+                if v < 0.99:
+                    rows.append((d, v, step))
+                if w is not None:
+                    prev = w
+            if rows:
+                print("        which of the two it is, per failing sample"
+                      " (deficit vs what ONE frame")
+                print("        of lag could cost at that point in the arc):")
+                for d, v, step in rows[:6]:
+                    deficit = math.degrees(math.acos(max(-1.0, min(1.0, v))))
+                    if step is None:
+                        est = "  n/a (no previous want= row)"
+                    else:
+                        est = "  1-frame lag <= %.1f deg (row-to-row %.1f deg / %d frames)" % (
+                            step / ARM_GAP, step, int(ARM_GAP))
+                        est += "  ⇒ %s" % ("READ LAG" if deficit <= 2.5 * step / ARM_GAP
+                                           else "NOT lag on our write")
+                    print("          %8s t=%-5s dot=%.4f = %5.1f deg off;%s"
+                          % (d.get("_ts", "?"), d.get("t", "-"), v, deficit, est))
+                print("        ⚠️ 'NOT lag on our write' does not mean the table is wrong -"
+                      " the parent")
+                print("           read is stale by the same one frame, and the parent is"
+                      " whatever clip")
+                print("           holds R Clavicle.  A quieter host should shrink this"
+                      " column; see -- T27 --.")
+    elif first:
+        print("  CHECK every dot= sample is a window's FIRST authored frame (kept<0), so the")
+        print("        criterion was never measured on a settled frame.  Unjudged, not passed -")
+        print("        raise kRideSwingArmLines or lower kRideSwingArmLogGap and re-run.")
+    else:
+        print("  CHECK every sample has dot=-2.0000 (or none at all) = shoulder->hand or want=")
+        print("        was degenerate, so THE criterion of this rung was never measured."
+              "  Unjudged,")
+        print("        not passed.")
+    if first:
+        fw = min(v for _, v in first)
+        print("        (%d first-frame sample(s), reported separately: worst dot=%.4f."
+              "  kept=-1 means" % (len(first), fw))
+        print("         the previous frame was the HOST's pose, so the cached derived"
+              " transform this")
+        print("         read comes from is the handover frame - it measures the read lag,"
+              " not the aim.)")
+    if unread:
+        print("        (%d sample(s) reported dot=-2.0000 = a zero-length vector on one side.)"
+              % len(unread))
+
+
+    # ---- 2) the arm lengths want= was built from ---------------------------
+    lens = [d.get("len") for d in s.sw_arm if d.get("len")]
+    if lens:
+        uniq = sorted(set(lens))
+        print("  len= (bind UpperArm->Forearm / Forearm->Hand, read from the live skeleton): %s"
+              % ", ".join(uniq[:4]))
+        ok = True
+        for v in uniq:
+            a, _, b = v.partition("/")
+            try:
+                if not (2.0 <= float(a) <= 4.0 and 2.0 <= float(b) <= 4.5):
+                    ok = False
+            except ValueError:
+                ok = False
+        print("  " + verdict(ok, "both bone lengths are the measured bind arm"
+                                 " (offline: 2.849 / 3.244)"))
+        if not ok:
+            print("        A 0.00 half means that bone did not resolve this frame, so want= was")
+            print("        computed from a shorter arm than the game drew - dot= above is then")
+            print("        measuring the tool, not the code.")
+
+    # ---- 3) did the authored path actually get traversed -------------------
+    wants = [triple(d, "want") for d in s.sw_arm]
+    wants = [w for w in wants if w]
+    if wants:
+        cols = ("out", "fore", "down")
+        got = []
+        for i, k in enumerate(cols):
+            v = [w[i] for w in wants]
+            got.append((k, min(v), max(v), max(v) - min(v)))
+        print("  want= spans: " + " | ".join("%s %.2f..%.2f (span %.2f)" % g for g in got))
+        if is_t28(s):
+            print("     offline table (tools\\armarc.py, T28's ARC2): out span 7.26 |"
+                  " fore 3.83 | down 6.19")
+        else:
+            print("     offline table (tools\\armarc.py, the RETIRED ARC_DIR): out span 6.20 |"
+                  " fore 6.09 | down 8.93")
+        widest = max(g[3] for g in got)
+        print("  " + verdict(widest >= 4.0,
+                             "the windows sampled a real slice of the arc"
+                             " (widest want= span %.2f)" % widest))
+        if widest < 4.0:
+            print("        The table is fine; the SAMPLING is thin.  kRideSwingArmLogGap (12"
+                  " frames) x")
+            print("        kRideSwingArmLines (30 since T28) has to cover kRideSwingArcMs -"
+                  " with a short window")
+            print("        or a spent line budget the log can miss the cut entirely."
+                  "  Read armt= above:")
+            print("        if armt reached 1.00, the ARC ran and only the LOG is short.")
+
+    # ---- 4) the blade, as data instead of a guess --------------------------
+    bxs = [triple(d, "bx") for d in s.sw_arm]
+    bxs = [b for b in bxs if b]
+    if bxs:
+        cols = ("out", "fore", "down")
+        got = []
+        for i, k in enumerate(cols):
+            v = [b[i] for b in bxs]
+            got.append((k, min(v), max(v), max(v) - min(v)))
+        print("  bx= (R Hand bone axis, the blade proxy): "
+              + " | ".join("%s %.2f..%.2f (span %.2f)" % g for g in got))
+        if is_t28(s):
+            print("  ⚠️ T28: these RAW spans are expected to be LARGE - the hand travels with"
+                  " the arm now.")
+            print("        The grip criterion is the angle between bx= and the arm, in"
+                  " -- T28 -- section 2;")
+            print("        judging 正手/反手 off the raw spans is what these numbers"
+                  " cannot do.")
+        else:
+            print("  NOTE  no criterion on purpose - nothing has ever measured which axis of the"
+                  " hand")
+            print("        the weapon follows.  The wrist is left to the host DELIBERATELY (it is"
+                  " what")
+            print("        kept the grip sane through T24), so this is here to answer 「刀身朝向对不对」")
+            print("        with data on the NEXT round instead of a guess.  A bx= that barely moves")
+            print("        while the hand travels = the blade keeps one attitude through the whole")
+            print("        stroke, which is the 'stab, not slash' look; if that is the eyeball")
+            print("        verdict, 'Bip01 R Hand' goes into BOTH tables (freed AND authored),"
+                  " never one.")
+
+    # ---- 5) what the eyeball has to answer this trip -----------------------
+    if is_t28(s):
+        print("  NOTE  the shape is judged in -- T28 -- section 7 for this build - the four")
+        print("        outcomes there replace the ones that used to print here, because two of")
+        print("        them (aim freely / edit the directions) are what T28 deleted.")
+        return
+    print("  NOTE  the shape is still not in this file.  Four outcomes:")
+    print("          1. it reads as a sabre cut ⇒ P4-3-4 is DONE.  Close T26; what is left is")
+    print("             the release decision (does this build replace v1.6 in release\\).")
+    print("          2. dot>=0.99 and it STILL does not read as a swing ⇒ the machinery is")
+    print("             finally out of the way and the TABLE is the only thing left."
+          "  Edit the")
+    print("             five rows of kRideSwingArc and armarc.py's ARC2 TOGETHER,"
+          " look at the")
+    print("             offline plot first, and change one key at a time.")
+    print("          3. right shape, wrong TIMING (too slow to read as a cut, or over before")
+    print("             it is seen) ⇒ kRideSwingArcMs, which must stay under the shortest")
+    print("             window (trip 23: 1437 ms).  The arc holds its last key after t=1.")
+    print("          4. the arm is right but the BLADE is wrong ⇒ section 4's bx=, and the")
+    print("             wrist rule there.")
+
+
+def report_swing_host(s):
+    """T27 - the window KEEPS its host: does holding 'guard 1h' through the stroke work?
+
+    ⛔ WHY THIS SECTION EXISTS.  Trip 24 (T26's aimed arc) got the eyeball to
+    「有点劈砍的意思了」 and named what was left: 「角色的右手总是想找左手因为原版就是
+    双手劈砍的，所以把动作带崩了」.  The mechanism is one step off that reading - the right
+    HAND's position is already ours (dot= mean 0.9920 over 36 samples) so no clip is
+    pulling that hand - but the conclusion holds.  What the swapped-in 'mid blow' still
+    owned was everything the arc does NOT: the LEFT arm, the right WRIST and the SPINE.
+    It is one of the six `blow` records, all 'whole,action,norm,reloc,restrict' =
+    two-handed committed strike (doc.md :245), so its left-arm track kept reaching across
+    for a grip our arc had already carried away.
+
+    ✅ T27 therefore stops swapping the host at all: 'guard 1h' (UPPER, LOOP,
+    weaponTypeFlags bit 0x04 = ONE-HANDED, no whole/reloc - doc.md :248) stays pinned
+    straight through the window and the authored arc cuts on top of it.  Three things
+    come free - no root motion inside the window, a wrist that keeps a one-handed
+    attitude for the whole stroke, and a window length that is our own arc's rather than
+    a restatement of 'mid blow's.
+
+    WHAT THAT RETIRES, and this section states it so nothing reads a design decision as
+    a regression: rst= (nothing to restart), sp= (a loop's speed is meaningless), prog=
+    as a close test (a LOOP's progress cycles), and §U's ClipPin-door dodge (the door is
+    `target + others <= 1.02f` and after this change only ONE clip ever asks for 1.0).
+
+    WHAT IT PUTS AT RISK, which is what the checks below are: the guard has to survive
+    being held for 1650 ms with our writes on two of its bones (pinst=/pw=/psw=/oen=),
+    the window has to close on OUR clock (ms= ~ kRideSwingWinMs), and the retired
+    assertion sites have to stay retired (rst=/drv=/hold=/fit= all 0).
+    """
+    print("")
+    print("== T27 - the window keeps its host ('guard 1h' straight through) ==")
+    if not (s.sw_rides or s.sw_close):
+        print("  no P43SW row at all - nothing to judge (see T20 above).")
+        return
+    if not is_t27(s):
+        print("  close rows carry guardoff=, not hostkeep=: this log is from a build whose")
+        print("  window still SWAPPED 'mid blow' onto the body.  NOT a failure - T20/T21"
+              " above")
+        print("  are its verdicts.  ⚠️ Passing those is not passing this: they judge the swap")
+        print("  this rung deletes.")
+        return
+
+    # ---- 1) the host guarantee, at its strongest ---------------------------
+    # The guard is resolved once per DLL load on the stance's first frame.  On T20..T26
+    # this line was background; here it is the precondition for the whole rung, because
+    # the clip it names is the body's host for every frame of every window.
+    if s.k_guard is None:
+        print("  CHECK no `P41K resolve` line in this log at all.  It is UNGATED and prints"
+              " on the")
+        print("        stance's first frame, so its absence means the stance never armed"
+              " - read")
+        print("        -- T18 -- and stop here; nothing below is judgeable.")
+    else:
+        print("  " + verdict(s.k_guard == "found",
+                             "'guard 1h' resolved in the rider's own table (guard=%s)"
+                             % s.k_guard))
+        if s.k_guard != "found":
+            print("        gP41kGuard is NULL, so RideSwingPass's `if (!host)` gate refuses"
+                  " EVERY window")
+            print("        (noclip= in T20 counts them) and the stance has no host either."
+                  "  This is not")
+            print("        a swing bug - FindAnimData could not find the clip in this rider's"
+                  " table.")
+        if s.k_blow is not None:
+            print("  NOTE  blow='mid blow' %s.  T27 only RESOLVES it - nothing requests it any"
+                  % s.k_blow)
+            print("        more.  The line is kept as standing evidence that the rider's table"
+                  " really")
+            print("        does hold a swing record, which is what makes the retreat in §17.18"
+                  " possible.")
+
+    # ---- 2) did the host survive being held through the stroke -------------
+    # ⚠️ THE FIELDS ARE THE SAME ONES T21 READ AND THEY DESCRIBE A DIFFERENT CLIP.
+    # RideSwingProbePin is handed `host`, which was gP41kBlow up to T26 and is gP41kGuard
+    # now, so pinst=/pw=/psw=/oen= on a T27 close row are the GUARD's.  pw is the
+    # SingleAnimation weight, oen the Ogre state's enabled flag: both at the close edge,
+    # i.e. after the whole window has run with our two bones written every frame.
+    closes = [d for d in s.sw_close if "pinst" in d]
+    if closes:
+        st = [(d.get("_ts", "?"), (d.get("pinst") or "?")) for d in closes]
+        dead = [t for t, v in st if v != "live"]
+        print("  " + verdict(not dead,
+                             "the guard's entry was still live at every close (%d/%d)"
+                             % (len(closes) - len(dead), len(closes))))
+        if dead:
+            print("        pinst=none/AV at %s.  none = the guard is no longer in the"
+                  " playing list, which" % ", ".join(dead[:6]))
+            print("        is trip 17's hostless skeleton with a new cause (T27 never"
+                  " withholds it, so")
+            print("        something else dropped it); AV = the layer walk hit a dangling"
+                  " list.")
+        pws = [v for v in (fnum(d, "pw") for d in closes) if v is not None]
+        if pws:
+            print("  " + verdict(min(pws) >= 0.95,
+                                 "the guard kept its render weight through the window"
+                                 " (worst pw=%.3f of %d)" % (min(pws), len(pws))))
+            if min(pws) < 0.95:
+                print("        The guard is pinned to 1.0 at BOTH sites every frame, so a"
+                      " sagging pw means")
+                print("        something is draining it while the window is open."
+                      "  ClipPin's door")
+                print("        (`target + others <= 1.02f`) is the first suspect, and on T27"
+                      " it should be")
+                print("        the LEAST likely it has ever been: only one clip asks for 1.0"
+                      " now.  Read the")
+                print("        P41K weight rows for that timestamp before touching the door"
+                      " (⛔ TASK.md")
+                print("        :326-334 says the door is not to be rewritten).")
+        sw = [d.get("psw") for d in closes]
+        oe = [d.get("oen") for d in closes]
+        badsw = [x for x in sw if x is not None and x != "1"]
+        badoe = [x for x in oe if x is not None and x != "1"]
+        if any(x is not None for x in sw) or any(x is not None for x in oe):
+            print("  " + verdict(not badsw and not badoe,
+                                 "stillWanted and the Ogre state stayed on (psw!=1: %d,"
+                                 " oen!=1: %d)" % (len(badsw), len(badoe))))
+            if badsw or badoe:
+                print("        psw=0 means our per-frame request stopped reaching the entry;"
+                      " oen=0 means the")
+                print("        entry is there but its Ogre state is disabled, so the pose"
+                      " is not being")
+                print("        applied at all.  Either one makes every 'kept=1.0000' above"
+                      " a write onto a")
+                print("        body nobody is drawing.")
+        # The pair that answers "does holding the host cost the stance anything": pw on the
+        # OPEN row is sampled at the open decision, pw on the close row after 1650 ms of
+        # window.  ⚠️ pre pinst=live is the EXPECTED shape here and it was NOT on T21 -
+        # there the probe looked at a one-shot whose entry did not exist yet (pinst=none
+        # 14/14).  Here it looks at a clip that has been playing since the stance began.
+        opens = [d for d in s.sw_open if "pinst" in d]
+        if opens:
+            pre_dead = [d.get("_ts", "?") for d in opens
+                        if (d.get("pinst") or "?") != "live"]
+            print("  " + verdict(not pre_dead,
+                                 "the guard was ALREADY playing at every open decision"
+                                 " (%d/%d live)"
+                                 % (len(opens) - len(pre_dead), len(opens))))
+            if pre_dead:
+                print("        pre pinst=none at %s: the stance's own host was not in the"
+                      " playing list when" % ", ".join(pre_dead[:6]))
+                print("        the window opened.  On T21 that reading was ROUTINE (the"
+                      " one-shot's entry was")
+                print("        built a frame later); on T27 it is news, because the guard"
+                      " is supposed to have")
+                print("        been pinned since the stance's first frame.")
+            po = [v for v in (fnum(d, "pw") for d in opens) if v is not None]
+            if po and pws:
+                print("  guard weight: open worst %.3f -> close worst %.3f  (held for the"
+                      " whole window)" % (min(po), min(pws)))
+
+    # ---- 3) the window closed on OUR clock ---------------------------------
+    # kRideSwingArcMs 1400 < kRideSwingWinMs 1650 < kRideSwingLenMs 3000 (cap) <
+    # kRideSwingMinGapMs 3200.  ms= below 1650 is structurally impossible (the close edge
+    # only fires once `now - openTick >= kRideSwingWinMs`), and ms= at the 3000 cap means
+    # the CAP closed the window - which after T27 can only happen if an open tick outlived
+    # a per-ride reset, not because a clip ran long.
+    WIN, CAP = 1650, 3000
+    mss = [(d.get("_ts", "?"), v) for d in s.sw_close
+           for v in (fnum(d, "ms"),) if v is not None]
+    if mss:
+        vals = [v for _, v in mss]
+        early = [(t, v) for t, v in mss if v < WIN - 1]
+        capped = [(t, v) for t, v in mss if v >= CAP - 60]
+        print("  window lengths: %s ms  (expected ~%d = kRideSwingWinMs; cap %d)"
+              % ("/".join("%d" % v for v in vals[:12]), WIN, CAP))
+        print("  " + verdict(not early and not capped,
+                             "every window closed on the arc's own clock (%d window(s))"
+                             % len(vals)))
+        if early:
+            print("        ms < %d at %s.  The close edge cannot fire before that by"
+                  " construction, so" % (WIN, ", ".join(t for t, _ in early[:6])))
+            print("        either kRideSwingWinMs was changed without changing this section,"
+                  " or the open")
+            print("        tick was rewritten mid-window (gRideSwingOpenTick is cleared by"
+                  " the per-ride")
+            print("        reset and by the rider-mismatch branch - both should also clear"
+                  " gRideSwingWasOpen).")
+        if capped:
+            print("        ms at the %d ms CAP at %s: kRideSwingLenMs closed the window,"
+                  " not kRideSwingWinMs." % (CAP, ", ".join(t for t, _ in capped[:6])))
+            print("        On T27 the cap is a pure safety net, so a hit means the window's"
+                  " own bound was")
+            print("        not applied - read the `open` computation, not the tuning.")
+        print("  NOTE  the ARC's completion is armt= in -- T25/T26 --, not ms=."
+              "  kRideSwingArcMs")
+        print("        (1400) finishes ~250 ms before the window does, and holds its last"
+              " key for the")
+        print("        remainder - that tail IS the settle pose, and it is why the two"
+              " numbers differ.")
+
+    # ---- 4) the retired assertion sites must STAY retired ------------------
+    # Four counters, four deleted call sites.  This is the check that catches the swap or
+    # the drive being reintroduced by a later edit - each one is a design decision of this
+    # rung, so a nonzero value is a code change, never a tuning artefact.
+    zero_bad = []
+    for d in s.sw_rides:
+        for k in ("rst", "drv"):
+            v = fnum(d, k)
+            if v is not None and v != 0:
+                zero_bad.append((d.get("_ts", "?"), k, v))
+    for d in s.sw_close:
+        for k in ("hold", "fit"):
+            v = fnum(d, k)
+            if v is not None and v != 0:
+                zero_bad.append((d.get("_ts", "?"), k, v))
+    print("  " + verdict(not zero_bad,
+                         "the four retired sites are all silent (rst/drv/hold/fit = 0)"))
+    if zero_bad:
+        for t, k, v in zero_bad[:8]:
+            print("        %8s  %s=%g - that call site was REMOVED in this rung." % (t, k, v))
+        print("        rst= is RideSwingRestart (no one-shot to restart), drv=/hold=/fit="
+              " are T22's")
+        print("        drive of the technique's own Ogre state, its blend mask and T24's"
+              " phase fit.")
+        print("        ⚠️ Do not re-attach the drive to 'fix' a stiff swing: its mask frees"
+              " only eight")
+        print("        bones and would fight the authored arm.  The answer to 「太僵」 is the"
+              " spine")
+        print("        (P4-1M's twist is already ours, RidingPlugin.cpp:6295).")
+
+    # ---- 5) the three per-frame counters have to agree ---------------------
+    # hostkeep= is counted in HaltAndForceSitPass (render side), arm= and swfree= in
+    # LegPosePass, all three on every frame a window is in flight.  Trip 24 measured
+    # 636/635/635 - a one-frame offset from the open frame, before the leg pass runs.
+    # A real gap means one of the two passes is not running while the other thinks a
+    # window is open, which is a pass-order or rider-identity fault, not tuning.
+    rows = [d for d in s.sw_rides if (fnum(d, "swing", 0) or 0) > 0]
+    if rows:
+        bad_agree = []
+        for d in rows:
+            hk = hostkeep(d)
+            ar = fnum(d, "arm")
+            fr = fnum(d, "swfree")
+            if hk is None or ar is None:
+                continue
+            tol = max(8.0, 0.02 * hk)
+            if abs(hk - ar) > tol or (fr is not None and abs(hk - fr) > tol):
+                bad_agree.append((d.get("_ts", "?"), hk, ar, fr))
+        print("  " + verdict(not bad_agree,
+                             "hostkeep / arm / swfree agree on every ride that swung"
+                             " (%d ride(s))" % len(rows)))
+        if bad_agree:
+            for t, hk, ar, fr in bad_agree[:6]:
+                print("        %8s  hostkeep=%g arm=%g swfree=%s"
+                      % (t, hk, ar, "-" if fr is None else "%g" % fr))
+            print("        All three count frames INSIDE a live window, from two passes"
+                  " that both run")
+            print("        once per frame, so they can only diverge if one pass is not"
+                  " reached (an early")
+            print("        return above it) or the two disagree about WHICH rider is"
+                  " swinging")
+            print("        (gRideSwingWho).  arm << hostkeep in particular means the"
+                  " window held the host")
+            print("        for frames that authored nothing - which renders the freed bones"
+                  " at BIND (§17.9).")
+
+    # ---- 6) the aim, which is a LAG term and now has a bigger rate to lag behind ----
+    # want= cancels the parent through `conj(parentDerived)`, and that read is one frame
+    # stale (const _getDerivedOrientation, §21.5) ⇒ the deficit in dot= scales with how fast
+    # the whole arm is turning: the host's contribution (R Clavicle, 'guard 1h', a LOOP at
+    # 1.0) plus OUR OWN arc rate.  Trips 24→25→26 differenced the 9.6 deg residual by moving
+    # one thing at a time: host 0.6 deg, model 1.7 deg, remainder 7.3 = the stale read.
+    # 🆕 T29 RAISES THE ARC'S PEAK RATE ON PURPOSE, 341 → 461 deg/s (a real hold at the top
+    # buys a faster descent).  A lag term must loosen with that, by construction:
+    #   scaled expectation = 7.3 * 461/341 = 9.9 deg, and that is an UPPER bound because
+    #   part of the 7.3 is the host, which did not change ⇒ anything at or under 9.9 is the
+    #   same defect at a higher speed, NOT a regression.
+    # ⛔ AND NOT A REASON TO TOUCH THE ARC.  This number is the price of the tempo the trip
+    # is buying; retuning the table to flatter it would undo the change under test.  The only
+    # honest fix is a fresh parent read (§21.5), which is a different rung entirely.
+    # Baseline = trip 26 (BE962686, diagnostics OFF, same host, same model, the shape being
+    # replaced), SETTLED samples only: worst 0.9918 (7.3 deg), mean 0.9984, 98 samples.
+    if swing_aimed(s):
+        settled, first24, _unread = swing_dot_split(s)
+        vals = [v for _, v in settled]
+        if vals:
+            BASE_W, BASE_DEG = 0.9918, 7.3
+            BAR_DEG = 11.0          # 9.9 scaled + 1.1 slack; see the derivation above
+            worst = min(vals)
+            wdeg = math.degrees(math.acos(max(-1.0, min(1.0, worst))))
+            print("  aim vs a 1.35x faster arc: settled worst %.4f (%.1f deg), mean %.4f,"
+                  " %d sample(s)" % (worst, wdeg, sum(vals) / len(vals), len(vals)))
+            print("  " + verdict(wdeg <= BAR_DEG,
+                                 "within the rate-scaled bar %.1f deg (trip 26 was %.4f /"
+                                 " %.1f deg at 341 deg/s)" % (BAR_DEG, BASE_W, BASE_DEG)))
+            if wdeg <= BASE_DEG:
+                print("        ⇒ and it did not loosen AT ALL despite +35%% peak rate, which"
+                      " says the")
+                print("          residual is host/parent rather than ours by an even wider"
+                      " margin than")
+                print("          the trip 24→26 differencing showed.  Worth a line in §17.19.")
+            elif wdeg > BAR_DEG:
+                print("        Loosened by MORE than the rate scaling can explain ⇒ something"
+                      " other than")
+                print("          lag.  Check WITNESS 1 (r= flat) and kept= first: if either"
+                      " moved, the")
+                print("          rigid-body model is being fought, and the arc table is"
+                      " downstream of that.")
+                print("        ⛔ Do not answer this by softening the arc - that would retune"
+                      " away the")
+                print("          very tempo this trip is testing.")
+
+    # ---- 7) what only the eyeball can answer this trip ---------------------
+    print("  NOTE  the shape is STILL not in this file, and 🆕 T29 changed the ARC ITSELF (the")
+    print("        window slid up the same circle: -100/+45 → -130/+25, plus a hold at each")
+    print("        end).  Trip 26 already accepted the direction (「侧面张开大臂带动刀，简单美")
+    print("        观」) - what this trip asks is whether it now reads as a CHOP.  Outcomes:")
+    print("          1. it reads as a downward cut ⇒ P4-3-4 is DONE.  Close T29; what is left")
+    print("             is the release decision (does this build replace v1.6 in release\\).")
+    print("          2. STILL 「侧面」 ⇒ the endpoints are already vert/lat 2.17, so the")
+    print("             remaining sideways component is the circle's own mid-stroke bulge (out")
+    print("             reaches 5.21 between the two keys, +2.34 past either end) and NO arc")
+    print("             table can remove it.  That is the AXIS dial, and the measured fallback")
+    print("             is a sagittal axis (log ≈ out 1 / fore 0 / down 0), which holds out")
+    print("             constant at 1.41 for the whole stroke.  ⚠️ Both mirrors together.")
+    print("          3. 「太僵」 / the body does not join in ⇒ author the SPINE.  P4-1M's"
+          " twist")
+    print("             is already ours (RidingPlugin.cpp:6295) and 'Bip01 Spine' would"
+          " re-enter")
+    print("             BOTH tables together.  ⛔ NOT by bringing a ground record back:"
+          " that is the")
+    print("             wall trips 20/22/24 hit three different ways.")
+    print("          4. the raise is now too big / the blade clips the head ⇒ offline says it")
+    print("             does not (cock out 2.87 down -4.41 vs head base out -1.83 down -2.22),")
+    print("             so trust the eyeball over that and pull the cock key back toward -115.")
+    print("          5. the arm is right and the BLADE is wrong ⇒ bx=/bz= in -- T26 --"
+          " section 4,")
+    print("             and the wrist rule there ('Bip01 R Hand' into BOTH tables or"
+          " neither).")
+    print("  NOTE  the regressions that must hold alongside, each judged in its own section:")
+    print("        the four v1.6 behaviours (P43RD/P43SUP), the straddle (takeovers ==")
+    print("        restored + released, minDot=1.0000, residue=0, dropped=0), no standing")
+    print("        upright on the mount, no sudden turn to its rear (hdveto=), and zero AV.")
+    print("        ⚠️ AND THE ONE EYEBALL CHECK THAT OUTRANKS THE SHAPE: look at the right"
+          " arm")
+    print("        AFTER DISMOUNTING (-- T25/T26 -- section 6 is its log-side proof only).")
+
+
+def swing_arm_windows(s):
+    """s.sw_arm split into windows: t only ever increases inside one.
+
+    The arm line carries no window number (it is throttled by kRideSwingArmLogGap and
+    budgeted by kRideSwingArmLines, so it cannot be tied to a close row by counting), and
+    every criterion in -- T28 -- is a WITHIN-window statement.  A t that goes backwards is
+    the only boundary marker there is, and it is a sound one: t is elapsedMs/kRideSwingArcMs
+    clamped to 1, so it is monotonic per window by construction.
+    """
+    wins, cur = [], []
+    for d in s.sw_arm:
+        t = fnum(d, "t")
+        if t is None:
+            continue
+        if cur and t < fnum(cur[-1], "t", 0.0) - 1e-9:
+            wins.append(cur)
+            cur = []
+        cur.append(d)
+    if cur:
+        wins.append(cur)
+    return wins
+
+
+def is_t28(s):
+    """T28 rows carry deg= and r=; every earlier arm line carried neither."""
+    return any("deg" in d and "r" in d for d in s.sw_arm)
+
+
+def is_t30(s):
+    """T30 rows carry elbow=; T28/T29 carried deg=/cone= and no elbow=.
+
+    Dispatch on the FIELD NAME, never on a trip number or a byte count - the same rule
+    is_t27() follows, and the reason is sharper here than anywhere else in this file: T28
+    needed the elbow FROZEN and T30 needs it to MOVE, so the two sections' criteria are each
+    other's negation.  Guessing the family from anything but the field is how a working build
+    gets failed by the previous rung's bar.
+    ⚠️ `elb=` is NOT this field.  T25's retired joint-angle line printed abd=/flx=/elb=, and
+    kv() keys those separately, so a T25 log cannot be mistaken for a T30 one.
+    """
+    return any("elbow" in d for d in s.sw_arm)
+
+
+def _len_pair(d):
+    """An arm row's len=<UpperArm->Forearm>/<Forearm->Hand> as two floats, or None.
+
+    Same rule as fnum_flagged(): one unparsable half drops the pair rather than reading as a
+    zero, because a 0.00 there is the log SAYING a bone did not resolve that frame.
+    """
+    v = d.get("len")
+    if not v:
+        return None
+    a, _, b = v.partition("/")
+    try:
+        return (float(a), float(b))
+    except ValueError:
+        return None
+
+
+def arm_vec(d):
+    """The shoulder->hand vector off an arm row's FLAT out=/fore=/down= fields.
+
+    Not triple(): the arm line prints this one loose ("out=%.2f fore=%.2f down=%.2f") because
+    it predates the (a,b,c) tuples beside it, while want=/bx=/bz=/sh= are tuples.  Same rule
+    as everywhere else - one missing component drops the row rather than reading as a zero.
+    """
+    v = (fnum(d, "out"), fnum(d, "fore"), fnum(d, "down"))
+    return None if None in v else v
+
+
+def _t28_deg(d):
+    """An arm row's own deg=, formatted, or '-' when the build never printed one."""
+    v = fnum(d, "deg")
+    return "-" if v is None else "%.1f" % v
+
+
+def report_swing_arc(s):
+    """T28 - ONE rigid rotation of a captured pose.  Did the elbow stay put and the grip hold?
+
+    ⛔ WHAT TRIP 25 SAID, and it named a mechanism, not a taste:
+    「本来是正手拿刀，动作是正手变反手然后从右侧劈出。只需要正手拿刀劈出就好。劈砍动作我试了
+    一下，大臂旋转小臂不动，带动小臂，带动刀。其他和以前一样」  The DIRECTION of the cut was
+    never the complaint - only the flip and the elbow.
+
+    BOTH HALVES WERE MEASURABLE IN THAT SAME LOG, offline, and both came out against the
+    retired model (`python tools\\armarc.py --log <trip-25 log>` reprints all of it):
+      * |shoulder->hand| moved by 0.617 .. 0.868 units inside every window, on a 5.4-unit
+        arm.  A rotation about the shoulder cannot change that length, so the elbow was
+        demonstrably flexing - and in the retired table's own numbers the forearm swung
+        ~124 deg while the upper arm turned 27.7, the exact inverse of 「大臂旋转小臂不动」.
+      * the angle between the weapon hand's own +X and the arm wandered 27.1 .. 54.0 deg
+        per window.  That IS 正手变反手, quantified: `UNIT_X.getRotationTo(dir)` is the
+        MINIMAL rotation onto a direction, so it fixes the bone's axis and leaves the roll
+        about it to fall out of the arc - and 'Bip01 R Hand' inherits every degree.
+
+    ✅ T28 replaces the two authored DIRECTIONS with one authored ANGLE: capture the upper
+    arm's derived orientation and the forearm's LOCAL orientation at window open, then write
+    derived_upper = S(t) * refUp and local_forearm = refFo verbatim every frame.  A constant
+    forearm local makes the elbow angle constant BY CONSTRUCTION, so the whole arm-and-blade
+    assembly is one rigid body turning about the shoulder.  Both complaints therefore become
+    arithmetic identities, and the two numbers above become this section's criteria.
+
+    ⚠️ AND THE PRICE, so nobody reads it as a bug: a rigid rotation traces a CONE.  Reach
+    and elbow angle are whatever 'guard 1h' happens to be holding - we do not choose where
+    the hand ends up any more.  The only two dials left are the AXIS and the ANGLE PROFILE.
+    """
+    print("")
+    print("== T28 - one rigid rotation: the elbow frozen, the grip carried ==")
+    if not s.sw_arm:
+        print("  no SWING arm sample at all - nothing to judge (see -- T25/T26 -- above).")
+        return
+    if not is_t28(s):
+        if is_t30(s):
+            print("  the arm rows carry elbow= and no deg=: this is a T30 log (vanilla's own two")
+            print("  baked curves played as a delta), and it is judged in -- T30 -- below."
+                  "  ⚠️ NOT")
+            print("  failed here, and not judgeable here either: T28 needed the elbow FROZEN and"
+                  " T30")
+            print("  needs it to MOVE, so every bar in this section is the negation of the one"
+                  " that")
+            print("  applies.  Running them anyway would fail a working build.")
+            return
+        print("  the arm rows carry no deg=/r=: this log predates T28, whose whole model is"
+              " ONE")
+        print("  angle about one axis.  NOT a failure - -- T25/T26 -- and -- T27 -- are its")
+        print("  verdicts.  ⚠️ Passing those is not passing this: they judge two independently")
+        print("  aimed directions, which is the thing this rung deletes.")
+        return
+    wins = swing_arm_windows(s)
+    print("  %d sample(s) in %d window(s) of samples (the arm line is throttled and budgeted,"
+          % (len(s.sw_arm), len(wins)))
+    print("  so this is not the number of windows - P43SW ride's swing= is).")
+
+    # ---- 1) THE ELBOW.  The one criterion no read lag can degrade. ---------
+    # r= is |shoulder->hand| straight off the two node positions.  Under our writes the whole
+    # chain below the shoulder is a rigid rotation of the captured pose, so this length is
+    # invariant - and a stale read cannot spoil it either, because a lagged sample is a
+    # ROTATED sample and a rotation preserves length.  It needs no model, no bind pose and no
+    # copy of the arc table, which makes it the sharpest instrument this file has ever had on
+    # the swing.  Baseline to beat: trip 25's 0.617 .. 0.868 per window (armarc.py --log).
+    FLAT = 0.05
+    spreads = []
+    for i, w in enumerate(wins):
+        rs = [v for v in (fnum(d, "r") for d in w) if v is not None]
+        if len(rs) >= 2:
+            spreads.append((i + 1, min(rs), max(rs), max(rs) - min(rs), len(rs)))
+    if not spreads:
+        print("  CHECK no window has two r= samples - the arm line budget"
+              " (kRideSwingArmLines) or the")
+        print("        throttle (kRideSwingArmLogGap) is starving the one measurement this"
+              " rung turns on.")
+    else:
+        worst = max(spreads, key=lambda x: x[3])
+        for n, lo, hi, sp, cnt in spreads:
+            print("    win%-2d n=%-3d r=%.3f .. %.3f   spread %.3f" % (n, cnt, lo, hi, sp))
+        print("  " + verdict(worst[3] <= FLAT,
+                             "|shoulder->hand| is FLAT in every window (worst spread %.3f <="
+                             " %.2f) = 「大臂旋转小臂不动」" % (worst[3], FLAT)))
+        if worst[3] > FLAT:
+            print("        win%d spans %.3f .. %.3f.  Three things could do that and none of"
+                  " them is tuning:" % (worst[0], worst[1], worst[2]))
+            print("          a) the forearm write is not landing - then kept= in -- T25/T26 --"
+                  " is also")
+            print("             below 1.0, and the mask is the suspect (§17.9), not the arc.")
+            print("          b) the capture went stale - refUp/refFo are cleared at the close"
+                  " edge, at")
+            print("             both per-ride resets and in RideSwingArmRelease; a survivor"
+                  " would freeze")
+            print("             an elbow angle that never existed, and r= would STEP once"
+                  " rather than drift.")
+            print("          c) 'guard 1h' keys the HAND bone's local POSITION (we own"
+                  " rotations only).")
+            print("             The only innocent explanation, and it would show up here and"
+                  " nowhere else,")
+            print("             as a drift correlated with t.")
+            print("        ⛔ Do not answer this by editing kRideSwingArc: an angle profile"
+                  " cannot change")
+            print("        a length the model holds constant.")
+
+    # ---- 2) THE GRIP.  Also model-free, also lag-proof. ---------------------
+    # angle(bx, arm) = the weapon hand's own +X against the shoulder->hand vector.  Under one
+    # rigid rotation BOTH turn by the same S(t), so the angle BETWEEN them is preserved - which
+    # makes its spread a direct reading of 正手变反手 needing no axis constant, no quaternion
+    # algebra and no second copy of the arc table to drift out of sync.
+    # ⚠️ NOT the raw bx= spans in -- T26 -- section 4: those are EXPECTED to be large now,
+    # because the hand is supposed to travel with the arm.  Only the part that survives after
+    # the shared rotation is removed is a flip, and this is that part.
+    # Baseline (trip 25, `python tools\\armarc.py --log`): spread 27.1 / 30.7 / 46.6 / 52.5 /
+    # 54.0 deg per window, 1.7 .. 55.7 overall = the flip the user saw, quantified.
+    GRIP = 15.0
+    grips = []
+    for i, w in enumerate(wins):
+        a = [v for v in (tri_angle(triple(d, "bx"), arm_vec(d)) for d in w) if v is not None]
+        if len(a) >= 2:
+            grips.append((i + 1, min(a), max(a), max(a) - min(a), len(a)))
+    if not grips:
+        print("  CHECK no window has two bx= samples with a hand vector beside them - the grip")
+        print("        criterion is UNJUDGED (not passed).")
+    else:
+        gworst = max(grips, key=lambda x: x[3])
+        for n, lo, hi, sp, cnt in grips:
+            print("    win%-2d n=%-3d angle(bx,arm)=%5.1f .. %5.1f deg   spread %5.1f"
+                  % (n, cnt, lo, hi, sp))
+        print("  " + verdict(gworst[3] <= GRIP,
+                             "the blade keeps its attitude relative to the arm (worst spread"
+                             " %.1f <= %.0f deg) = 正手 stays 正手" % (gworst[3], GRIP)))
+        if gworst[3] > GRIP:
+            print("        win%d wanders %.1f .. %.1f deg.  Read it in this order:"
+                  % (gworst[0], gworst[1], gworst[2]))
+            print("          a) WITNESS 1 also failed ⇒ one cause, not two: the forearm local"
+                  " is not")
+            print("             constant, so nothing about the assembly is rigid.  Fix that"
+                  " first.")
+            print("          b) WITNESS 1 passed ⇒ the rotation IS rigid and the wrist is"
+                  " moving on")
+            print("             its own.  'Bip01 R Hand' is deliberately in NEITHER table"
+                  " (§17.14), so")
+            print("             that motion is 'guard 1h' - a LOOP - keying the hand, and the"
+                  " remedy is")
+            print("             to put that bone in BOTH tables (freed AND authored), never"
+                  " one.")
+            print("        ⛔ Not a table question either: every key in kRideSwingArc rotates"
+                  " hand and")
+            print("        blade together, so no angle profile can widen or narrow this"
+                  " number.")
+
+    # ---- 3) DID THE LOG SEE THE CUT, and is the axis worth anything ---------
+    # armt= in -- T27 -- says the ARC ran; this says the SAMPLING saw it.  The table's extremes
+    # are -130 (cock) and +25 (through), 155 deg swept, and one sample per
+    # kRideSwingArmLogGap=12 authored frames can miss either end - hence bars inside them.
+    # 🆕 T29 re-registered both bars because the table moved.  How they were derived (offline,
+    # armarc.py): sweep every phase offset of a 1-row-per-12-frames sampler over the 1400 ms arc.
+    # The cock is HELD 196 ms (≈12 frames at 60 fps) so a sample lands in it at every phase ⇒
+    # worst-phase min is the full -130, and -120 is slack.  The through key is held 112 ms and the
+    # arc is above +15 for 212 ms total ⇒ worst-phase max seen is +17 at 60 fps.  ⚠️ At 30 fps
+    # that bound drops to -2, so if max= comes in short, count the arm rows per window FIRST
+    # (≈7-8 rows/window ⇒ ~60 fps, which is what trips 24-26 ran at); a low frame rate loosens
+    # this criterion and nothing else.
+    degs = [v for v in (fnum(d, "deg") for d in s.sw_arm) if v is not None]
+    if degs:
+        print("  deg= sampled %.1f .. %.1f   (kRideSwingArc: 0 / -130 cock+hold /"
+              " +25 through+hold / 0)" % (min(degs), max(degs)))
+        print("  " + verdict(min(degs) <= -120.0 and max(degs) >= 15.0,
+                             "the samples cover both ends of the stroke"))
+        if not (min(degs) <= -120.0 and max(degs) >= 15.0):
+            print("        A stroke can be missing from the LOG and present on screen."
+                  "  Split them:")
+            print("          armt=1.00 in -- T27 -- ⇒ the arc ran, the line budget"
+                  " (kRideSwingArmLines")
+            print("            = 30/ride) or the gap (12 frames) is what is short."
+                  "  Not a failure.")
+            print("          armt<1.00 ⇒ the window closed before the arc finished, which is a"
+                  " TIMING")
+            print("            invariant, not a table one: kRideSwingArcMs 1400 <"
+                  " kRideSwingWinMs 1650.")
+            print("          deg= stuck at 0.0 ⇒ t is not advancing at all; read"
+                  " RideSwingArcAt's caller,")
+            print("            not the table.")
+    cones = [v for v in (fnum(d, "cone") for d in s.sw_arm) if v is not None and v >= 0.0]
+    if cones:
+        print("  cone= %.1f .. %.1f deg  (per WINDOW, captured once: the axis against the UPPER"
+              " ARM's" % (min(cones), max(cones)))
+        print("        own +X, i.e. how wide a circle this rotation draws)")
+        print("  " + verdict(25.0 <= min(cones) <= 155.0 and max(cones) <= 155.0,
+                             "the axis is well off the arm's own length, so the rotation MOVES"
+                             " the hand"))
+        print("  ⚠️ NOT armarc.py's 77.0: that is the axis against the shoulder->hand VECTOR,"
+              " which")
+        print("     this log cannot become (a sample is two segments summed)."
+              "  Cousins, not copies -")
+        print("     never 'fix' one to match the other.")
+        if not (25.0 <= min(cones) <= 155.0 and max(cones) <= 155.0):
+            print("        A cone near 0 or 180 is the one failure that passes every other"
+                  " criterion in")
+            print("        this file: the arc rolls the arm about its own length, 155 deg get"
+                  " swept, and")
+            print("        the hand barely moves - r= flat, grip flat, kept=1.0, a dead stroke."
+                  "  This is")
+            print("        the AXIS dial (kRideSwingAxisOut/Fore/Down + armarc.py's AXIS,"
+                  " edited together),")
+            print("        and it is the only criterion here that points at it.")
+
+    # ---- 4) THE CAPTURE.  A freed bone nobody wrote renders at BIND. --------
+    # noref= counts frames that wanted to author but could not resolve BOTH arm bones.  The two
+    # are freed by the same two flags they are authored by, so any nonzero reading is a frame
+    # with a host-masked bone that nobody wrote - §17.9, the 「在牛背上站直」 family, except
+    # localised to the arm.
+    nrows = [d for d in s.sw_close if "noref" in d]
+    if not nrows:
+        if s.sw_close:
+            print("  CHECK close rows carry no noref= - that field is T28's own, so either the"
+                  " line")
+            print("        budget (kRideSwingLines) was spent or this is not a T28 build after"
+                  " all.")
+    else:
+        tot = sum(int(fnum(d, "noref", 0.0)) for d in nrows)
+        print("  noref= over %d close row(s): %d" % (len(nrows), tot))
+        print("  " + verdict(tot == 0,
+                             "every authored frame resolved both bones (no freed-but-unwritten"
+                             " bone)"))
+        if tot:
+            print("        Each counted frame left 'R UpperArm'/'R Forearm' masked off the host"
+                  " AND")
+            print("        unwritten by us ⇒ that frame drew them at the BIND pose."
+                  "  The suspect is the")
+            print("        skeleton instance being rebuilt under us (§16 - which is why both"
+                  " bones are")
+            print("        re-resolved BY NAME every frame), not the arc.")
+
+    # ---- 5) THE HANDOVER, which this model makes free ----------------------
+    # S(0) = identity, so the first authored frame writes the pose ALREADY on screen: aim[0] is
+    # the captured host orientation itself and aim[1] = aim[0]*refFo is the host's own forearm.
+    # want= and the read therefore come from the same cache on that frame, and dot= should be
+    # ~1.  Trip 25's aimed table had no such property and paid for it: its three first frames
+    # read dot=0.8449 (32.3 deg off) / 0.9711 / 0.9659.  This is the cheapest criterion in the
+    # section and the one that says the model's zero point is where the code thinks it is.
+    settled, first, unread = swing_dot_split(s)
+    if first:
+        vals = [v for _, v in first]
+        print("  first authored frame (kept<0): "
+              + " / ".join("dot=%.4f at deg=%s" % (v, _t28_deg(d)) for d, v in first))
+        worstf = min(vals)
+        print("  " + verdict(worstf >= 0.99,
+                             "the window opens ON the host's own pose (worst first-frame"
+                             " dot=%.4f) = no handover pop" % worstf))
+        if worstf < 0.99:
+            print("        %.1f deg off on a frame whose own deg= is within a few degrees of 0,"
+                  % math.degrees(math.acos(max(-1.0, min(1.0, worstf)))))
+            print("        i.e. where S(t) is still ~identity ⇒ this is NOT the table: the"
+                  " capture and")
+            print("        the read disagree inside one frame.  Two candidates, both cheap:"
+                  " len= in")
+            print("        -- T26 -- must be 2.85/3.24 (a zero = a bone that did not resolve, so"
+                  " want= was")
+            print("        built from a short arm), and _getDerivedOrientation vs"
+                  " _getDerivedPosition must")
+            print("        be reading the same point in the frame (§21.5).")
+    else:
+        print("  NOTE  no sample landed on a window's first authored frame (kept<0), so the")
+        print("        handover is UNJUDGED this trip - it is throttle luck, not a failure.")
+
+    # ---- 6) dot=, and why its bar moves with the tempo ----------------------
+    # dot= compares THIS frame's intent against a transform read one frame late, so it scales
+    # with how fast the intent is moving - and 🆕 T29 moves it faster again.  The arithmetic,
+    # from the table alone: -130 -> +25 is 155 deg across 0.24 * kRideSwingArcMs = 336 ms =
+    # 461 deg/s (T28's cut was 105 deg / 308 ms = 341), so one frame of lag costs 461/fps
+    # degrees (~5.1 deg at the ~90 fps trip 25's own frame stamps imply).  A deficit near that
+    # is the READ; a deficit far above it is the parent (R Clavicle, host-driven) exactly as in
+    # trip 24.  -- T26 -- already prints that separator per failing sample; this only moves the
+    # bar: trip 26 measured 7.3 deg at 341 deg/s, and 7.3 * 461/341 = 9.9 deg is what the same
+    # defect costs at this speed.  Bar = 11.0 deg (0.9816) = that plus slack.
+    if settled:
+        sv = [v for _, v in settled]
+        worst_s = min(sv)
+        mean_s = sum(sv) / len(sv)
+        print("  settled dot=: worst %.4f = %.1f deg, mean %.4f over %d sample(s)"
+              % (worst_s, math.degrees(math.acos(max(-1.0, min(1.0, worst_s)))),
+                 mean_s, len(sv)))
+        print("     trip-26 baseline: worst 0.9918 = 7.3 deg, mean 0.9984 at 341 deg/s;"
+              " rate-scaled")
+        print("     expectation here 9.9 deg (0.9851), bar 11.0 deg (0.9816)")
+        print("  " + verdict(worst_s >= 0.9816,
+                             "the lag term grew no faster than the arc's peak rate did"))
+        print("  ⛔ Whatever this reads, it is NOT answered by editing kRideSwingArc."
+              "  dot= measures")
+        print("     whether our write landed where we aimed it; the SHAPE is the eyeball's"
+              " question and")
+        print("     WITNESS 1/2 above are the model's.  Chasing dot= with the angle profile is"
+              " how a")
+        print("     round gets spent on the tool instead of the stroke - and this trip BUYS"
+              " rate with")
+        print("     the table, so flattering dot= would mean undoing the change under test.")
+
+    # ---- 7) what only the eyeball can answer, and what each answer costs ----
+    print("  NOTE  the SHAPE is still not in this file.  Four outcomes and their next rungs:")
+    print("          1. it reads as a sabre cut ⇒ P4-3-4 is DONE; what is left is the release")
+    print("             decision (does this build replace v1.6 in release\\).")
+    print("          2. elbow and grip both pass and it STILL does not read as a cut ⇒ 🆕 T29")
+    print("             has now SPENT the ANGLE PROFILE dial (the window slid up the same circle")
+    print("             to -130/+25, endpoints vert/lat 0.83 → 2.17), so what is left is the")
+    print("             AXIS: the circle's own mid-stroke bulge (out 5.21, +2.34 past either")
+    print("             key) is unreachable from the table, and the measured fallback is a")
+    print("             sagittal axis (log ≈ out 1 / fore 0 / down 0), which holds out constant")
+    print("             at 1.41 the whole stroke.  ⚠️ Both dials are mirrored in tools\\armarc.py")
+    print("             (AXIS / ARC2) and nothing in the build can catch the copies drifting -")
+    print("             edit them together and look at the offline plot before rebuilding.")
+    print("          3. the arm is in the right plane but too bent / too short / reaching wrong")
+    print("             ⇒ that is the PRICE of a rigid rotation, not a bug: reach and elbow are")
+    print("             whatever 'guard 1h' holds.  Authoring the elbow again is a NEW rung and")
+    print("             it re-opens 正手变反手, which is what this one exists to close.")
+    print("          4. the arm is right and the BLADE is wrong ⇒ section 2's remedy (the hand")
+    print("             bone into BOTH tables), not the arc.")
+    print("  ⚠️ WHAT THIS SECTION DOES NOT COVER, so nobody reads a pass here as a pass:")
+    print("       -- T25/T26 --  kept= (our write survived applyToNode), the freed==authored"
+          " table,")
+    print("                      len=, armback (man=0x00 / minDot~1.0 = the arm was handed"
+          " back).")
+    print("       -- T27 --      pinst=live at every close, armt=1.00, ms= vs the 1650/3000"
+          " pair,")
+    print("                      the four retired counters (rst/drv/hold/fit = 0) and the")
+    print("                      hostkeep/arm/swfree agreement.")
+    print("       and the regressions that have nothing to do with the arm: zero AV, straddle")
+    print("       takeovers == restored, dropped=0, and the eyeball's 「其他和以前一样」.")
+
+
+def report_swing_bake(s):
+    """T30 - vanilla's own 'chop down' replayed as a DELTA on the captured pose.  Did it land?
+
+    THE MODEL IN ONE LINE:  local(t) = capturedLocal * X(t), one baked 27-row table per bone,
+    X(0) = identity on both.  Three consequences, and each is a criterion below:
+      * the window still opens on the pose already on screen (T28's one good property, kept).
+      * NO PARENT IS READ TO BUILD THE POSE.  T28 wrote the upper arm in derived space and had
+        to divide out a one-frame-stale parentDerived - the 7.3 deg residual that trips
+        24->25->26 differenced down.  A local write has no such term, so dot= drops from a
+        MECHANISM to a diagnostic (section 7).
+      * THE ELBOW IS ANIMATED AGAIN, by vanilla's own hinge - the one thing a rigid rotation
+        could not do at all.
+
+    ⚠️⚠️ EVERY CRITERION HERE HAS THE OPPOSITE SIGN FROM -- T28 --.  T28 was ONE rigid
+    rotation, so it needed |shoulder->hand| FLAT and measured span 0.000 over 13 windows; that
+    same reading here means the forearm table never reached the bone.  The two sections dispatch
+    on the field name (deg= vs elbow=) precisely so nobody carries a bar across.
+
+    ⚠️ AND THE HONEST LIMIT, unchanged since trip 23: 「往下戳」 was a correctly measured curve
+    pointing the wrong way.  Every number in this section can pass on a stroke that reads wrong
+    on screen, because the DIRECTION half needs an anchor and no anchor exists in the log alone.
+    That half is `python tools\\armarc.py --log <log>` (WITNESS 2's DIRECTION line, anchored once
+    per window at its own first sample) - a separate implementation on a separate code path, so
+    the two should agree number for number and disagreement is a tool bug in one of them.
+    """
+    print("")
+    print("== T30 - vanilla's curve as a delta: did the ELBOW come back? ==")
+    if not s.sw_arm:
+        print("  no SWING arm sample at all - nothing to judge (see -- T25/T26 -- above).")
+        return
+    if not is_t30(s):
+        print("  the arm rows carry no elbow=: this log predates T30, whose whole model is"
+              " vanilla's")
+        print("  two baked curves.  NOT a failure - -- T28 -- above is this log's verdict,"
+              " and every")
+        print("  criterion here is the negation of one there, so this section stays silent.")
+        return
+    wins = swing_arm_windows(s)
+    print("  %d sample(s) in %d window(s) of samples (throttled one per"
+          " kRideSwingArmLogGap=12" % (len(s.sw_arm), len(wins)))
+    print("  authored frames, budgeted kRideSwingArmLines=30 per RIDE, so this is not the"
+          " number of")
+    print("  windows - P43SW ride's swing= is.  ~133 ms between samples at trip-26 frame"
+          " rates.)")
+
+    # Offline reference for every bar below.  Regenerate with `python tools\armarc.py --bake`,
+    # which re-bakes the clip out of male_skeleton.skeleton, diffs it against the .cpp's two
+    # tables value by value and REFUSES to report on a mismatch.
+    # ⚠️ These numbers describe THE SHIPPED TABLE.  A different clip, --map lead/stretch or
+    # --abs moves all of them, and then this block is stale rather than wrong - re-read it off
+    # that report in the same commit, the way the AXIS/ARC2 mirror used to demand.
+    OFF_R, OFF_EL, OFF_GRIP = (2.90, 5.42), (56.0, 126.0), 28.4
+    DIP_LO, DIP_HI = 0.04, 0.18   # window t where offline r <= 3.62 and elbow <= 72.6
+    MOVE_R, MOVE_EL = 1.5, 40.0   # the two pooled bars, against T28's FLAT = 0.05
+    T28FLAT = 0.05
+
+    # ---- 1) WITNESS 1: r= and elbow= must MOVE.  T28's criterion, inverted. -
+    # Both come from three DERIVED POSITIONS and a law of cosines - no model, no bind pose, no
+    # copy of either table - and a one-frame-stale read cannot spoil either, because a lagged
+    # sample is a ROTATED sample and a rotation preserves both.  That is what makes them the
+    # sharpest instruments in this file, and it is why they are also the pair whose sign flipped.
+    # ⚠️ JUDGED POOLED, not per window, and the reason is sampling arithmetic rather than
+    # laxity: offline r only dips below 3.62 for t in 0.055..0.166 = a 155 ms band of a 1400 ms
+    # arc, while the throttle leaves ~133 ms between samples.  A window can therefore miss the
+    # cocking phase entirely and span under 1.0 with nothing wrong with it.  Pooled over every
+    # window the band is sampled many times over, so the pooled span is the build-level fact.
+    # The per-window table is still printed, and a window that DID cover the dip and still reads
+    # T28-flat is called out separately - that is a stale capture, not a sampling gap.
+    per = []
+    for i, w in enumerate(wins):
+        tv = [v for v in (fnum(d, "t") for d in w) if v is not None]
+        rs = [v for v in (fnum(d, "r") for d in w) if v is not None]
+        es = [v for v in (fnum(d, "elbow") for d in w) if v is not None and v >= 0.0]
+        dip = any(DIP_LO <= v <= DIP_HI for v in tv)
+        per.append((i + 1, len(w), tv, rs, es, dip))
+        print("    win%-2d n=%-3d t %.2f..%.2f   r %s   elbow %s   dip=%s"
+              % (i + 1, len(w), min(tv) if tv else 0.0, max(tv) if tv else 0.0,
+                 ("%4.2f..%4.2f span %4.2f" % (min(rs), max(rs), max(rs) - min(rs)))
+                 if len(rs) >= 2 else "     (n<2)      ",
+                 ("%3.0f..%3.0f span %3.0f" % (min(es), max(es), max(es) - min(es)))
+                 if len(es) >= 2 else "    (n<2)    ",
+                 "yes" if dip else "NO "))
+    pr = [v for v in (fnum(d, "r") for d in s.sw_arm) if v is not None]
+    pe = [v for v in (fnum(d, "elbow") for d in s.sw_arm) if v is not None and v >= 0.0]
+    if len(pr) < 2 or len(pe) < 2:
+        print("  CHECK fewer than two r=/elbow= samples in the whole log - the one measurement"
+              " this")
+        print("        rung turns on is starved (kRideSwingArmLines / kRideSwingArmLogGap).")
+    else:
+        rsp, esp = max(pr) - min(pr), max(pe) - min(pe)
+        print("  pooled, every sample:  r %.2f..%.2f (span %.2f)   elbow %.0f..%.0f (span %.0f)"
+              % (min(pr), max(pr), rsp, min(pe), max(pe), esp))
+        print("  offline, the table:    r %.2f..%.2f (span %.2f)   elbow %.0f..%.0f (span %.0f)"
+              % (OFF_R[0], OFF_R[1], OFF_R[1] - OFF_R[0],
+                 OFF_EL[0], OFF_EL[1], OFF_EL[1] - OFF_EL[0]))
+        print("  T28/T29 measured span 0.000 over 13 windows and that was its PASS."
+              "  Here it is the")
+        print("  failure: a frozen elbow means kRideSwingBakeFo never reached the bone.")
+        print("  " + verdict(rsp >= MOVE_R and esp >= MOVE_EL,
+                             "both MOVE (r span %.2f >= %.1f u, elbow span %.0f >= %.0f deg) ="
+                             " vanilla's hinge is on the bone" % (rsp, MOVE_R, esp, MOVE_EL)))
+        if rsp < MOVE_R or esp < MOVE_EL:
+            print("        Read it in this order, and none of the four is a tuning question:")
+            print("          a) elbow= is CONSTANT to the last digit ⇒ the forearm write is not")
+            print("             landing at all.  kept= in -- T25/T26 -- is then also below 1.0 and"
+                  " the")
+            print("             mask is the suspect (§17.9), not the table.")
+            print("          b) elbow= moves a little and r= barely ⇒ RideSwingBakeAt is being"
+                  " asked")
+            print("             for the wrong t, or kRideSwingBakeFoKeys disagrees with the table"
+                  " length.")
+            print("             `python tools\\armarc.py --mirror` decides that offline in one"
+                  " second.")
+            print("          c) every window's dip= reads NO ⇒ this is a SAMPLING gap, not a"
+                  " failure:")
+            print("             the throttle never landed a sample in the cocking phase.  Re-read"
+                  " the")
+            print("             t ranges above before touching anything.")
+            print("          d) the window was cut short (armt= < 1.00 in -- T27 --) ⇒ the arc"
+                  " never")
+            print("             played, so there was no shape to see.")
+        blind = [p for p in per if p[5] and len(p[3]) >= 2
+                 and (max(p[3]) - min(p[3])) <= T28FLAT]
+        if blind:
+            print("  CHECK win%s covered the cocking phase (dip=yes) and still read T28-flat"
+                  " (<= %.2f u)."
+                  % (", ".join(str(p[0]) for p in blind), T28FLAT))
+            print("        A sampling gap cannot do that.  The suspect is the CAPTURE: refUp/refFo"
+                  " are")
+            print("        cleared at the close edge, at every ride boundary and in"
+                  " RideSwingArmRelease,")
+            print("        and a survivor replays the delta off a pose from the previous window -"
+                  " which")
+            print("        shows up as one window flat while its neighbours move.")
+    print("  ⚠️ the one innocent way to break this: 'guard 1h' keying the HAND bone's local"
+          " POSITION")
+    print("     (we own rotations only).  That would move r= without moving the elbow, and it"
+          " would")
+    print("     show up here and nowhere else in the file.")
+    # ---- 2) THE GRIP, which is now a MATCH test rather than a flatness one --
+    # angle(bx, arm) = the weapon hand's own +X against the shoulder->hand vector.  Still
+    # anchor-free and still lag-proof (both vectors turn together), but the VERDICT flipped with
+    # the model: T28 rotated the whole limb rigidly so this had to be ~0, while T30 bends the
+    # elbow, which moves the hand's axis relative to the arm BY CONSTRUCTION.
+    # 🔑 WHERE THE 正手 CLAIM NOW LIVES: it is proven OFFLINE, not here.  The forearm's baked
+    # curve is a pure hinge about the bone's own -Y (x = z = 0.000000 on all 27 keys, which
+    # `--mirror` re-derives from the asset every run), and a rotation perpendicular to the bone
+    # axis induces no twist about it, so 'Bip01 R Hand' keeps the roll it was captured with.  The
+    # upper arm's curve DOES twist - that is vanilla's shoulder, i.e. part of the chop.
+    # ⚠️ SO THIS SPAN CAN NO LONGER DETECT A FLIP, and pretending otherwise would be the worst
+    # kind of pass: trip 25's flip measured 27.1..54.0 deg per window and the offline T30
+    # prediction is 28.4 - the two ranges OVERLAP.  The sharp instrument is the per-sample
+    # residual against the offline curve (armarc.py WITNESS 2's `grip` line); this span only
+    # catches a stroke that moves by the wrong AMOUNT.
+    GRIP_LO, GRIP_HI = 8.0, 45.0
+    grips = []
+    for i, w in enumerate(wins):
+        a = [v for v in (tri_angle(triple(d, "bx"), arm_vec(d)) for d in w) if v is not None]
+        if len(a) >= 2:
+            grips.append((i + 1, min(a), max(a), max(a) - min(a), len(a)))
+    if not grips:
+        print("  CHECK no window has two bx= samples with a hand vector beside them - the grip")
+        print("        criterion is UNJUDGED (not passed).")
+    else:
+        for n, lo, hi, sp, cnt in grips:
+            print("    win%-2d n=%-3d angle(bx,arm)=%5.1f ..%6.1f deg   spread %5.1f"
+                  % (n, cnt, lo, hi, sp))
+        gsp = max(g[3] for g in grips)
+        print("    offline, the whole stroke: 1.8 .. 30.2 deg, spread %.1f  <- what the spreads"
+              " above" % OFF_GRIP)
+        print("    should look like; a window that missed the cocking phase legitimately"
+              " shows less.")
+        print("  " + verdict(GRIP_LO <= gsp <= GRIP_HI,
+                             "the blade's attitude moves by about the amount the table says"
+                             " (widest %.1f deg, band %.0f..%.0f)"
+                             % (gsp, GRIP_LO, GRIP_HI)))
+        if gsp < GRIP_LO:
+            print("        ⚠️ a T28-shaped ~0 spread is now a FAILURE, and it is the SAME fault as")
+            print("        WITNESS 1's: a rigid limb.  Fix that first; this number follows it.")
+        elif gsp > GRIP_HI:
+            print("        More motion than the table can explain.  WITNESS 1 decides which half:")
+            print("          a) WITNESS 1 also out of range ⇒ one cause, and it is the tables.")
+            print("          b) WITNESS 1 passed ⇒ the wrist is moving on its own."
+                  "  'Bip01 R Hand' is")
+            print("             deliberately in NEITHER table (§17.14), so that motion is"
+                  " 'guard 1h'")
+            print("             keying the hand, and the remedy is that bone into BOTH tables,"
+                  " never one.")
+        print("  ⛔ passing this is NOT a no-flip proof (see the comment above): 正手 is the"
+              " eyeball's")
+        print("     call plus the offline hinge check, and this span overlaps trip 25's flip.")
+    # ---- 3) THE SETTLE CLOSES THE LOOP.  T28 had no equivalent. ------------
+    # The last clip key sits at t=0.690 and bake_curve appends a SYNTHETIC key at t=1.000 whose
+    # delta is identity, so from 967 ms to 1400 ms the arm interpolates back onto the pose it was
+    # captured from.  That makes a prediction needing neither table nor anchor: a window's LAST
+    # sample must read the same r= and elbow= as its FIRST one, because both are the captured
+    # pose.  It is the cheapest test of the settle key AND of the handback - an arm that does not
+    # come home here is an arm that pops when the window closes.
+    # ⚠️ Only judgeable on windows the throttle happened to sample at both ends (the phase is
+    # per-RIDE, so a window's first authored frame is not guaranteed a line).  Unjudged is
+    # throttle luck, not a failure - the same rule -- T28 -- section 5 follows.
+    # ⚠️⚠️ BOTH GATES ARE TIGHT ON PURPOSE, and a dry run against a synthetic PERFECT log is what
+    # set them.  Loosening either one breaks the criterion rather than widening it:
+    #   * t <= 0.005 - i.e. a printed t=0.00, the same frame kept<0 marks - because the cocking
+    #     starts on the FIRST key and is steep: t=0.02 already reads r 4.86 (0.56 u gone in 28
+    #     ms), so 0.02 was measured to admit a mid-stroke sample and self-fail a perfect log.
+    #     The %.2f quantisation is worth at most ~0.14 u here, well inside the bar below.
+    #   * t >= 0.99 because between the last clip key (t=0.690) and the synthetic settle key
+    #     (t=1.000) the arm is still INTERPOLATING home: at t=0.94 it is ~80% of the way, worth
+    #     0.7 u of r.  Only t=1.00 is the captured pose, and it is reachable: the arc clamps t to
+    #     1 while the window runs on to kRideSwingWinMs, so ~250 ms (1-2 samples) sit at 1.00.
+    OPEN_T, SETTLE_T, CLOSE_R, CLOSE_EL = 0.005, 0.99, 0.25, 8.0
+
+
+    loops = []
+    for (n, _cnt, _tv, _rs, _es, _dip), w in zip(per, wins):
+        a = [d for d in w if fnum(d, "t") is not None and fnum(d, "t") <= OPEN_T]
+        b = [d for d in w if fnum(d, "t") is not None and fnum(d, "t") >= SETTLE_T]
+        if not a or not b:
+            continue
+        r0, r1 = fnum(a[0], "r"), fnum(b[-1], "r")
+        e0, e1 = fnum(a[0], "elbow"), fnum(b[-1], "elbow")
+        if None in (r0, r1, e0, e1) or e0 < 0.0 or e1 < 0.0:
+            continue
+        loops.append((n, r0, r1, abs(r1 - r0), e0, e1, abs(e1 - e0)))
+    if not loops:
+        print("  NOTE  no window carries a sample at BOTH t<=%.3f and t>=%.2f, so the settle is"
+              % (OPEN_T, SETTLE_T))
+        print("        UNJUDGED this trip - throttle luck, not a failure (trip 26 caught the"
+              " first")
+        print("        authored frame in 5 of 13 windows, so expect this to be judgeable"
+              " sometimes).")
+
+    else:
+        for n, r0, r1, dr, e0, e1, de in loops:
+            print("    win%-2d r %.2f -> %.2f (%+.2f)   elbow %.0f -> %.0f (%+.0f deg)"
+                  % (n, r0, r1, r1 - r0, e0, e1, e1 - e0))
+        wr = max(l[3] for l in loops)
+        we = max(l[6] for l in loops)
+        print("  " + verdict(wr <= CLOSE_R and we <= CLOSE_EL,
+                             "every sampled window came home to its captured pose (worst %.2f u /"
+                             " %.0f deg, bars %.2f / %.0f)" % (wr, we, CLOSE_R, CLOSE_EL)))
+        if wr > CLOSE_R or we > CLOSE_EL:
+            print("        The arm ends the window somewhere the capture never was, so the close"
+                  " edge")
+            print("        has to snap it back.  Two candidates and they are told apart by the"
+                  " sign:")
+            print("          a) it does not return at all ⇒ the synthetic settle key is missing"
+                  " from")
+            print("             the .cpp tables (both must end `{ 1.0000f, 1.0, 0, 0, 0 }`);"
+                  " --mirror")
+            print("             checks exactly that, since bake_tail() adds it on the offline"
+                  " side.")
+            print("          b) it returns to a DIFFERENT pose ⇒ the host clip advanced under us,"
+                  " which")
+            print("             is legitimate drift (offline 'guard 1h' moves the forearm 0.1 deg"
+                  " over")
+            print("             its own keys, so a large reading means the host is not the parked"
+                  " guard).")
+    # ---- 4) THE READ ITSELF, and the one thing that would move every bar ----
+    # r=, elbow= and len= are three views of ONE triangle: r^2 = l1^2 + l2^2 - 2*l1*l2*cos(elbow)
+    # whenever |shoulder->elbow| and |elbow->hand| really are the bind lengths len= prints.  So
+    # the ratio r_measured / r_from_the_law is 1.000 by geometry, and it answers two questions no
+    # other line here can:
+    #   * a SCATTERED ratio = the three _getDerivedPosition() calls are not describing one frame
+    #     (or a bone did not resolve), i.e. the measurement is unusable and every span above is
+    #     measuring the tool.
+    #   * a CONSISTENT ratio away from 1 = the live skeleton is SCALED - Kenshi sizes characters
+    #     by race - and then this ratio IS the scale factor, so the offline r bars (2.90..5.42)
+    #     scale with it while the two ANGLE bars (elbow, grip) do not.  That is the only way the
+    #     offline reference can be right and the game still read differently, and it costs one
+    #     division to rule out.
+    # ⚠️ Informational: it cannot fail the stroke, only the reading of it.
+    ratios = []
+    for d in s.sw_arm:
+        L, r, el = _len_pair(d), fnum(d, "r"), fnum(d, "elbow")
+        if L is None or r is None or el is None or el < 0.0 or min(L) <= 0.0:
+            continue
+        c = math.cos(math.radians(el))
+        pred = math.sqrt(max(0.0, L[0] * L[0] + L[1] * L[1] - 2.0 * L[0] * L[1] * c))
+        if pred > 1.0e-3:
+            ratios.append(r / pred)
+    if not ratios:
+        print("  NOTE  no sample carries r=, elbow= and len= together, so the read is UNCHECKED.")
+    else:
+        ratios.sort()
+        med, lo, hi = ratios[len(ratios) // 2], ratios[0], ratios[-1]
+        print("  law of cosines closure r/sqrt(l1^2+l2^2-2*l1*l2*cos elbow) over %d sample(s):"
+              % len(ratios))
+        print("     median %.4f   range %.4f .. %.4f   (1.0000 = one frame, unscaled bind arm)"
+              % (med, lo, hi))
+        print("  " + verdict(hi - lo <= 0.02,
+                             "the three positions and the two lengths describe one triangle"
+                             " (spread %.4f <= 0.0200)" % (hi - lo)))
+        if abs(med - 1.0) > 0.02:
+            print("        ⚠️ consistently %.1f%% off 1.0 ⇒ a SCALED rider."
+                  "  Multiply the offline r" % ((med - 1.0) * 100.0))
+            print("        bars (2.90..5.42, span 1.5) by %.3f before reading WITNESS 1;"
+                  " the elbow and" % med)
+            print("        grip bars are angles and do NOT scale.")
+        if hi - lo > 0.02:
+            print("        A spread this wide is not rounding (len= is 2 decimals ⇒ ~0.01,"
+                  " elbow= 1")
+            print("        decimal ⇒ ~0.002).  Suspect the three reads straddling a skeleton"
+                  " rebuild")
+            print("        (§16) - which is why both bones are re-resolved BY NAME every frame.")
+    # ---- 5) THE CAPTURE.  A freed bone nobody wrote renders at BIND. --------
+    # Unchanged from -- T28 --, and it stays a HARD criterion because it is about the mask, not
+    # the model: kRideSwingFreeBones takes 'R UpperArm'/'R Forearm' away from the host clip, and
+    # RideSwingArmPose bails as a unit (++gRideSwingNoRef) if either bone fails to resolve.  Every
+    # counted frame is therefore a frame that drew those two bones at BIND - §17.9's 「在牛背上
+    # 站直」 localised to one arm.
+    nrows = [d for d in s.sw_close if "noref" in d]
+    if not nrows:
+        if s.sw_close:
+            print("  CHECK close rows carry no noref= - the line budget (kRideSwingLines) was"
+                  " spent, or")
+            print("        this is not a build that authors the arm at all.")
+    else:
+        tot = sum(int(fnum(d, "noref", 0.0)) for d in nrows)
+        print("  noref= over %d close row(s): %d" % (len(nrows), tot))
+        print("  " + verdict(tot == 0,
+                             "every authored frame resolved both bones (no freed-but-unwritten"
+                             " bone)"))
+        if tot:
+            print("        Suspect the skeleton instance being rebuilt under us (§16 - which is"
+                  " why both")
+            print("        bones are re-resolved BY NAME every frame), not the tables.")
+
+    # ---- 6) THE HANDOVER, which this model keeps for free -------------------
+    # Both baked tables start at { 0.0000f, 1.0, 0, 0, 0 } - X(0) = conj(K(0))*K(0) = identity by
+    # construction, not by tuning - so the first authored frame writes capturedLocal verbatim, i.e.
+    # the pose already on screen.  🆕 And T30 makes that claim cheaper to trust than T28 could:
+    # the write is a LOCAL orientation, so no parent transform is read to build it and there is no
+    # stale-cache term in the write path at all (see section 7).  Trip 25's aimed table had no such
+    # property and paid: 0.8449 (32.3 deg) / 0.9711 / 0.9659 on its three first frames.
+    settled, first, unread = swing_dot_split(s)
+    if first:
+        vals = [v for _, v in first]
+        print("  first authored frame (kept<0): "
+              + " / ".join("dot=%.4f at t=%s" % (v, d.get("t", "?")) for d, v in first))
+        worstf = min(vals)
+        print("  " + verdict(worstf >= 0.99,
+                             "the window opens ON the host's own pose (worst first-frame"
+                             " dot=%.4f) = no handover pop" % worstf))
+        if worstf < 0.99:
+            wt = min(first, key=lambda p: p[1])[0]
+            wtv = fnum(wt, "t")
+            print("        %.1f deg off."
+                  % math.degrees(math.acos(max(-1.0, min(1.0, worstf)))), end="")
+            if wtv is not None and wtv > 0.05:
+                print("  ⚠️ BUT its own t=%.2f is past 0.055, i.e. inside the" % wtv)
+                print("        cocking band, where one frame of read lag legitimately costs up to"
+                      " 13.8 deg")
+                print("        at 90 fps (section 7's table).  A kept<0 sample can only be the"
+                      " window's")
+                print("        first authored frame, whose t is ~0.00, so a t this large means the"
+                      " kept<0")
+                print("        marker and t disagree - read it there, not here, and do not touch"
+                      " the tables.")
+            else:
+                print("  X(t) is still ~identity on that frame, so this is NOT")
+                print("        the tables.  Two candidates: the tables do not actually start at"
+                      " identity (⇒")
+                print("        `python tools\\armarc.py --mirror`, which compares key 0 of both),"
+                      " or the")
+                print("        capture read a different frame than the log did (§21.5).")
+
+    else:
+        print("  NOTE  no sample landed on a window's first authored frame (kept<0), so the")
+        print("        handover is UNJUDGED this trip - throttle luck, not a failure.")
+    # ---- 7) dot= IS NOW DIAGNOSTIC ONLY.  Read it, do not chase it. ---------
+    # 🆕 The reclassification is the whole point of T30's write path.  T28 built a DERIVED
+    # orientation and divided out the parent's derived transform, which is cached one frame stale
+    # ⇒ the stale read entered the POSE and the 7.3 deg residual trips 24/25/26 differenced was a
+    # real deformation.  T30 writes capturedLocal * X(t) - a LOCAL orientation, no parent read at
+    # all - so want=/dot= are computed for the log only (RidingPlugin.cpp:5990+) and a deficit here
+    # can no longer bend the arm.  What it still measures honestly: how far the arm travelled
+    # between our write and the log's read one frame later.
+    # The bar has to move with the tempo, and vanilla's own curve is FAST.  From the shipped table
+    # (`python tools\armarc.py --bake`), arm-vector rate: PEAK 1244 deg/s measured over one key
+    # (t 0.055->0.083, 48.1 deg in 38.7 ms), MEDIAN 214; T29's hand-drawn cut was 461, so vanilla
+    # is 2.7x it.  ⚠️ 1244 is a per-key AVERAGE and the instantaneous peak is higher (~1400): the
+    # cut passes through r=2.90, and the same linear hand speed sweeps more angle on a short arm.
+    # 🔑 So the bars are computed from the frame rate THIS log ran at, not from a remembered one -
+    # a dry run against a synthetic perfect log showed a fixed 0.99 mean bar false-alarming at
+    # 30 fps while passing at 90, which would have spent a round on the tool.  The frame rate is
+    # in the rows already: consecutive samples in one window are kRideSwingArmLogGap authored
+    # frames apart in f= and (dt * kRideSwingArcMs) ms apart in t.
+    if settled:
+        steps = []
+        for w in wins:
+            for i in range(1, len(w)):
+                df = (fnum(w[i], "f", 0.0) or 0.0) - (fnum(w[i - 1], "f", 0.0) or 0.0)
+                dt = ((fnum(w[i], "t", 0.0) or 0.0) - (fnum(w[i - 1], "t", 0.0) or 0.0)) * 1.400
+                if df > 0.0 and dt > 0.02:      # dt=0 is the t=1.00 clamp, not a frame time
+                    steps.append(df / dt)
+        steps.sort()
+        fps = steps[len(steps) // 2] if steps else 90.0
+        # one frame of read lag, in degrees, at that rate - times the slack a synthetic PERFECT
+        # log needed with room to spare (1.25 on the peak, 3.0 on the mean; both were checked at
+        # 90 / 60 / 30 fps, and a seeded 3x lag still CHECKs at all three).
+        wdeg, mdeg = min(179.0, 1400.0 / fps * 1.25), min(179.0, 214.0 / fps * 3.0)
+        wbar, mbar = math.cos(math.radians(wdeg)), math.cos(math.radians(mdeg))
+        sv = [v for _, v in settled]
+        worst_s, mean_s = min(sv), sum(sv) / len(sv)
+        print("  settled dot=: worst %.4f = %.1f deg, mean %.4f over %d sample(s)"
+              % (worst_s, math.degrees(math.acos(max(-1.0, min(1.0, worst_s)))),
+                 mean_s, len(sv)))
+        print("     %s%.0f fps from f=/t= over %d step(s) ⇒ one frame of lag is worth 1400/fps ="
+              % ("" if steps else "ASSUMED ", fps, len(steps)))
+        print("     %.1f deg at the cut and 214/fps = %.1f deg in the slow majority; bars"
+              " mean >= %.4f" % (1400.0 / fps, 214.0 / fps, mbar))
+        print("     (%.1f deg), worst >= %.4f (%.1f deg)" % (mdeg, wbar, wdeg))
+        print("  " + verdict(mean_s >= mbar, "the read tracks the write away from the fast band"
+                                             " (mean %.4f)" % mean_s))
+        print("  " + verdict(worst_s >= wbar,
+                             "even the worst sample is within one frame of the arc's peak rate"))
+        if worst_s < wbar or mean_s < mbar:
+            print("        Before treating this as a defect: at %.0f fps the cocking band alone"
+                  % fps)
+            print("        ALLOWS %.1f deg (dot %.4f), so check WHERE the bad samples landed -"
+                  % (1400.0 / fps, math.cos(math.radians(min(179.0, 1400.0 / fps)))))
+            print("        a deficit INSIDE t 0.055..0.083 is the table's own speed."
+                  "  -- T26 -- prints")
+            print("        the per-sample separator that tells that apart from a real one.")
+
+        print("  ⛔ dot= is a DIAGNOSTIC here, not a gate on the shape: it cannot deform the arm"
+              " under")
+        print("     this model (local write, no parent read), and the only way to flatter it"
+              " would be to")
+        print("     slow vanilla's own cut - i.e. to undo the change under test.  The shape's"
+              " judges are")
+        print("     WITNESS 1/2 above and the eyeball below.")
+    # ---- 8) what only the eyeball can answer, and what each answer costs ----
+    print("  NOTE  the SHAPE is still not in this file.  Four outcomes and their next rungs:")
+    print("          1. it reads as a sabre cut ⇒ P4-3-4 is DONE; what is left is the release")
+    print("             decision (does this build replace v1.6 in release\\).")
+    print("          2. the shape IS vanilla's and it still reads wrong ⇒ 🆕 the dials are no"
+          " longer")
+    print("             hand-tuned numbers.  Three remain and each is a REGENERATION:")
+    print("               * the CLIP    - BAKE_CLIP in armarc.py ('chop down' today; 'chop left',")
+    print("                               'attack1'... - `python tools\\skelanims.py --sweep chop`")
+    print("                               ranks them by shoulder AND elbow travel).")
+    print("               * the TEMPO   - --map native|lead|stretch (native fits the clip's own")
+    print("                               967 ms into the 1650 ms window, cut at 541 ms).")
+    print("               * the FORM    - --abs replays the clip's pose instead of a delta, which")
+    print("                               trades the handover property for vanilla's exact arm.")
+    print("             ⚠️ All three change BOTH tables at once, so the .cpp and armarc.py must be")
+    print("             regenerated together - `python tools\\armarc.py --mirror` is the check and")
+    print("             every armarc mode runs it first, refusing to report on a mismatch.")
+    print("          3. the arm is right and the BLADE is wrong ⇒ section 2's remedy: 'Bip01 R"
+          " Hand'")
+    print("             into BOTH tables (§17.14), never one.  Note this is now a REAL option:")
+    print("             the wrist is currently keeping a captured roll while the elbow moves"
+          " under")
+    print("             it, which is exactly the case where the hand needs its own curve.")
+    print("          4. elbow= / r= came out FLAT ⇒ that is not a taste question at all, it is")
+    print("             WITNESS 1 failing: the forearm table is not reaching the bone.  Fix that")
+    print("             before spending a round on the shape.")
+    print("  ⚠️ WHAT THIS SECTION DOES NOT COVER, so nobody reads a pass here as a pass:")
+    print("       -- T25/T26 --  kept= (our write survived applyToNode), the freed==authored"
+          " table,")
+    print("                      len=, armback (man=0x00 / minDot~1.0 = the arm was handed"
+          " back).")
+    print("       -- T27 --      pinst=live at every close, armt=1.00, ms= vs the 1650/3000"
+          " pair,")
+    print("                      the four retired counters (rst/drv/hold/fit = 0) and the")
+    print("                      hostkeep/arm/swfree agreement.")
+    print("       and the regressions that have nothing to do with the arm: zero AV, straddle")
+    print("       takeovers == restored, dropped=0, the eyeball's 「其他和以前一样」, and THE"
+          " RIGHT")
+    print("       ARM AFTER DISMOUNTING (the standing exit through LegPoseRestoreImpl's"
+          " unconditional")
+    print("       RideSwingArmRelease - the one regression this whole family keeps re-earning).")
+
+
 def report_trailer(s, lines):
     print("")
     print("== leftovers ==")
@@ -3162,6 +6208,16 @@ def main(argv):
     report_stance_terms(s)
     report_suppress(s)
     report_redraw(s)
+    report_swing(s)
+    report_swing_look(s)
+    report_swing_drive(s)
+    report_swing_split(s)
+    report_swing_gate(s)
+    report_swing_arm(s)
+    report_swing_aim(s)
+    report_swing_host(s)
+    report_swing_arc(s)
+    report_swing_bake(s)
     report_attach(s)
     report_detach(s)
     report_p41d(s)
