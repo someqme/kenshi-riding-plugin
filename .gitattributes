@@ -1,6 +1,8 @@
 # Preserve exact bytes of shipped artifacts.
 # riding.cfg is GBK-encoded (species names must match the game's getName() bytes) — never convert EOLs.
 release/RidingPlugin/riding.cfg -text
+# README.txt ships as UTF-8-with-BOM + pure LF; core.autocrlf=true would hand out CRLF on checkout.
+release/RidingPlugin/README.txt -text
 *.dll binary
 *.mod binary
 
