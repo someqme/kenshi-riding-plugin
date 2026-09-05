@@ -5172,8 +5172,28 @@ static unsigned short     gRideSwingFreeHandle[kRideSwingFreeCount];
 // the torso renders at bind o yaw.  For 'guard 1h' that means a straight back instead of its
 // slight lean.  Fixing it would be capture-and-replay like the calf snapshot; not worth a
 // second state machine before the direction itself has been seen in game.
-static const float kRideTwistMaxDeg   = 60.0f;  // clamp: past this the rider faces backwards
-static const float kRideTwistNoTgtDeg = 30.0f;  // in combat with no identifiable target
+//
+// ⚠️ 2026-09-05 THE AMOUNT WAS RE-SCOPED BY THE PLAYER (the mechanism above is untouched):
+// 「打架的时候敌人在正前方就没必要侧着身子。大多数情况下动物都会正对敌人，所以侧的角度没必要
+// 太大。」  Both consequences are pure numbers, see the two constants right below - and note that
+// the direction requirement itself still stands (a mounted swing cannot go straight through the
+// animal's neck), it is the MAGNITUDE that was too generous.  ⛔ Do not re-inflate 60/30 by
+// citing the P4-1M comments in this file: those were written before the rider had a swing of his
+// own (v1.7 / T30), when the twist was the only thing that read as "aiming" at all.
+static const float kRideTwistMaxDeg   = 30.0f;  // clamp, was 60 until 2026-09-05: 60 only ever
+                                                // applied to a flanking enemy and read as a
+                                                // wrenched torso; 30 is a torso glance.
+                                                // ⚠️ Aiming GAIN stays 1.0 on purpose - scaling
+                                                // the angle down instead would make the rider
+                                                // under-aim at EVERY bearing, which is not what
+                                                // was asked; a target dead ahead already yields
+                                                // ~0 because the angle is proportional.
+static const float kRideTwistNoTgtDeg = 0.0f;   // in combat with no identifiable target: stay
+                                                // square.  Was 30 until 2026-09-05, and that was
+                                                // the only source of a gratuitous twist in the
+                                                // whole path (everything else is proportional to
+                                                // the target's bearing) => it is precisely the
+                                                // 「敌人在正前方却侧着身子」 being reported.
 static const float kRideTwistMinDeg   = 1.0f;   // below this we hand the spine back entirely
 static const float kRideTwistLerp     = 0.12f;  // per-frame low pass, see below
 // ⚠️ The exponential low pass is legitimate HERE even though CLAUDE.md warns about them: that
@@ -6194,10 +6214,14 @@ static float RideTwistTargetDeg(Character* rider, Character* mount, AnimationCla
     Character* tgt = RideNearestThreat(rider, mount, &tdist);
     Ogre::Vector3 rp = rider->getPosition();
 
-    // In stance but nobody identifiable: still twist, by a fixed amount.  A mounted fighter who
-    // is squared up dead ahead is exactly the pose the player rejected, and this is also the
-    // normal state during the kRideStanceHoldMs tail, where a snap back to square-on would
-    // be worse than a held twist that then decays.
+    // In stance but nobody identifiable: stay SQUARE (kRideTwistNoTgtDeg = 0 since 2026-09-05).
+    // In practice this is the kRideStanceHoldMs tail plus the odd frame where every threat book
+    // empties mid-fight.  ⚠️ The comment that used to sit here argued the opposite ("a mounted
+    // fighter squared up dead ahead is exactly the pose the player rejected, and a snap back
+    // would be worse than a held twist"): the first half was P4-1M, before the rider had a swing
+    // of his own, and the player's 2026-09-05 call is the reverse (「敌人在正前方就没必要侧着
+    // 身子」); the second half never applied to 0 anyway, because kRideTwistLerp low-passes the
+    // way down and kRideTwistMinDeg hands the spine back to the host clip at the bottom.
     if (!tgt) return kRideTwistNoTgtDeg * kRideTwistSign;
 
     Ogre::Vector3 d = tgt->getPosition() - rp;
@@ -6544,6 +6568,9 @@ static void LegPosePassImpl(AnimationClass* rAnim, AnimationData* poseData, Char
         // 「地面是往正前方砍，我们应该往侧方，测前方砍」 - the ground swing squares up dead
         // ahead, a mounted one must not.  The mount's heading is not negotiable (it is where
         // the animal is going), so the aim has to come out of the rider's spine.
+        // ⚠️ 2026-09-05: still true as a DIRECTION, but the MAGNITUDE was cut (clamp 60 -> 30,
+        // no-target 30 -> 0) - 「敌人在正前方就没必要侧着身子…侧的角度没必要太大」.  The knobs
+        // are kRideTwistMaxDeg / kRideTwistNoTgtDeg; nothing in this block changed.
         //
         // Half the yaw on each of Spine1/Spine2 about that bone's own local +X.  RE_NOTES §16
         // measured local +X as "along the bone toward the child", and for a spine bone the
