@@ -36,6 +36,22 @@ EXTRA = {
     "65260-Newwworld.mod": 1,       # neckFollow race match, RidingPlugin.cpp
 }
 
+# 🆕 P2-4 (2026-09-06): kRideLegStyleRows is a SECOND table keyed on the same raceKeys, so every
+# key it lists legitimately appears one more time in the DLL.  ⚠️ Read out of the source rather
+# than hard-coded, exactly like armarc/legpose --mirror: a row added there raises its own allowance,
+# and - the part that matters - a key TYPO'd there is caught below, because a leg-style key that is
+# not a kDefaultSeats key cannot be seated at all and is therefore dead.
+LEG_ROWS_RE = re.compile(
+    rb'kRideLegStyleRows\[\]\s*=\s*\{(.*?)\n\};', re.S)
+
+
+def leg_style_keys(src_path):
+    src = open(src_path, "rb").read()
+    m = LEG_ROWS_RE.search(src)
+    if not m:
+        return None                 # table gone (or renamed) - reported by the caller
+    return [k.decode("utf-8") for k in re.findall(rb'\{\s*"([^"]+)"', m.group(1))]
+
 
 def newest_snapshot():
     """Highest _v<N> among snapshots\riding_tuned_*.cfg.
@@ -85,9 +101,34 @@ def main(argv):
     names = keys_of(cfg)
     blob = open(dll, "rb").read()
     gbk_ok = bare_chinese_literals(SRC)
+    leg = leg_style_keys(SRC)
 
     print("cfg   %s" % cfg)
     print("dll   %s  (%d B)\n" % (dll, len(blob)))
+
+    # 🆕 P2-4: the leg-style table's own integrity, before the byte counts use it.
+    extra_rows = 0
+    if leg is None:
+        print("NOTE  kRideLegStyleRows not found in RidingPlugin.cpp - either it was renamed or")
+        print("      P2-4 was reverted.  Counting as if it does not exist.\n")
+        leg = []
+    else:
+        stray = [k for k in leg if k not in names]
+        dupe = sorted(set(k for k in leg if leg.count(k) > 1))
+        print("leg   kRideLegStyleRows: %d row(s)" % len(leg))
+        if stray:
+            extra_rows += len(stray)
+            for k in stray:
+                print("BAD   %-22s in kRideLegStyleRows but NOT a kDefaultSeats key => that race"
+                      " cannot be seated," % k)
+                print("      so the row is dead code (a typo'd stringID, the red line this script"
+                      " exists for)")
+        for k in dupe:
+            extra_rows += 1
+            print("BAD   %-22s listed TWICE in kRideLegStyleRows - the first row wins silently" % k)
+        if not stray and not dupe:
+            print("      every key is a kDefaultSeats key, no duplicates")
+        print("")
 
     def count(b):
         return 0 if not b else len(re.findall(re.escape(b), blob))
@@ -100,7 +141,7 @@ def main(argv):
         except UnicodeEncodeError:
             g = 0
         subs = [m for m in names if m != n and n in m]
-        allow = 1 + len(subs) + EXTRA.get(n, 0)
+        allow = 1 + len(subs) + EXTRA.get(n, 0) + leg.count(n)
         gbad = g > 0 and not n.isascii() and n not in gbk_ok
         ok = (u == allow) and not gbad
         if not ok:
@@ -111,8 +152,8 @@ def main(argv):
             ("  subs:" + ",".join(s.encode("unicode_escape").decode() for s in subs))
             if subs else ""))
 
-    print("\nrows=%d  bad=%d" % (len(names), bad))
-    return 1 if bad else 0
+    print("\nrows=%d  bad=%d  legrows=%d  legbad=%d" % (len(names), bad, len(leg), extra_rows))
+    return 1 if (bad or extra_rows) else 0
 
 
 if __name__ == "__main__":

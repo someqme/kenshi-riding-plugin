@@ -303,6 +303,19 @@ enum SeatMode
 // getAnimationData(kRidePose) safe - that call INSERTS a NULL on a miss.
 static const char* const kRidePose = "sitting chair";
 
+// 🆕 P2-4 Option A (2026-09-07): the cushion tier pins THIS record instead.  The legs were always
+// ours there (kRideCushionLeg, baked from this same clip @ t=8.8238), but the UPPER BODY - hands
+// included - was still the host's 'sitting chair', and the user read the difference on screen
+// (R UpperArm differs 55.5° between the two clips, so the hands were visibly NOT sitting idle).
+// Same record class as kRidePose (verified in gamedata.base: UPPER cat=NORMAL flags=whole,loop),
+// so every getAnimationData below stays miss-free.  Three facts that make the swap safe:
+//   * root bone (Bip01) translation is essentially constant over the whole 10.9 s (ty span 0.02
+//     at -9.07, vs sitting chair's -3.62) - the node solver already absorbs a constant offset;
+//   * all four leg tracks are CONSTANT in this record, so the host writes exactly the values our
+//     baked table writes - no fight between the clip and kRideCushionLeg;
+//   * the torso/hand fidget is a 10.9 s loop - exactly the 原版动作 the user asked for.
+static const char* const kRideCushionPose = "sitting idle";
+
 // Per-mount seat setup (computed at mount time).
 struct SeatInfo
 {
@@ -2860,8 +2873,34 @@ static float MountCombatSize(Character* mount, const SeatInfo& seat)
     return (t > rad) ? t : rad;
 }
 
+// 🆕 P4-5 (2026-09-06, user ruling 「人物在坐坐垫的时候不参与战斗」).  Forward declaration only: the
+// definition needs kRideLegStyleRows and the geometric fallback, both of which live with the leg
+// pose ~3500 lines below, while the COMBAT gate is the first thing that has to know the answer.
+static bool RideLegPoseIsCushion(Character* mount, const SeatInfo& seat);
+
+// 🆕 P2-4 Option A: same forward-declaration game as above.  The pose NAME is per-style now
+// (cushion mounts pin 'sitting idle' as the host clip so the hands/torso read as the 原版 sitting
+// fidget; straddle and chair stay on 'sitting chair'), and the sites that need it run both before
+// and after the real definition - Mount() at ~7100, the diagnostic at ~4660.
+static const char* RidePoseNameForSeat(Character* mount, const SeatInfo& seat);
+
+// TWO independent denials, answering different questions - ⛔ never merge them (same warning as
+// IsBigMount above):
+//   * size    - "is the animal small enough that the RIDER's own weapon reaches" (P4-0).
+//   * 坐坐垫  - "is this seat a fighting seat at all".  Cross-legged with one shin folded over the
+//     other is not, so P4-5 turns the WHOLE combat route off for that style: RideStanceRaw calls
+//     this first, so no stance means no twist, no auto-draw (P43RD), no sheathe suppression
+//     (P43SUP passes straight through) and no swing window; and CombatAndForceDismountPass's
+//     !riderFights branch additionally ends the rider's combat mode every frame - the same passive
+//     tier the oversized mounts have shipped in since P4-2.
+// ⚠️ 利维坦 was ALREADY denied by size (recorded torso 83.7 >> 15.5).  What P4-5 adds is 螃蟹
+// (trip 28: size 9.5), 沼泽乌龟 (8.8), 巨型沼泽速龙 and 陆地蝙蝠 - every one of them read elig=1
+// before today, so the crab and the turtle CHANGE BEHAVIOUR and are what the next trip has to look
+// at (they now walk the passive branch, which only leviathan-class mounts had ever exercised).
+// ⚠️ The MOUNT is untouched: it keeps its own engine AI and still fights back (user-confirmed).
 static bool MountCombatEligible(Character* mount, const SeatInfo& seat)
 {
+    if (RideLegPoseIsCushion(mount, seat)) return false;   // 🆕 P4-5, see the block above
     float s = MountCombatSize(mount, seat);
     return s > 0.0f && s <= kCombatSizeMax;   // a failed read (0) DENIES
 }
@@ -3017,7 +3056,7 @@ static bool RideFightIsOn(Character* rider, Character* mount)
 static bool RideStanceRaw(Character* rider, Character* mount, const SeatInfo& seat)
 {
     if (!rider || !mount) return false;
-    if (!MountCombatEligible(mount, seat)) return false;
+    if (!MountCombatEligible(mount, seat)) return false;   // size gate AND 🆕 P4-5 坐坐垫
     if (!RideFightIsOn(rider, mount))      return false;
     float d = -1.0f;
     if (!RideNearestThreat(rider, mount, &d)) return false;
@@ -3799,7 +3838,8 @@ static void RideSwingPass(Character* rider, Character* mount, AnimationClass* rA
     // ---- open decision ------------------------------------------------------------------------
     if (!stance) return;               // the stance is the gate for everything on this route, so a
                                        // big-mount rider can never reach here (MountCombatEligible
-                                       // runs first inside it) and neither can a rider out of a
+                                       // runs first inside it - 🆕 P4-5: nor can a 坐坐垫 rider, by
+                                       // the same one gate) and neither can a rider out of a
                                        // fight - the same gate the suppressor and the re-draw use.
     // ⚠️ A paused game must not open a window: a pause freezes exactly what the interval measures
     // (same discipline as the stance tail and ServicePendingMounts).
@@ -4658,7 +4698,10 @@ static void DebugLogRideFrame(Character* rider, Character* mount, const SeatInfo
         // getAnimationData cannot insert a NULL.
         int   posePlayDbg = 0;
         float poseWDbg = 0.0f, posePDbg = 0.0f, otherWDbg = 0.0f, actWDbg = 0.0f;
-        AnimationData* poseDataDbg  = rAnim->getAnimationData(kRidePose);
+        // 🆕 Option A: diagnose the pose this seat actually pins ('sitting idle' for cushion
+        // mounts) - same forward-declared helper the shipping sites use.  Miss-free for both
+        // names, same as the shipping path.
+        AnimationData* poseDataDbg  = rAnim->getAnimationData(RidePoseNameForSeat(mount, seat));
         AnimationData* otherDataDbg = rAnim->getAnimationData("idle_stand_normal");
         if (poseDataDbg)
         {
@@ -5115,6 +5158,29 @@ static const float kRideLegRadRef       = 3.0f;   // getRadius() of a dog-sized 
 static const float kRideLegAbductPerRad = 3.75f;  // degrees per world unit of radius
 static const float kRideLegTorsoToRad   = 0.65f;  // fallback fit: 7.6->4.9 and 10.3->6.7
 
+// 🆕 P2-4 (2026-09-05) - the lower body does NOT have to straddle.  User's ruling:
+// 「下半身贴在动物身上不一定非要跨骑，有的动物比如驮兽加鲁兽坐椅子的动作更合适」.
+//   The FIRST cut of this was 「按背宽自动判」 (⛔ no hotkey, ⛔ no cfg column, ⛔ no species list).
+// The user then supplied the split BY SPECIES, and it is THREE styles, not two, and it is ⛔ not a
+// width function - which is a measurement, not an opinion:
+//   * 牛 torso 10.3 / rad 6.7 => stout 0.650 wants STRADDLE, while 驮兽 9.0 / 6.7 => 0.744 wants
+//     CHAIR.  The bull is LONGER and LESS stout on both axes, so no threshold pair can order them.
+//   * 利维坦 (torso 83.7, stout 0.67) and 螃蟹类 (torso 5.9, stout ~5.7) both want CUSHION from
+//     OPPOSITE geometric extremes => no width rule produces a third class at all.
+// >= 3 of the 8 measured species contradict any geometric cut, so the LIST is the truth source:
+// kRideLegStyleRows keys the 21 shipped species by race stringID, and the rule below survives as
+// the fallback for a race that is NOT in that list (i.e. mods).  kDefaultsVersion still does not
+// move - this is a source-side table, not a new cfg column.
+enum RideLegStyle { kLegStyleStraddle = 0, kLegStyleChair = 1, kLegStyleCushion = 2 };
+static const char* const kRideLegStyleName[3] = { "straddle", "chair", "cushion" };
+
+// The two thresholds of the FALLBACK rule only (see RideLegPoseWantsChair).  ⚠️ They are still
+// printed on every takeover line (wth=/sth=) so an unlisted mount's cut can be re-judged from a
+// log without another design pass.
+static const float kRideChairTorsoMin = 8.5f;   // front<->rear span, LIVE units, >= this = chair
+static const float kRideChairStoutMax = 0.90f;  // rad/torso above this = a compact animal
+                                                // (bonedog 1.16, crabs 5.7-5.9) => straddle
+
 // Order is load-bearing: 0/1 are the thighs we take over (masked + written), 2/3 are
 // the calves, whose local knee bend is borrowed from the pose track or replayed from a
 // snapshot (index i's calf is at i+2), and 4/5 are the spine bones the P4-1M torso twist
@@ -5129,6 +5195,47 @@ static const int          kLegPoseBoneCount   = 6;
 static const int          kLegBoneThighFirst  = 0;   // [0,2)
 static const int          kLegBoneCalfFirst   = 2;   // [2,4)
 static const int          kLegBoneSpineFirst  = 4;   // [4,6)
+
+// 🆕 P2-4 坐坐垫: the THIRD style's pose, and the only one with no vanilla clip behind it at
+// RUNTIME - a combat clip is UPPER and carries no leg track, so "let go and let the game pose the
+// legs" straightens them (that is the entire reason gLegCalfSnap exists).  So it is baked the way
+// T30 bakes the swing: a vanilla clip's own leg keys, read out of male_skeleton.skeleton OFFLINE
+// and stored as BIND-RELATIVE deltas, replayed by OUR writer under OUR mask:
+//     want[i] = bone->getInitialOrientation() * kRideCushionLeg[i]
+// which is algebraically the same shape straddle already writes (bind * delta) => a third target
+// for an existing writer, not new machinery.  Keys on disk are bind-relative (local = bind * key),
+// which is exactly the space Bone::setOrientation takes, so the table is a straight copy.
+//   Row order IS kLegPoseBones[0..3] - both thighs then both calves.
+//   Source clip = 'sitting idle' = VANILLA'S OWN GROUND/CUSHION SIT (the only floor sit among the
+// 174 human clips; 'sitting chair' is the chair pose chair mode borrows, 'sitting dazed' is the hurt
+// variant).  ⚠️ Its record is UPPER, so only the torso fidgets: the four LEG tracks are CONSTANT
+// across all 10.9 s (t=0 / 2.5 / 5.5 / medoid all read the same pose to 0.01 units) => a static
+// snapshot of it is EXACT, not an approximation.  Geometry: left knee 90 deg and 1.6 ABOVE the
+// pelvis, right knee 56 deg folded under, both ankles pulled INBOARD of the knees (lateral 4.98 vs
+// 5.85) => cross-legged with one shin over the other.  The 35 deg left/right asymmetry IS the pose
+// (it is on every frame of the clip), not a sampling artefact.  Both calf rows are a PURE hinge
+// (x = z = 0 exactly, i.e. rotation about the bone's own -Y), so nothing below the knee gets rolled
+// - the same structural argument T30's grip rests on.
+//   (The first bake used 'squat': symmetric, 22 deg, knees wide.  That is a squat, not a sit - the
+// user pointed out 坐坐垫 is a motion vanilla already has, and this clip is it.)
+// ⚠️ GENERATED - ⛔ do not hand-edit a value.  `python tools\legpose.py --mirror` re-bakes this
+// table out of the asset and diffs it value by value, and EVERY legpose.py mode runs that first and
+// refuses to report on a mismatch (armarc.py's rule).  To change the pose, re-bake it
+// (`--bake <clip>`) and paste the whole table, never nudge a number.
+// Generated by `python tools\legpose.py --bake sitting idle` (t=8.8238) - DO NOT hand-edit a value.
+static const float kRideCushionLeg[4][4] = {   // w, x, y, z - bind-relative delta
+    {   0.561357f,   0.009353f,   0.787889f,  -0.253027f },   // Bip01 L Thigh
+    {   0.475541f,   0.734646f,   0.475172f,  -0.091468f },   // Bip01 R Thigh
+    {   0.711202f,  -0.000000f,  -0.702988f,   0.000000f },   // Bip01 L Calf
+    {   0.470522f,  -0.000000f,  -0.882388f,   0.000000f }    // Bip01 R Calf
+};
+// ⚠️ Ogre::Quaternion's ctor is (w, x, y, z) - the same order the table is emitted in, which is why
+// the row goes through verbatim (RideSwingBakeAt relies on the identical convention).
+static Ogre::Quaternion RideCushionQ(int i)
+{
+    return Ogre::Quaternion(kRideCushionLeg[i][0], kRideCushionLeg[i][1],
+                            kRideCushionLeg[i][2], kRideCushionLeg[i][3]);
+}
 
 // 🆕 T23 - the HOST's half of the split, ⚠️ CUT DOWN TO THE ARM BY T25 (2026-09-03, trip 22).
 // These are the bones the host must let go of WHILE A WINDOW IS OPEN: zeroed on every weighted clip
@@ -5311,6 +5418,15 @@ static bool              gLegCalfHave[2];   // knee bend captured this ride
 static Ogre::Quaternion gLegCalfSnap[2];
 static bool             gLegCalfManual = false;  // we are replaying the bend right now
 static bool             gLegCalfWarned = false;  // "no snapshot" said once per ride
+// 🆕 P2-4: the same borrow-and-replay machinery, one joint up, for chair mode only.  In straddle
+// mode these stay unused (the thighs are authored from the bind pose every frame); in chair mode
+// the pose's own hip orientation is the thing we have to keep alive across a combat clip, exactly
+// as the knee bend already is.  ⚠️ Snapshot, not a constant: the chair record is shared by every
+// mount but the individual's scale is not, and this way nothing about the pose is hardcoded here.
+static bool             gLegThighHave[2];
+static Ogre::Quaternion gLegThighSnap[2];
+static bool             gLegThighManual = false;  // we are holding the thighs right now
+static bool             gLegChairWarned = false;  // "no snapshot" said once per ride
 // Every change of host, up to a budget, NOT debug-gated: "which clip owned the skeleton
 // when the legs looked wrong" is unanswerable after the fact otherwise, and the takeover
 // line only fires once per arming.  Budgeted rather than gated because a stance that
@@ -5449,8 +5565,8 @@ static void LegMaskTrack(Ogre::AnimationState* st, bool mine, const char* clip)
 // masked to 0 - a bone we are not holding must stay at 1.0 so it keeps receiving its track
 // (that is the borrowed-knee-bend path, and the same rule now covers the spine, which is only
 // ours while the torso twist is engaged).
-static int LegMaskApply(AnimationClass* rAnim, unsigned short nb, bool calfMask, bool spineMask,
-                        bool swingFree)
+static int LegMaskApply(AnimationClass* rAnim, unsigned short nb, bool thighMask, bool calfMask,
+                        bool spineMask, bool swingFree)
 {
     if (!rAnim || !rAnim->layer.valid() || nb == 0) return 0;
     unsigned int nl = rAnim->layer.size();
@@ -5478,9 +5594,16 @@ static int LegMaskApply(AnimationClass* rAnim, unsigned short nb, bool calfMask,
             {
                 if (!gLegPoseHas[i] || gLegPoseHandle[i] >= nb) continue;
                 bool ours;
-                if (i < kLegBoneCalfFirst)       ours = true;        // thighs: always
-                else if (i < kLegBoneSpineFirst) ours = calfMask;    // calves: on replay
-                else ours = spineMask;                               // spine: only when twisting
+                // 🆕 P2-4: the thighs are no longer unconditional.  Straddle and cushion mode pass
+                // thighMask=true every frame (we author them - from the bind pose and from the
+                // baked 盘腿 delta respectively); chair mode passes it only on the frames we are
+                // replaying the pose's own hips, so during ordinary riding the chair clip keeps its
+                // legs at mask 1.0 and we own nothing below the waist.  Same rule the calves have
+                // had since route A - except that cushion also passes calfMask=true every frame,
+                // because there the knee fold IS the pose rather than a borrowed detail.
+                if (i < kLegBoneCalfFirst)       ours = thighMask;    // thighs: straddle/cushion/replay
+                else if (i < kLegBoneSpineFirst) ours = calfMask;     // calves: replay or cushion
+                else ours = spineMask;                                // spine: only when twisting
                 sa->mainState->setBlendMaskEntry((size_t)gLegPoseHandle[i],
                                                  ours ? 0.0f : 1.0f);
             }
@@ -6147,6 +6270,8 @@ static void LegPoseRestoreImpl(AnimationClass* rAnim, AnimationData* poseData)
         ++seen;
     }
     gLegCalfManual = false;
+    gLegThighManual = false;  // P2-4: chair mode leaves the hips manual between fights, and this
+                              // is the only path that can hand them back for good
     gLegTwistManual = false;
     gLegTwistDeg    = 0.0f;   // so the next fight ramps in instead of snapping
     // Drop the masks.  Ownership-aware and pointer-validated (see LegMaskRelease): the
@@ -6185,6 +6310,136 @@ static float RideLegAbductDeg(Character* mount, const SeatInfo& seat)
     if (a < kRideLegAbductMin) a = kRideLegAbductMin;
     if (a > kRideLegAbductMax) a = kRideLegAbductMax;
     return a;
+}
+
+// 🆕 P2-4: straddle or chair for a mount that is NOT in kRideLegStyleRows - i.e. a modded race we
+// have never seen.  ⚠️ This was the WHOLE decision under 「按背宽自动判」 and is now the FALLBACK
+// only (the user's species list overrides it for all 21 shipped races, and no geometric cut can
+// reproduce that list - see the falsification at kRideChairTorsoMin).  It can still only answer
+// two-way: 坐坐垫 has no geometric signature at all (利维坦 and 螃蟹 want it from opposite extremes),
+// so an unknown race is never given the third style.
+//   The honest version of the ruling is that neither quantity we can read is a back WIDTH, so the
+// split is cut with the two that exist, each answering a different half of the question:
+//   * torsoLen (front<->rear bone span, live) = "is this animal big enough to sit ON".  Measured:
+//     garru 9.0 / pack beast 9.0 / bison 10.3 above the line; goat 7.6, bonedog 6.9, crab 1.6,
+//     Mr.Crab 3.9 below it.  ⚠️ LIVE, so it moves with the individual's scale - a runt garru
+//     straddles.  That is deliberate: the pose that fits the body in front of us wins over a
+//     species label, and this is the same live quantity the abduction above already adapts to.
+//   * rad/torso (scale-INVARIANT, both terms scale together) = "is it a long back or a compact
+//     one".  This is the gate that makes the bonedog decision scale-proof: a reference-scale
+//     bonedog is 8.9 long (it would clear the size gate) but its ratio is 1.16, and the crabs sit
+//     at 5.7-5.9, while every long-backed quadruped measured lands in 0.64-0.74.
+// Both must pass, and anything unreadable falls back to the straddle - that is the pose 27 trips
+// have shipped, so an unknown mount must never be the one experimenting.
+// ⚠️ ORDERING FACT, do not lose it: the garru (0.73) is at the TOP of the low ratio band, so no
+// threshold can chair the garru and leave the goat/bison straddling.  The goat is separated by the
+// SIZE gate alone (7.6 vs 8.5), which is why that gate exists and why 8.5 is the number to move if
+// the trip says a species landed wrong.  All measured values are in TASK.md P2-4.
+static bool RideLegPoseWantsChair(Character* mount, const SeatInfo& seat,
+                                  float* torsoOut, float* stoutOut)
+{
+    float torso = seat.torsoLen;
+    float rad   = mount ? mount->getRadius() : 0.0f;
+    bool  radOk = (rad > 0.1f && rad < 200.0f);
+    float stout = (torso > 0.1f && radOk) ? (rad / torso) : -1.0f;
+    if (torsoOut) *torsoOut = torso;
+    if (stoutOut) *stoutOut = stout;
+    if (stout < 0.0f) return false;   // ⛔ no derived fallback here: rad ~= 0.65*torso IS the
+                                      // fallback fit, and feeding it in would read as ratio 0.65
+                                      // = "chair" for every mount we cannot measure.
+    return torso >= kRideChairTorsoMin && stout <= kRideChairStoutMax;
+}
+
+// 🆕 P2-4: the user's own split, by species (2026-09-05).  ⚠️ THIS TABLE IS THE TRUTH SOURCE for
+// the 21 shipped mounts - the geometric rule above is consulted only for a race that is not here.
+//   ⚠️ Keys are COPIED verbatim out of kDefaultSeats.  ⛔ Never retype a stringID suffix (CLAUDE.md:
+// falsified twice); a race absent from kDefaultSeats cannot be seated at all, so it cannot need a
+// row here either.  The Chinese name on each line is the user's own word for it, resolved through
+// locale\zh_CN\gamedata.po -> the RACE record the seat row is keyed on.
+//   ⚠️ TWO ROWS WERE INFERRED, not given: the user's list covers 19 of the 21 races.  Both were put
+// to the user on 2026-09-05 and CONFIRMED as they stand (铁之蜘蛛 ⇒ chair, 埋骨地狼 ⇒ straddle), so
+// the ⓘ marks below are provenance, not open questions.
+//   ⚠️ ONE GENUINE COLLISION, user-accepted ("接受，两者都坐坐垫"): 巨型沼泽速龙 (list: 坐坐垫) and
+// 河之沼泽速龙 (list: 跨骑) are separate
+// creatures but 42071 is the race BOTH plain 沼泽速龙 and the Megaraptor carry, while 河之沼泽速龙 is
+// its own race 44910.  So the list is expressible after all - but any OTHER swamp raptor variant
+// sharing 42071 inherits 坐坐垫 with it.
+struct RideLegStyleRow { const char* raceKey; int style; };
+static const RideLegStyleRow kRideLegStyleRows[] = {
+    { "2860-gamedata.base",             kLegStyleStraddle },  // 喙嘴兽   Beak Thing
+    { "3966-gamedata.base",             kLegStyleCushion  },  // 利维坦   Leviathan
+    { "3976-gamedata.base",             kLegStyleStraddle },  // 骨犬     Bonedog        (犬类)
+    { "3985-gamedata.base",             kLegStyleStraddle },  // 野牛     Bull           (牛类)
+    { "3987-gamedata.base",             kLegStyleCushion  },  // 沼泽乌龟 Swamp Turtle
+    { "3992-gamedata.base",             kLegStyleStraddle },  // 山羊     Goat           (山羊类)
+    { "3998-gamedata.base",             kLegStyleChair    },  // 驮兽/加鲁兽 Garru       (驮兽类)
+    { "42068-small_changes_otto.mod",   kLegStyleStraddle },  // 笼中野兽 Cage Beast
+    { "42070-small_changes_otto.mod",   kLegStyleChair    },  // ⓘ 铁之蜘蛛 Robot Spider Worker
+                                                              //   - not in the user's list; every
+                                                              //   other spider is 坐椅子
+    { "42071-small_changes_otto.mod",   kLegStyleCushion  },  // 巨型沼泽速龙 Swamp Raptor
+    { "43870-rebirth.mod",              kLegStyleChair    },  // 人皮蜘蛛 Spider
+    { "43947-rebirth.mod",              kLegStyleStraddle },  // 家牛     Bull (domesticated)
+    { "44910-rebirth.mod",              kLegStyleStraddle },  // 河之沼泽速龙 River Raptor
+    { "48689-rebirth.mod",              kLegStyleChair    },  // 安全蜘蛛 Robot Guard Spider
+    { "50641-rebirth.mod",              kLegStyleChair    },  // 血之蜘蛛 Small Spider
+    { "56088-rebirth.mod",              kLegStyleStraddle },  // 剪嘴鸥   Skimmer
+    { "56089-Newwworld.mod",            kLegStyleCushion  },  // 螃蟹     Crab           (螃蟹类)
+    { "56112-Newwworld.mod",            kLegStyleChair    },  // 清洁组件 Big-Bones
+    { "65260-Newwworld.mod",            kLegStyleChair    },  // 卷缩者 + 国王 Crimper (one race)
+    { "66294-Newwworld.mod",            kLegStyleStraddle },  // ⓘ 埋骨地狼 Boneyard Wolf
+                                                              //   - not in the user's list; 犬类
+                                                              //   is 跨骑
+    { "97570-Newwworld.mod",            kLegStyleCushion  }   // 陆地蝙蝠 Land Bat
+};
+static const int kRideLegStyleRowCount =
+    (int)(sizeof(kRideLegStyleRows) / sizeof(kRideLegStyleRows[0]));
+
+// Which of the three lower bodies THIS mount gets.  ⚠️ The geometric rule runs unconditionally,
+// even for a listed race, because torso=/stout= are the calibration instrument on the takeover line
+// and the fallback has to stay re-cuttable from a log of any ride.  fromRowOut says which half
+// answered, so a log can never be misread as "the geometry chose 坐坐垫" (it cannot).
+static int RideLegPoseStyle(Character* mount, const SeatInfo& seat,
+                           float* torsoOut, float* stoutOut, bool* fromRowOut)
+{
+    bool chairGeo = RideLegPoseWantsChair(mount, seat, torsoOut, stoutOut);
+    if (!seat.raceKey.empty())
+    {
+        for (int i = 0; i < kRideLegStyleRowCount; ++i)
+        {
+            if (seat.raceKey == kRideLegStyleRows[i].raceKey)
+            {
+                if (fromRowOut) *fromRowOut = true;
+                return kRideLegStyleRows[i].style;
+            }
+        }
+    }
+    if (fromRowOut) *fromRowOut = false;
+    return chairGeo ? kLegStyleChair : kLegStyleStraddle;
+}
+
+// 🆕 P4-5: the ONE question the combat gate asks of the leg pose (declared up next to
+// MountCombatEligible, defined here because this is where the table and the fallback live).
+// ⚠️ Deliberately re-derived on every call instead of cached in a global that LegPosePass fills:
+// the stance is read from two passes per frame plus the sheathe hook (which fires from the engine's
+// own call graph at an arbitrary point in the frame), so a cache would make the answer depend on
+// pass ORDER, and one frame of "straddle" is long enough to open a swing window on a cushion mount.
+// The cost is 21 string compares plus the one getRadius() the geometric fallback already does.
+static bool RideLegPoseIsCushion(Character* mount, const SeatInfo& seat)
+{
+    return RideLegPoseStyle(mount, seat, NULL, NULL, NULL) == kLegStyleCushion;
+}
+
+// 🆕 P2-4 Option A: the host clip a seat's ride pose should be pinned to.  Cushion mounts answer
+// kRideCushionPose ('sitting idle' - the record the leg table was baked from, so the upper body
+// and the legs finally come from the SAME clip); everything else answers kRidePose unchanged.
+// 🆕 Re-derived per call on purpose, same discipline as RideLegPoseIsCushion above: the pose is
+// requested from Mount(), from the per-frame reassert and from the dismount teardown, and caching
+// it would let the answer depend on which of those ran last - Mount() would happily switch the
+// host clip a frame after the per-frame pass already pinned the other one.
+static const char* RidePoseNameForSeat(Character* mount, const SeatInfo& seat)
+{
+    return RideLegPoseIsCushion(mount, seat) ? kRideCushionPose : kRidePose;
 }
 
 // Where the rider should be aiming, in degrees of yaw away from the mount's heading.
@@ -6423,6 +6678,25 @@ static void LegPosePassImpl(AnimationClass* rAnim, AnimationData* poseData, Char
         }
     }
 
+    // 🆕 P2-4: the hips, same window, same reason.  In straddle mode the thighs are manual from
+    // the first armed frame, so isManuallyControlled() shuts this off by itself and nothing is
+    // ever captured (or spent); in chair mode this is the only place the pose's own hip
+    // orientation can be read cleanly.  ⚠️ Not gated on the chair decision on purpose: the
+    // decision is per-MOUNT and a re-arm can change mounts, so the snapshot has to already exist.
+    if (poseIsHost && host->weight >= kLegCalfSnapW && !gLegThighManual)
+    {
+        for (int i = 0; i < 2; ++i)
+        {
+            if (!gLegPoseHas[i]) continue;
+            std::string tn(kLegPoseBones[i]);
+            if (!rAnim->getHasBone(tn)) continue;
+            Ogre::OldBone* tb = rAnim->_getBone(tn);
+            if (!tb || tb->isManuallyControlled()) continue;
+            gLegThighSnap[i] = tb->getOrientation();
+            gLegThighHave[i] = true;
+        }
+    }
+
     // Calves: borrow the bend from the host while the ride pose IS the host, replay the
     // snapshot once anything else takes over (combat clips are UPPER without 'whole' and
     // carry no leg tracks, so borrowing there means straight knees).  No snapshot => stay
@@ -6432,6 +6706,35 @@ static void LegPosePassImpl(AnimationClass* rAnim, AnimationData* poseData, Char
     {
         gLegCalfWarned = true;
         DebugLog("Riding: LEGPOSE knee bend unavailable - calves left to the host clip");
+    }
+
+    // 🆕 P2-4: which of the three lower bodies this mount gets, and therefore who owns the thighs
+    // and the calves this frame.
+    //   * straddle => thighs ours every frame, authored from the bind pose (unchanged since
+    //                 P2-1b-3); calves borrowed/replayed exactly as above.
+    //   * chair    => the vanilla pose's legs are already the answer, so we take nothing while it
+    //                 is the host and step in ONLY when something else is (a stance/combat clip
+    //                 is UPPER and carries no leg tracks - borrowing there means straight legs,
+    //                 which is the exact defect gLegCalfSnap exists for, one joint up).
+    //   * cushion  => thighs ours every frame like straddle, but from the baked 盘腿 delta instead
+    //                 of the abduction/flexion pair, and the CALVES come with them EVERY frame -
+    //                 not just in combat.  The chair pose's own shins hang down, so borrowing them
+    //                 out of combat would un-fold the sit between fights.
+    // Missing snapshot in chair mode => hold nothing and mask nothing, same failure posture as
+    // the calves: the legs read as the host's, not as bind.  Cushion has no such hole: its pose is
+    // a compiled-in constant, so it cannot be unavailable.
+    float chairTorso = 0.0f, chairStout = -1.0f;
+    bool  styleRow   = false;
+    int   legStyle   = RideLegPoseStyle(mount, seat, &chairTorso, &chairStout, &styleRow);
+    bool  chair      = (legStyle == kLegStyleChair);
+    bool  cushion    = (legStyle == kLegStyleCushion);
+    bool thighReplay = chair && !poseIsHost && gLegThighHave[0] && gLegThighHave[1];
+    bool thighOurs   = !chair || thighReplay;
+    bool calfOurs    = cushion || calfReplay;
+    if (chair && !poseIsHost && !thighReplay && !gLegChairWarned)
+    {
+        gLegChairWarned = true;
+        DebugLog("Riding: LEGPOSE chair hips unavailable - thighs left to the host clip");
     }
 
     // ---- how far to twist the torso ---------------------------------------------------
@@ -6460,7 +6763,7 @@ static void LegPosePassImpl(AnimationClass* rAnim, AnimationData* poseData, Char
     // (§17.9), written-but-unfreed is overwritten by the host.  T27 does not touch either table: the
     // host clip changed, the split did not.
     bool swingFree = RideSwingInFlight(rider);
-    int msk = LegMaskApply(rAnim, nb, calfReplay, twistOn, swingFree);
+    int msk = LegMaskApply(rAnim, nb, thighOurs, calfOurs, twistOn, swingFree);
     if (swingFree && msk > 0) ++gRideSwingFreeFrames;
 
     // 🆕 T25: author the arm on exactly the frames the host has let go of it.  ⚠️ ORDER IS
@@ -6497,18 +6800,39 @@ static void LegPosePassImpl(AnimationClass* rAnim, AnimationData* poseData, Char
             Ogre::OldBone* b = rAnim->_getBone(bn);    // a skeleton instance can be rebuilt
             if (!b) continue;
 
+            // 🆕 P2-4: chair mode with the pose still hosting (or with no snapshot) - the thigh is
+            // not ours this frame.  ⚠️ NO reset() on the way out, unlike LegPoseRestoreImpl: this
+            // pass runs after the game's update, so reset() would render ONE frame of bind pose
+            // (straight leg) at every fight->idle transition.  Clearing the flag is enough - the
+            // next Skeleton::reset() inside the game's update covers this bone again - and what
+            // stays on screen for that one frame is the chair pose's own hip, which is what the
+            // track is about to write anyway.
+            if (!thighOurs)
+            {
+                if (gLegThighManual) { b->setManuallyControlled(false); b->needUpdate(); }
+                continue;
+            }
+
             // Read back BEFORE writing.  What sits here now is whatever survived last
             // frame's Skeleton::reset() + track application, so |dot| with what we wrote
             // is the direct answer to "does a manual write hold, or does the pose win?"
+            // ⚠️ gLegThighManual as well as gLegPoseArmed: in chair mode we skip whole
+            // stretches of frames, and comparing against a write from before the gap would
+            // report a fault that is really just the pose having driven the bone meanwhile.
             Ogre::Quaternion had = b->getOrientation();
-            float kept = gLegPoseArmed
+            float kept = (gLegPoseArmed && gLegThighManual)
                        ? (float)Ogre::Math::Abs(had.Dot(gLegPoseWrote[i])) : -1.0f;
 
             b->setManuallyControlled(true);
             Ogre::Quaternion qAbd(Ogre::Degree(abd * ((i == 0) ? -1.0f : 1.0f)),
                                   Ogre::Vector3::UNIT_Z);
             Ogre::Quaternion qFlx(Ogre::Degree(flx), Ogre::Vector3::UNIT_Y);
-            Ogre::Quaternion want = b->getInitialOrientation() * (qAbd * qFlx);
+            // Chair replays the pose's own hip verbatim, cushion replays the baked 盘腿 delta, and
+            // straddle authors the abduction/flexion pair - all three are `bind * delta`, which is
+            // why one writer covers them (kRideCushionLeg's header has the algebra).
+            Ogre::Quaternion want = thighReplay ? gLegThighSnap[i]
+                                  : cushion     ? (b->getInitialOrientation() * RideCushionQ(i))
+                                                : (b->getInitialOrientation() * (qAbd * qFlx));
             b->setOrientation(want);
             b->needUpdate();
             gLegPoseWrote[i] = want;
@@ -6528,20 +6852,27 @@ static void LegPosePassImpl(AnimationClass* rAnim, AnimationData* poseData, Char
                 // (+Z = forward).  `down` keeps the 4.17 femur length in view, so a
                 // nonsense read is obvious rather than plausible.
                 Ogre::Vector3 rel = cp - dp;
-                char ln[320];
-                _snprintf_s(ln, 320, _TRUNCATE,
+                char ln[352];
+                _snprintf_s(ln, 352, _TRUNCATE,
                     "Riding: LEGPOSE f=%u '%s' kept=%.4f abd=%.1f flx=%.1f "
-                    "out=%.2f fore=%.2f down=%.2f hip=(%.2f,%.2f,%.2f) knee=(%.2f,%.2f,%.2f)",
+                    "out=%.2f fore=%.2f down=%.2f hip=(%.2f,%.2f,%.2f) knee=(%.2f,%.2f,%.2f) st=%d",
                     gLegPoseFrames, kLegPoseBones[i], kept, abd, flx,
                     rel.x * ((i == 0) ? 1.0f : -1.0f), rel.z, -rel.y,
-                    dp.x, dp.y, dp.z, cp.x, cp.y, cp.z);
+                    dp.x, dp.y, dp.z, cp.x, cp.y, cp.z,
+                    thighReplay ? 1 : (cushion ? 2 : 0));   // st=: 0 straddle / 1 chair / 2 cushion
                 DebugLog(std::string(ln));
                 --gLegPoseBudget;
             }
         }
-        // Calves.  Replay = manual + masked (the host has no knee track to borrow);
-        // otherwise make sure we are NOT holding them, so the host's own bend rides along
-        // with the thigh exactly as it did before route A.
+        // 🆕 P2-4: whoever we ended up holding, that is the custody state the mask, the kept=
+        // baseline and the hand-back branch above all key off next frame.
+        gLegThighManual = thighOurs;
+        // Calves.  Ours = manual + masked; otherwise make sure we are NOT holding them, so the
+        // host's own bend rides along with the thigh exactly as it did before route A.
+        //   * replay (straddle/chair, combat hosting) = the bend borrowed off the pose track,
+        //     because the host has no knee track to borrow from.
+        //   * cushion = the baked delta, EVERY frame, for the same reason the thigh is: the fold IS
+        //     the pose, so handing the knee back between fights would straighten the sit out.
         for (int i = 0; i < 2; ++i)
         {
             if (!gLegPoseHas[i + 2]) continue;
@@ -6549,10 +6880,12 @@ static void LegPosePassImpl(AnimationClass* rAnim, AnimationData* poseData, Char
             if (!rAnim->getHasBone(cn)) continue;
             Ogre::OldBone* cb = rAnim->_getBone(cn);
             if (!cb) continue;
-            if (calfReplay)
+            if (calfOurs)
             {
                 cb->setManuallyControlled(true);
-                cb->setOrientation(gLegCalfSnap[i]);
+                cb->setOrientation(cushion
+                                   ? (cb->getInitialOrientation() * RideCushionQ(i + 2))
+                                   : gLegCalfSnap[i]);
                 cb->needUpdate();
             }
             else if (gLegCalfManual)
@@ -6562,7 +6895,7 @@ static void LegPosePassImpl(AnimationClass* rAnim, AnimationData* poseData, Char
                 cb->needUpdate();
             }
         }
-        gLegCalfManual = calfReplay;
+        gLegCalfManual = calfOurs;
 
         // ---- torso side-twist ---------------------------------------------------------
         // 「地面是往正前方砍，我们应该往侧方，测前方砍」 - the ground swing squares up dead
@@ -6674,20 +7007,34 @@ static void LegPosePassImpl(AnimationClass* rAnim, AnimationData* poseData, Char
         // route-A additions: which clip opened the gate, and how many AnimationStates got
         // masked (msk=1 while a stance is up means we missed a contributor, which is what
         // a kept< 1.0000 further down would then be blamed on).
+        //   🆕 P2-4 fields, and they are the whole calibration instrument: style= is the verdict
+        // (straddle|chair|cushion) and src= says WHO gave it - `row` = the user's species list,
+        // `geo` = the fallback rule, which can only ever answer straddle|chair.  torso=/stout= are
+        // the two measurements the fallback reads and wth=/sth= the thresholds that build used, so
+        // an unlisted mount's cut can be re-judged from any log without guessing which DLL it came
+        // from - they are printed for listed races too, where they are informational only.  thigh=
+        // is who owns the hips on the arming frame, calf= who owns the knees (⚠️ cushion holds both
+        // every frame => 1/1), snap= whether the chair snapshot existed yet.  ⚠️ ONE LINE PER MOUNT
+        // - to calibrate, ride one animal of each species and read style=/src=/torso=/stout=, not
+        // these numbers averaged.
         if (takeover)
         {
-            char tk[352];
-            _snprintf_s(tk, 352, _TRUNCATE,
+            char tk[448];
+            _snprintf_s(tk, 448, _TRUNCATE,
                 "Riding: LEGPOSE takeover abd=%.1f flx=%.1f rad=%.1f torso=%.1f "
                 "h=(%u,%u) bones=%u host='%s' hw=%.3f L=%d msk=%d calf=%d "
-                "spine=(%u,%u) stance=%d twist=%.1f",
+                "spine=(%u,%u) stance=%d twist=%.1f style=%s src=%s stout=%.3f "
+                "wth=%.1f sth=%.2f thigh=%d snap=%d",
                 abd, flx, mount ? mount->getRadius() : -1.0f, seat.torsoLen,
                 (unsigned int)gLegPoseHandle[0], (unsigned int)gLegPoseHandle[1],
                 (unsigned int)nb, host->animName.c_str(), host->weight, hostLayer,
-                msk, calfReplay ? 1 : 0,
+                msk, calfOurs ? 1 : 0,
                 (unsigned int)gLegPoseHandle[kLegBoneSpineFirst],
                 (unsigned int)gLegPoseHandle[kLegBoneSpineFirst + 1],
-                stance ? 1 : 0, gLegTwistDeg);
+                stance ? 1 : 0, gLegTwistDeg,
+                kRideLegStyleName[legStyle], styleRow ? "row" : "geo", chairStout,
+                kRideChairTorsoMin, kRideChairStoutMax,
+                thighOurs ? 1 : 0, (gLegThighHave[0] && gLegThighHave[1]) ? 1 : 0);
             DebugLog(std::string(tk));
         }
     }
@@ -6802,8 +7149,9 @@ void Mount(Character* rider, Character* mount)
     //    attach is dropped for every mount.
 
     // 3) Play the native sitting animation so the rider sits upright on the back.
-    //    kRidePose is the toilet-sitting pose the player confirmed.
-    rider->runSlaveAnim(kRidePose, 1.0f, 1.0f);
+    //    kRidePose is the toilet-sitting pose the player confirmed; 🆕 cushion mounts pin
+    //    'sitting idle' instead (Option A, 2026-09-07) so the hands match the baked legs.
+    rider->runSlaveAnim(RidePoseNameForSeat(mount, seat), 1.0f, 1.0f);
 
     mountSeat[mount] = seat;
 
@@ -6889,6 +7237,10 @@ void Mount(Character* rider, Character* mount)
     gLegCalfHave[1]  = false;
     gLegCalfManual   = false;
     gLegCalfWarned   = false;
+    gLegThighHave[0] = false;        // P2-4: the chair hip snapshot is per-ride for the same
+    gLegThighHave[1] = false;        // reason the knee bend is - the individual's scale is in it
+    gLegThighManual  = false;
+    gLegChairWarned  = false;
     gLegHostLast     = NULL;
     gLegMaskedCount  = 0;
     gLegMaskOverflow = false;
@@ -6947,6 +7299,9 @@ void Mount(Character* rider, Character* mount)
              // P4-0: rad=/size=/elig= are the gate itself (all ×10), h= is the record-only
              // candidate third term.  size = max(torso, rad) so it is comparable to torso=
              // and rad= printed beside it; elig= is what the gate would answer today.
+             // ⚠️ 🆕 P4-5: elig= now has TWO terms, so `elig=0` next to a small size= is not a bug -
+             // it is a 坐坐垫 mount (the LEGPOSE takeover line's style= says which, and ridelog.py's
+             // T32 invariant ⑨ cross-checks exactly this pair).
              + " rad=" + IntToStr((int)(radDbg * 10.0f))
              + " size=" + IntToStr((int)(sizeDbg * 10.0f))
              + " elig=" + IntToStr(MountCombatEligible(mount, seat) ? 1 : 0)
@@ -6965,14 +7320,27 @@ void Dismount(Character* rider)
     // ends, the rider walks away with manually-controlled thighs (Skeleton::reset() will not
     // touch them) and a blend-masked pose - i.e. permanently broken until a reload.  This is
     // a no-op when it was never armed.
-    if (gLegPoseArmed)
+    // 🆕 Option A: the pose NAME follows the style that was actually ridden.  The mount is
+    // looked up from the map here because the map erase only happens at the END of this
+    // function - the pair is still tracked on entry by construction (Dismount is only called
+    // for a rider in riderToMount).  Same NULL tolerance as everywhere: a miss answers
+    // kRidePose, which endSlaveAnim/getAnimationData already treat as a no-op/absent.
     {
-        AnimationClass* pAnim = rider->getAnimationClass();
-        if (pAnim)
+        boost::unordered_map<Character*, Character*>::const_iterator dit = riderToMount.find(rider);
+        Character* dm = (dit != riderToMount.end()) ? dit->second : NULL;
+        SeatInfo dSeat;
+        boost::unordered_map<Character*, SeatInfo>::const_iterator dSit = mountSeat.find(dm);
+        if (dm && dSit != mountSeat.end()) dSeat = dSit->second;
+        const char* poseNm = RidePoseNameForSeat(dm, dSeat);
+        if (gLegPoseArmed)
         {
-            LegPoseRestore(pAnim, pAnim->getAnimationData(kRidePose));
-            gLegPoseArmed = false;
-            DebugLog("Riding: LEGPOSE restored on dismount");
+            AnimationClass* pAnim = rider->getAnimationClass();
+            if (pAnim)
+            {
+                LegPoseRestore(pAnim, pAnim->getAnimationData(poseNm));
+                gLegPoseArmed = false;
+                DebugLog("Riding: LEGPOSE restored on dismount");
+            }
         }
     }
 
@@ -6993,7 +7361,16 @@ void Dismount(Character* rider)
     // stop the ride pose.  Only one pose exists now (P2-0, 2026-08-29); the companion
     // endSlaveAnim("idle_stand_normal") was deleted with the standing posture.  Ending an
     // animation that is not playing is a no-op, so nothing here depends on it having run.
-    rider->endSlaveAnim(kRidePose);
+    // 🆕 Option A: cushion rides end their own clip ('sitting idle'); endSlaveAnim on a
+    // never-run name is a no-op, so a mismatched pair is still safe.
+    {
+        boost::unordered_map<Character*, Character*>::const_iterator dit2 = riderToMount.find(rider);
+        Character* dm2 = (dit2 != riderToMount.end()) ? dit2->second : NULL;
+        SeatInfo dSeat2;
+        boost::unordered_map<Character*, SeatInfo>::const_iterator dSit2 = mountSeat.find(dm2);
+        if (dm2 && dSit2 != mountSeat.end()) dSeat2 = dSit2->second;
+        rider->endSlaveAnim(RidePoseNameForSeat(dm2, dSeat2));
+    }
 
     // THE put-down (2026-08-24 rev 6, confirmed in-game).  Mount() only severs the CARRIER's
     // side of the carry link (dropCarriedObject with removeOnly), which leaves the rider stuck
@@ -7125,7 +7502,9 @@ void RestoreRideAfterLoad(Character* rider, Character* mount)
 {
     SeatInfo seat = BuildSeatInfo(mount);
 
-    rider->runSlaveAnim(kRidePose, 1.0f, 1.0f);
+    // 🆕 Option A: same per-style pose choice as a fresh Mount() - cushion mounts come back
+    // from a load on 'sitting idle', everything else on kRidePose.
+    rider->runSlaveAnim(RidePoseNameForSeat(mount, seat), 1.0f, 1.0f);
     mountSeat[mount] = seat;
     riderToMount[rider] = mount;
     mountToRider[mount] = rider;
@@ -7223,6 +7602,10 @@ void RestoreRideAfterLoad(Character* rider, Character* mount)
     gLegCalfHave[1]  = false;
     gLegCalfManual   = false;
     gLegCalfWarned   = false;
+    gLegThighHave[0] = false;        // P2-4: the chair hip snapshot is per-ride for the same
+    gLegThighHave[1] = false;        // reason the knee bend is - the individual's scale is in it
+    gLegThighManual  = false;
+    gLegChairWarned  = false;
     gLegHostLast     = NULL;
     gLegMaskedCount  = 0;
     gLegMaskOverflow = false;
@@ -7293,7 +7676,10 @@ bool IsAttackTask(TaskType t)
 }
 
 void (*newPlayerTask_orig)(PlayerInterface* thisptr, TaskType t, const hand& targetH, Building* destinationIndoors, const Ogre::Vector3& clickpos, bool addDontClear) = NULL;
-void newPlayerTask_hook(PlayerInterface* thisptr, TaskType t, const hand& targetH, Building* destinationIndoors, const Ogre::Vector3& clickpos, bool addDontClear)
+
+// The whole order handler lives in an Impl so the hook can hold the SEH shell (C2712:
+// __try cannot share a frame with unwindable objects, and this body builds std::strings).
+static void NewPlayerTaskImpl(PlayerInterface* thisptr, TaskType t, const hand& targetH, Building* destinationIndoors, const Ogre::Vector3& clickpos, bool addDontClear)
 {
     Character* target = targetH.getCharacter();
 
@@ -7421,6 +7807,32 @@ void newPlayerTask_hook(PlayerInterface* thisptr, TaskType t, const hand& target
 
     // otherwise pass through (vanilla orders preserved)
     newPlayerTask_orig(thisptr, t, targetH, destinationIndoors, clickpos, addDontClear);
+}
+
+// SEH shell: same rationale as mainLoop_hook and animUpdate_hook (2026-09-08, after a
+// player-reported "sometimes crashes on mount/dismount").  This hook is where the two
+// heaviest native engine calls outside the per-frame passes actually run - Mount()'s
+// pickupObject/dropCarriedObject right here when the rider is already in range, and
+// Dismount()'s getDropped/ragdollMode on the "put down" order - and it was the one
+// registered hook that never got the shell the per-frame ones have.  Every Mount()/
+// Dismount() call site is under an SEH shell after this: the pendingMount boarding and
+// the forced dismount both run inside mainLoop_hook's, and the load restore inside
+// animUpdate_hook's.  On a fault the order is swallowed - no newPlayerTask_orig, no
+// WipeAllRideState: the pointers here come from the live selection, not from a
+// post-load world reset, so wiping everyone's state for one bad order is the wrong
+// tool, and the mainLoop shell remains the second net for whatever an interrupted
+// Mount() left behind.  Worst case after this shell is a stuck rider, not a crash.
+void newPlayerTask_hook(PlayerInterface* thisptr, TaskType t, const hand& targetH, Building* destinationIndoors, const Ogre::Vector3& clickpos, bool addDontClear)
+{
+    __try
+    {
+        NewPlayerTaskImpl(thisptr, t, targetH, destinationIndoors, clickpos, addDontClear);
+    }
+    __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION
+                  ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH)
+    {
+        DebugLog("Riding: access violation in newPlayerTask - order swallowed");
+    }
 }
 
 // ---- pose weight pin + animation layer dump (v1.6, 2026-08-29) ------------
@@ -7580,7 +7992,11 @@ static void AnimUpdateImpl(AnimationClass* thisptr, float frameTIME)
                     boost::unordered_map<Character*, SeatInfo>::iterator sit = mountSeat.find(mount);
                     if (sit != mountSeat.end() && sit->second.forceSit)
                     {
-                        AnimationData* poseData = thisptr->getAnimationData(kRidePose);
+                        // 🆕 Option A: same per-style name as HaltAndForceSitPass's reassert
+                        // (both read the same mountSeat entry this frame, so the two sites can
+                        // never disagree on the name).
+                        AnimationData* poseData =
+                            thisptr->getAnimationData(RidePoseNameForSeat(mount, sit->second));
                         // P4-1M: route A ships.  `stance` is the shipping predicate, NOT a
                         // probe - no debugContinuous gate, no rotation: eligible mount + the
                         // rider actually in combat mode.  Route C (both clips at 0.5) is DELETED,
@@ -8178,14 +8594,21 @@ static void HaltAndForceSitPass()
                         // runSlaveAnim stays gated because it is the untested half (and the
                         // slave side is already maintained every frame by
                         // animationRequirements.forcedSlaveLoop in the animUpdate pre-pass).
-                        AnimationData* poseData = rAnim->getAnimationData(kRidePose);
+                        // 🆕 Option A: the pose NAME is per-style - cushion mounts pin
+                        // 'sitting idle' (same record the leg table was baked from), so the
+                        // getAnimationData below stays miss-free for BOTH names (each is a
+                        // verified vanilla record) and poseData flowing into PoseLayerPin and
+                        // LegPosePass follows the switch automatically.  sit->second is the
+                        // seat this frame's decision was made from; mount is in scope above.
+                        const char* poseName = RidePoseNameForSeat(mount, sit->second);
+                        AnimationData* poseData = rAnim->getAnimationData(poseName);
                         // In stance the pose channel is handed back entirely - the stance owns
                         // the torso and LegPosePass owns the legs.
                         if (!stance && (!poseData || !rAnim->getAnimationPlaying(poseData)
                                       || rAnim->getAnimationCurrentWeight(poseData) < 0.99f))
-                            rAnim->runSlaveAnim(kRidePose, 1.0f, 1.0f, 1.0f);
+                            rAnim->runSlaveAnim(poseName, 1.0f, 1.0f, 1.0f);
                         if (!stance)
-                            rAnim->runAnimation(kRidePose, 1.0f, 1.0f);
+                            rAnim->runAnimation(poseName, 1.0f, 1.0f);
                         // P4-1k/A: hand the channel back AND ask for a clip of our own, which is
                         // the whole point of this phase - with the layers empty (24/24 dumps in
                         // P4-1i) there is no 'whole' pose left to press a request to w=0.000, so
@@ -9334,6 +9757,7 @@ static void CombatAndForceDismountPass()
             // one edge can only ever cost one attempt.  `riderFights` is not re-tested: the edge
             // could only have been latched while the stance was up, and the stance already
             // requires MountCombatEligible, so a big-mount rider can never reach this.
+            // (🆕 P4-5: nor a 坐坐垫 rider - same one gate, so no draw edge can ever be latched.)
             if (gStanceDrawPend && rider == gStanceDrawWho)
             {
                 gStanceDrawPend = false;
@@ -9359,7 +9783,12 @@ static void CombatAndForceDismountPass()
 
             if (!riderFights)
             {
-                // big tier: rider stays passive - never swings its tiny weapon from up there
+                // big tier: rider stays passive - never swings its tiny weapon from up there.
+                // 🆕 P4-5: 坐坐垫 mounts land here too (MountCombatEligible denies the style), which
+                // is what 「人物在坐坐垫的时候不参与战斗」 asked for - the engine's own combat
+                // bookkeeping is cleared, not merely our writes withheld.  ⚠️ The crab and the swamp
+                // turtle are the first COMMONLY RIDDEN animals to walk this branch (trip 28 rode
+                // both with elig=1), so this frame-by-frame halt() is the P4-5 regression to watch.
                 if (rider->isInCombatMode(true, true) || rider->getAttackTarget().getCharacter())
                     rider->endCombatMode();
                 if (rider->getMovement())

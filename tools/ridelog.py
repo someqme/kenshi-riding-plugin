@@ -250,6 +250,8 @@ class Session(object):
         self.takeovers = []      # LEGPOSE takeover lines (dicts)
         self.released = []       # LEGPOSE released lines (grace=, f=, ts)
         self.handback = []       # LEGPOSE handback audit lines (DLL 307712 B+)
+        self.no_calf_snap = 0    # "knee bend unavailable" notices
+        self.no_chair_snap = 0   # "chair hips unavailable" notices (P2-4)
         # Timestamp spans (merged, kDownGap tolerance) during which a P3CMB row
         # reported down=1.  2026-08-31: EVERY sub-1.0 kept sample and BOTH
         # grace-exhausted releases of that trip fell inside such a span, so this
@@ -258,6 +260,13 @@ class Session(object):
         self.down_spans = []     # [start_ts, end_ts]
         self.kept = Stat()
         self.kept_bad = 0        # samples not 1.0000
+        # 🆕 P2-4/T32: kept=-1.0000 is the DLL's own "no baseline to compare against"
+        # sentinel (gLegPoseArmed && gLegThighManual false), NOT a mask failure.  It was
+        # a once-per-ride curiosity while the thighs were held unconditionally; in chair
+        # mode the hips are handed back between fights, so it fires on every re-take.
+        # Counted apart so a chair trip cannot report a fault it does not have - and
+        # printed, so nothing is hidden either.
+        self.kept_fresh = 0      # samples that were exactly the -1.0 sentinel
         self.kept_bad_rows = []  # (f, bone, kept, abd, flx, ts) for the bad ones
         # First/last timestamp a kept= sample was taken at.  Needed to tell a
         # real "no bad kept inside the knockdown window" from a VACUOUS one: the
@@ -474,6 +483,10 @@ def parse(path, s):
             if m:
                 d = kv(line)
                 d["species"] = m.group("sp")
+                # 🆕 P2-4/T32: the takeover line carries no species, so the only way to
+                # say "the garru got a chair" is to pair it with the mount event that
+                # preceded it.  Additive - nothing else reads this key.
+                d["_ts"] = ts(line)
                 s.rides.append(d)
                 continue
             if "Riding: dismounted" in line:
@@ -495,6 +508,15 @@ def parse(path, s):
                 d = kv(line)
                 d["_ts"] = ts(line)
                 s.takeovers.append(d)
+                continue
+            # The two "we have no snapshot, so we are staying out of it" notices.  Both
+            # are once per ride and both mean the same thing: a joint was left to a clip
+            # that has no track for it => the leg straightens.  Counted, not judged here.
+            if "LEGPOSE knee bend unavailable" in line:
+                s.no_calf_snap += 1
+                continue
+            if "LEGPOSE chair hips unavailable" in line:
+                s.no_chair_snap += 1
                 continue
             if "LEGPOSE released" in line:
                 d = kv(line)
@@ -525,7 +547,10 @@ def parse(path, s):
                     if s.kept_t0 is None:
                         s.kept_t0 = kt
                     s.kept_t1 = kt
-                if k is not None and abs(k - 1.0) > 0.0005:
+                if k is not None and k < -0.5:
+                    # The sentinel, not a measurement.  See Session.kept_fresh.
+                    s.kept_fresh += 1
+                elif k is not None and abs(k - 1.0) > 0.0005:
                     s.kept_bad += 1
                     # Keep the identity of the bad ones.  Without f= and the bone
                     # name these samples cannot be lined up against the LEGPOSE
@@ -535,7 +560,8 @@ def parse(path, s):
                     if len(s.kept_bad_rows) < 24:
                         s.kept_bad_rows.append(
                             (fnum(d, "f"), m.group(1) if m else "?", k,
-                             d.get("abd"), d.get("flx"), ts(line)))
+                             d.get("abd"), d.get("flx"), ts(line),
+                             d.get("st")))
                 continue
 
             if "Riding: STANCE" in line:
@@ -1459,7 +1485,15 @@ def report_legs(s):
               " matching re-arm on")
         print("       stand-up (or the next mount) and no bad kept in that"
               " window.")
-    print("  kept: %s   not-1.0000 samples=%d" % (s.kept, s.kept_bad))
+    print("  kept: %s   not-1.0000 samples=%d   fresh-custody (-1.0000)"
+          " samples=%d" % (s.kept, s.kept_bad, s.kept_fresh))
+    if s.kept_fresh:
+        print("        (the -1.0000 rows are the DLL saying it had no baseline for"
+              " that bone yet:")
+        print("         first armed frame, and in P2-4 chair mode every re-take"
+              " after a fight.")
+        print("         They are excluded from not-1.0000 on purpose - they measure"
+              " nothing.)")
     if not s.kept.n:
         print("  CHECK no kept= sample - that row is budgeted AND gated on"
               " Ctrl+NUM.,")
@@ -1476,9 +1510,10 @@ def report_legs(s):
     if s.kept_bad_rows:
         print("  the not-1.0000 samples (t= lines these up against STANCE,"
               " 'released' and down=):")
-        for f, bone, k, abd, flx, t in s.kept_bad_rows:
-            print("    t=%s f=%s %-16s kept=%.4f abd=%s flx=%s%s"
+        for f, bone, k, abd, flx, t, st in s.kept_bad_rows:
+            print("    t=%s f=%s %-16s kept=%.4f abd=%s flx=%s%s%s"
                   % (t, "?" if f is None else "%d" % f, bone, k, abd, flx,
+                     "" if st is None else "  st=%s" % st,
                      "   <- rider DOWN" if in_down(s, t) else ""))
 
     # 2026-08-31: the knockdown correlation.  Computed rather than asserted,
@@ -1591,10 +1626,348 @@ def report_legs(s):
                   t.get("abd"), t.get("flx"), t.get("rad"), t.get("torso"),
                   t.get("host"), t.get("hw"), t.get("msk"), t.get("calf"),
                   t.get("stance"), t.get("twist")))
+        # style=/stout= only exist from the P2-4 build on; older logs print nothing
+        # extra rather than a row of None.
+        if t.get("style") is not None:
+            print("      style=%s stout=%s thigh=%s snap=%s  (cut at wth=%s"
+                  " sth=%s)" % (t.get("style"), t.get("stout"), t.get("thigh"),
+                                t.get("snap"), t.get("wth"), t.get("sth")))
     print("        msk= is how many weighted clips got a mask this frame."
           "  It is NOT a")
     print("        defect marker: a plain ride has 2 (pose + whatever is fading)."
           "  Judge by kept.")
+
+
+# The expected style per race is NOT restated here.  It is READ OUT of the .cpp's
+# kRideLegStyleRows on every run - armarc.py's and legpose.py's rule for their baked tables,
+# and for the same reason: this file would otherwise hold the user's species list a second
+# time, the compiler would never see this copy, and a row edited on one side only would stay
+# invisible until an in-game trip contradicted it.  Unreadable (script run from a copy, table
+# renamed) is a stated NOTE, not a failure - every log-side invariant still runs.
+STYLE_ROW = re.compile(r'\{\s*"([^"]+)"\s*,\s*kLegStyle(\w+)\s*\}')
+
+
+def read_style_rows():
+    """{raceKey: 'straddle'|'chair'|'cushion'} out of RidingPlugin.cpp, or None."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..",
+                        "RidingPlugin.cpp")
+    if not os.path.isfile(path):
+        return None
+    out, inside = {}, False
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            if "kRideLegStyleRows[]" in line:
+                inside = True
+                continue
+            if not inside:
+                continue
+            if line.strip().startswith("};"):
+                break
+            m = STYLE_ROW.search(line)
+            if m:
+                out[m.group(1)] = m.group(2).lower()
+    return out or None
+
+
+def report_chair(s):
+    """-- T32 -- P2-4: which of the THREE lower bodies each mount got, and who decided.
+
+    Two decision paths now.  The user's own species list (kRideLegStyleRows, mirrored out
+    of the .cpp above) answers every race it lists and prints src=row; anything unlisted -
+    a modded animal, a race the list never covered - falls through to the geometric rule
+    and prints src=geo, which can only ever answer straddle|chair (no back width means
+    "cushion", which is exactly why the list exists).  So the invariants split: a listed
+    race is checked against the TABLE, an unlisted one against its own torso=/stout=.
+
+    Everything below is either a machine INVARIANT or the CALIBRATION TABLE the user reads.
+    A species landing on the wrong side of the LIST is a judgement about how it looks on an
+    animal's back - this tool prints the row and says so.
+
+    🆕 P4-5 rides along at the end: 坐坐垫 is not a fighting seat, so the same style decision
+    is ALSO the first term of the combat gate.  That one is machine-checkable without a fight
+    (the mounted line's elig=), which is why it lives here and not in the swing sections.
+    """
+    print("")
+    print("== -- T32 -- three lower bodies: straddle / chair / cushion (P2-4) ==")
+    rows = [t for t in s.takeovers if t.get("style") is not None]
+    if not s.takeovers:
+        print("  no LEGPOSE takeover line at all - the leg pass never armed, so the")
+        print("  style decision is UNMEASURED, not clean.")
+        return
+    if not rows:
+        print("  takeovers=%d and NOT ONE carries style= => this log predates the P2-4"
+              " build." % len(s.takeovers))
+        print("  UNMEASURED: re-run the trip on a DLL whose takeover line prints"
+              " style=/src=/stout=/wth=/sth=.")
+        return
+    want_by_race = read_style_rows()
+    if want_by_race:
+        print("  mirror: %d race rows read out of ..\\RidingPlugin.cpp"
+              "  (%d straddle / %d chair / %d cushion)"
+              % (len(want_by_race),
+                 sum(1 for v in want_by_race.values() if v == "straddle"),
+                 sum(1 for v in want_by_race.values() if v == "chair"),
+                 sum(1 for v in want_by_race.values() if v == "cushion")))
+    else:
+        print("  NOTE  could not read kRideLegStyleRows out of ..\\RidingPlugin.cpp => the")
+        print("        'listed race answered by the list' invariant is SKIPPED this run.")
+    has_src = any(t.get("src") is not None for t in rows)
+    if not has_src:
+        print("  NOTE  no src= on any row => this log is the two-way (geometry-only) build,")
+        print("        so it is judged as one: the list is not held against it.")
+
+    # Species AND race live on the 'mounted' line, not here, so pair each takeover with the
+    # last mount event before it.  race= is the exact key the decision was keyed on - never a
+    # name guess (CLAUDE.md's stringID red line).  It logs as "<key>(<Name>)" and the name
+    # half is dropped here.  Unpaired rows still get judged - they just print '?'.
+    ride_ts = []
+    for r in s.rides:
+        v = tsnum(r.get("_ts", "?"))
+        if v is not None:
+            ride_ts.append((v, r.get("species", "?"),
+                            str(r.get("race", "?")).split("(", 1)[0]))
+    ride_ts.sort()
+
+    def mount_for(row):
+        v = tsnum(row.get("_ts", "?"))
+        best = ("?", "?")
+        if v is None:
+            return best
+        for rt, sp, rk in ride_ts:
+            if rt <= v + 0.001:
+                best = (sp, rk)
+            else:
+                break
+        return best
+
+    print("  the calibration table - ONE ROW PER MOUNT (this is what the eyeball"
+          " verdict attaches to):")
+    print("    %-14s %-24s %-8s %-4s %6s %6s %6s %3s %3s %3s" % (
+        "species", "race", "style", "src", "torso", "rad", "stout", "thg", "clf", "snp"))
+    bad_row, bad_calc, bad_geo3, bad_guard = [], [], [], []
+    bad_hold, bad_straddle, bad_cush = [], [], []
+    by_species, src_by_species = {}, {}
+    for t in rows:
+        sp, rk = mount_for(t)
+        style = str(t.get("style"))
+        src = t.get("src")
+        torso, rad, stout = fnum(t, "torso"), fnum(t, "rad"), fnum(t, "stout")
+        wth, sth = fnum(t, "wth"), fnum(t, "sth")
+        thigh, calf, snap = fnum(t, "thigh"), fnum(t, "calf"), fnum(t, "snap")
+        ifmt = lambda v: "?" if v is None else "%d" % int(v)
+        print("    %-14s %-24s %-8s %-4s %6s %6s %6s %3s %3s %3s" % (
+            sp[:14], rk[:24], style, src or "?",
+            "?" if torso is None else "%.1f" % torso,
+            "?" if rad is None else "%.1f" % rad,
+            "?" if stout is None else "%.3f" % stout,
+            ifmt(thigh), ifmt(calf), ifmt(snap)))
+        by_species.setdefault(sp, set()).add(style)
+        src_by_species.setdefault(sp, set()).add(src or "?")
+
+        # (A) the LIST is authoritative: a listed race must be answered BY the list, with the
+        # style the list holds, and an unlisted one must not claim it was.  This is the whole
+        # point of mirroring the table - it catches a key typo'd on one side, a row the .cpp
+        # has and the trip did not exercise the way we thought, and src= wired backwards.
+        if want_by_race is not None and has_src and rk != "?":
+            want = want_by_race.get(rk)
+            if want is None:
+                if src == "row":
+                    bad_row.append((sp, rk, style, "src=row but this race is NOT in the table"))
+            elif src != "row":
+                bad_row.append((sp, rk, style, "src=%s but the table lists it as %s"
+                                % (src or "?", want)))
+            elif style != want:
+                bad_row.append((sp, rk, style, "the table says " + want))
+        # (B) the fallback still has to be reproducible from the numbers printed beside it -
+        # but ONLY where the fallback actually decided.  A listed race's torso=/stout= are
+        # informational, and checking them there would fail every deliberate override.
+        if src != "row" and None not in (torso, stout, wth, sth):
+            wantg = "chair" if (stout >= 0.0 and torso >= wth and stout <= sth) else "straddle"
+            if wantg != style:
+                bad_calc.append((sp, style, wantg, torso, stout, wth, sth))
+        # (C) the geometric rule has no cushion answer at all (⇐ the falsification that made
+        # the list necessary: 利维坦 83.7 and 螃蟹 5.9 both want it from opposite extremes).
+        if src == "geo" and style == "cushion":
+            bad_geo3.append((sp, rk))
+        # (D) unreadable geometry must fall back to the pose 27 trips have shipped.
+        if src != "row" and stout is not None and stout < 0.0 and style != "straddle":
+            bad_guard.append((sp, style, stout))
+        # (E) custody: chair never holds the hips without a snapshot, straddle always holds
+        # them, and cushion holds BOTH joints every frame - its knees are the folded half of
+        # the pose, so releasing them between fights would un-fold the sit.
+        if style == "chair" and thigh == 1 and snap == 0:
+            bad_hold.append((sp, torso))
+        if style == "straddle" and thigh == 0:
+            bad_straddle.append((sp, torso))
+        if style == "cushion" and (thigh != 1 or calf != 1):
+            bad_cush.append((sp, ifmt(thigh), ifmt(calf)))
+
+    print("  rows=%d  straddle=%d chair=%d cushion=%d   (decided by: row=%d geo=%d)" % (
+        len(rows),
+        sum(1 for t in rows if t.get("style") == "straddle"),
+        sum(1 for t in rows if t.get("style") == "chair"),
+        sum(1 for t in rows if t.get("style") == "cushion"),
+        sum(1 for t in rows if t.get("src") == "row"),
+        sum(1 for t in rows if t.get("src") == "geo")))
+    if want_by_race is not None and has_src:
+        print("  " + verdict(not bad_row,
+                             "every listed race was answered BY the list, and only unlisted"
+                             " races said src=geo"))
+        for sp, rk, got, why in bad_row[:8]:
+            print("      %s [%s] printed %s - %s" % (sp, rk, got, why))
+    print("  " + verdict(not bad_calc,
+                         "every src=geo style is reproducible from its own torso=/stout="
+                         " against wth=/sth="))
+    for sp, got, want, torso, stout, wth, sth in bad_calc[:8]:
+        print("      %s printed %s but torso=%.1f stout=%.3f vs wth=%.1f sth=%.2f"
+              " says %s" % (sp, got, torso, stout, wth, sth, want))
+    print("  " + verdict(not bad_geo3,
+                         "the geometric fallback never answered cushion (it structurally"
+                         " cannot)"))
+    for sp, rk in bad_geo3[:8]:
+        print("      %s [%s]" % (sp, rk))
+    print("  " + verdict(not bad_guard,
+                         "unreadable geometry (stout<0) fell back to straddle"))
+    print("  " + verdict(not bad_hold,
+                         "chair mode never held the hips without a snapshot"
+                         " (thigh=1 => snap=1)"))
+    print("  " + verdict(not bad_straddle,
+                         "straddle mode owned the hips on every arming frame"
+                         " (thigh=1)"))
+    print("  " + verdict(not bad_cush,
+                         "cushion mode owned BOTH joints on every arming frame"
+                         " (thigh=1 and calf=1)"))
+    for sp, th, cf in bad_cush[:8]:
+        print("      %s thigh=%s calf=%s  <- a released knee un-folds the sit mid-fight"
+              % (sp, th, cf))
+
+    # 🆕 (F) P4-5 (2026-09-06, user ruling 「人物在坐坐垫的时候不参与战斗」): 坐坐垫 is not a
+    # fighting seat, so MountCombatEligible denies the STYLE as well as the size.  That shuts the
+    # whole route off (no stance => no twist, no auto-draw, no sheathe suppression, no swing
+    # window) and parks the rider in the passive tier (endCombatMode every frame).
+    # 🔑 The mounted line's elig= is that gate's OWN answer, so this is checkable WITHOUT a fight -
+    # which is the point: every other combat field reads 0 on a ride where nothing attacked.
+    # ⛔ One-directional.  A straddle/chair mount may read elig=0 too because it is OVERSIZED
+    # (P4-0, kCombatSizeMax) - a different denial, not a P4-5 failure.
+    if want_by_race:
+        cush_rides = [d for d in s.rides
+                      if want_by_race.get(str(d.get("race", "?")).split("(", 1)[0]) == "cushion"]
+        have  = [d for d in cush_rides if d.get("elig") is not None]
+        armed = [d for d in have if d.get("elig") != "0"]
+        if not cush_rides:
+            print("  NOTE  P4-5 (坐坐垫不参与战斗): no cushion mount was ridden => the combat"
+                  " gate's")
+            print("        style term is UNMEASURED this run.")
+        elif not have:
+            print("  NOTE  P4-5: %d cushion mount(s) ridden and no elig= on the mounted line =>"
+                  % len(cush_rides))
+            print("        this log predates that field; the style term is UNMEASURED.")
+        else:
+            print("  " + verdict(not armed,
+                                 "every 坐坐垫 mount reported elig=0 - the rider's combat route"
+                                 " is shut for that style (P4-5, %d mount(s))" % len(have)))
+            for d in armed[:8]:
+                print("      %s [%s] elig=%s size=%s  <- P4-5's style term is not in the gate"
+                      % (d.get("species", "?"),
+                         str(d.get("race", "?")).split("(", 1)[0],
+                         d.get("elig"), d.get("size", "?")))
+            if armed:
+                print("        Two readings, and they are told apart by the DLL, not by this"
+                      " log: either")
+                print("        the run predates the P4-5 build (md5 8FF9739F..., 2026-09-06)"
+                      " - the")
+                print("        mirror always judges a log against the CURRENT .cpp - or the"
+                      " gate really")
+                print("        lost its style term.  Check which DLL was loaded before"
+                      " chasing code.")
+            if len(cush_rides) == len(s.rides):
+                sw = sum(int(fnum(d, "swing", 0) or 0) for d in s.sw_rides)
+                dr = sum(int(fnum(d, "drawn", 0) or 0) for d in s.sup_rides)
+                print("  " + verdict(sw == 0 and dr == 0,
+                                     "every ride in this log was a cushion mount and the route"
+                                     " stayed shut (swing=%d drawn=%d)" % (sw, dr)))
+                print("        ⚠️ Both totals are also 0 on a ride where nothing ATTACKED, so they")
+                print("        only carry weight if the trip really got into a fight up there."
+                      "  And the")
+                print("        absence of STANCE lines proves NOTHING here - that line is")
+                print("        debugContinuous-gated (RidingPlugin.cpp :8443).")
+            else:
+                print("  NOTE  mixed styles in this log => swing=/drawn= totals cannot be pinned"
+                      " on one")
+                print("        mount; the per-mount check is elig= above.")
+
+    # Same species, two answers.  Under the LIST that is a defect - style is a pure function
+    # of race, so two rows for one species must agree.  It stays excusable only where the
+    # geometric fallback decided: torso= is a LIVE span, so a runt and a giant of an UNLISTED
+    # race can legitimately land on either side of wth=.
+    split = sorted(k for k, v in by_species.items() if len(v) > 1)
+    hard = [k for k in split if src_by_species.get(k, set()) == {"row"}]
+    soft = [k for k in split if k not in hard]
+    print("  " + verdict(not hard,
+                         "no LISTED species got two different styles (style is a pure"
+                         " function of race)"))
+    for k in hard[:8]:
+        print("      %s got %s" % (k, "/".join(sorted(by_species[k]))))
+    if soft:
+        print("  CHECK these species got BOTH styles with the fallback involved: %s"
+              % ", ".join(soft))
+        print("        Expected consequence of a LIVE size gate (a runt straddles, a giant")
+        print("        sits) and it only reaches unlisted races now.  If it looks wrong on")
+        print("        screen, the knob is wth=, not the code.")
+
+    if s.no_chair_snap:
+        print("  CHECK 'chair hips unavailable' x%d - a chair mount went into a"
+              " combat clip with no" % s.no_chair_snap)
+        print("        hip snapshot, so its thighs were left to a clip that has no"
+              " leg track (= the")
+        print("        legs straighten).  The capture window is pose-is-host at"
+              " w>=0.99: look for a")
+        print("        ride that armed straight into a stance.")
+    else:
+        print("  PASS  no 'chair hips unavailable' notice (every chair mount had its"
+              " snapshot in time)")
+    if s.no_calf_snap:
+        print("  NOTE  'knee bend unavailable' x%d - same shape, one joint down"
+              " (pre-existing path)" % s.no_calf_snap)
+
+    # The stuck-leg regression.  Bits 0..3 of man= are the four leg bones in kLegPoseBones
+    # order, and cushion is the first style that holds the CALVES continuously => bits 2/3
+    # now carry load too.  Naming the bit is the difference between "legs stuck after
+    # dismount" and knowing which write forgot to hand back.
+    manbits = ("L thigh", "R thigh", "L calf", "R calf")
+    if not s.handback:
+        print("  CHECK no LEGPOSE handback line - whether the legs came home after the ride")
+        print("        is UNMEASURED (that is the borrow-and-replay styles' own regression"
+              " risk).")
+    else:
+        stuck = []
+        for d in s.handback:
+            try:
+                man = int(str(d.get("man", "0x00")), 16)
+            except ValueError:
+                continue
+            if man & 0x0F:
+                stuck.append((d.get("_ts", "?"),
+                              "+".join(manbits[i] for i in range(4) if man & (1 << i))))
+        print("  " + verdict(not stuck,
+                             "no handback left a leg bone manually controlled"
+                             " (man bits 0-3 clear on all %d)" % len(s.handback)))
+        for tsv, which in stuck[:8]:
+            print("      at t=%s  %s still manual  <- 'legs stuck after dismount' looks"
+                  " exactly like this" % (tsv, which))
+
+    # kept= reads differently per style BY DESIGN: chair re-takes the hips fresh after every
+    # fight (no baseline => the -1.0000 fresh-custody sentinel, bucketed separately in the
+    # mask section), while cushion replays a table it already holds, so its custody never
+    # lapses mid-ride and its kept= should look like straddle's ~1.0.
+    print("  NOTE  kept=-1.0000 is chair's normal 'fresh custody', NOT a mask failure;"
+          " cushion")
+    print("        should not produce it (it never hands the joints back mid-ride).")
+    print("  ⚠️ WHAT THIS SECTION CANNOT SAY: whether the pose each species got LOOKS right")
+    print("     on that animal's back - a cushion sit clipping into a crab's shell reads")
+    print("     identically to a clean one here.  That is the eyeball half: read the table")
+    print("     above and judge each species by name (TEST_REQUIRED.md T32 carries the")
+    print("     expected list).")
 
 
 def report_pose(s):
@@ -6203,6 +6576,7 @@ def main(argv):
     report_input(s)
     report_tuned(s, cfg)
     report_legs(s)
+    report_chair(s)
     report_pose(s)
     report_sheathe(s)
     report_stance_terms(s)
