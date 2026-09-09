@@ -724,7 +724,7 @@ def report_log(bones, path):
     return 0
 
 
-# ---- P4-3-4l: bake a vanilla clip's TWO arm curves ---------------------------------------------
+# ---- P4-3-4l: bake a vanilla clip's arm-and-wrist curves ----------------------------------------
 # The third knob, and the only one bigger than axis+arc.  T28's model is ONE rigid rotation, so the
 # hand rides ONE circle and the elbow is frozen - that is exactly what witness 1 (`r=` span 0.000)
 # measures.  Every `chop` Kenshi ships moves the elbow 62..80 deg (`skelanims.py --sweep chop`), so
@@ -741,13 +741,36 @@ def report_log(bones, path):
 #   ABSOLUTE  local(t) = bind * K(t).  Vanilla verbatim - the shape the user has already accepted on
 #             foot.  Price: a pop at window open, whose size is the `opening gap` printed below and
 #             which only a cross-fade can hide.
-BAKE_CLIP, HOST_CLIP = 'chop down', 'guard 1h'
+# ⚠️ check_mirror() re-bakes from BAKE_CLIP, so the clip moves with its tables in the SAME commit.
+# P4-6c trip 34: 'chop down' (loop clip, no forward reach) -> 'heavy downcut' (cock behind, lands in
+# front-low, but the LANDING is the same point the window opened on - net travel ~0, read as 「和原来
+# 差距不大」) -> 'downward combo', the one whose landing is a REAL forward-down strike: relative to
+# window-open the hand travels +4.16 fore / -4.71 down, the elbow OPENS to 107 deg at the strike (the
+# arm extends - 'heavy downcut' struck at 102-112 deg = still folded), peak cut speed 88 u/s over 127 ms,
+# and the settle LEAVES the arm half-extended in front instead of snapping back to the guard.  Two
+# strikes inside one clip: raise/wind to the side-up, strike at t~0.50, re-cock, strike AGAIN at
+# t~0.818 (r 5.37 = the longest reach of any attack clip), settle.  stretch (0.81x vanilla) fits its
+# 1.733 s into the 1400 ms arc; the second strike lands at 1209 ms, 160 ms after kRideSwingHitMs -
+# 12% late, under 1.5 units at cut speed, and 'lead' cannot fix it (its cock anchor is the highest
+# hand, but this clip has two peaks; it would slide the FIRST strike onto the hit instead).
+# 🆕 P4-6d trip 35: 'downward combo' -> 'bigchopv2'.  Trip 35's log settled the question the
+# eyeball raised (「手臂停在半空，没往下劈到位」): in the DELTA form the hand's LOWEST point was
+# the window-open pose itself (down 4.34) and both strike landings sat ABOVE it - a delta curve
+# is the identity at its ends, so 'downward combo' could only ever turn the arm upward from a
+# guard that already sits low.  `--sweep-down` (new mode, same commit) ranks all 174 clips by
+# where the stroke actually POINTS: 'bigchopv2' is the only attack clip whose hand goes BELOW
+# the open pose (down 4.90 at t=0.87, i.e. 0.56 lower) while still reaching forward (fore 3.08
+# at the fd peak) and carrying a real elbow (span 96 deg).  Its own tempo is 2.833 s, so stretch
+# runs it at 0.49x vanilla.
+BAKE_CLIP, HOST_CLIP = 'chop down static', 'guard 1h'
 # ⚠️ MIRRORED, and this is the pair that says WHICH bake the .cpp is holding.  check_mirror() re-bakes
 # with exactly these and diffs; if you ship a different form or tempo, change them here in the same
 # commit or the checker will (correctly) call the .cpp drifted - and it will name the combination that
 # does match, so the fix is never a guess.
 BAKE_FORM, BAKE_MAP = 'delta', 'native'
-ARM = (UPPER, FORE)
+# The live writer applies all three local deltas.  This preserves the original clip's shoulder,
+# elbow, and wrist motion instead of forcing the arm through a rigid synthetic arc.
+ARM = (UPPER, FORE, HAND)
 # ⚠️ MIRRORS NOTHING in the .cpp.  It is T28's/T29's measured landing instant, kept only as the target
 # the 'lead' mapping aims at; the shape of the path does not depend on it.
 LAND_MS = 1092
@@ -842,7 +865,7 @@ def bake_tail(form, ts):
 
 
 def bake_curve(bones, form=None, mapping=None, clip=None, host=None):
-    """-> {'ts','rows','lab','off'} : the SHIPPED offline stroke, i.e. what the .cpp's two tables
+    """-> {'ts','rows','lab','off'} : the SHIPPED offline stroke, i.e. what the .cpp's three tables
     encode, sampled on its own keys and carrying the synthetic settle key.  None if an asset is
     missing, so report_log can fall back to the measurement-only witnesses instead of dying.
 
@@ -944,6 +967,58 @@ def bake_path(bones, base, K, form, corr=None):
                      qang(K[FORE][0][1], K[FORE][i][1]),
                      grip if grip is not None else -1.0))
     return rows
+
+
+def sweep_down(bones, base, find=None, top=25):
+    """Rank every clip by how far BELOW the window-open pose its stroke reaches.
+
+    The third trip in a row where the CLIP was the answer, and the first where the metric
+    needed a SIGN.  P4-6c picked 'downward combo' by NET REACH, and a delta-form curve is
+    the identity at BOTH ends - so a stroke that only ever turns the arm upward can still
+    maximise reach.  Trip 35 measured exactly that: the hand's lowest point was the window-
+    open pose itself (down 4.34), both strike landings sat above it, and the user read
+    「手臂停在半空，没往下劈到位」.
+
+    depth = max(down) - down(open), in the same skeleton-space units report_log prints,
+    measured in the DELTA form the .cpp actually uses.  depth > 0 is a stroke that really
+    goes lower than the guard; depth <= 0 cannot, by construction."""
+    sk = _skel()
+    rows = []
+    for (name, secs, tracks) in sk.anims:
+        if find and find.lower() not in name.lower():
+            continue
+        try:
+            csecs, K = clip_tracks(name)
+            if not K or UPPER not in K or FORE not in K or HAND not in K:
+                continue
+            path = bake_path(bones, base, K, 'delta')
+        except Exception:
+            continue
+        if len(path) < 2:
+            continue
+        ds = [r[1][2] for r in path]
+        fs = [r[1][1] for r in path]
+        rs = [r[2] for r in path]
+        es = [r[3] for r in path]
+        fd = [fs[i] + ds[i] for i in range(len(fs))]
+        bi = fd.index(max(fd))
+        rows.append((name, csecs, len(path), max(fs), fs[bi], ds[bi], fd[bi],
+                     max(ds) - ds[0], max(rs), max(es) - min(es)))
+    rows.sort(key=lambda r: -r[6])
+    print('')
+    print('SWEEP-DOWN  delta form, host %r  -  fd = max(fore + down)' % HOST_CLIP)
+    print('    the sample that points the hand most nearly FORWARD-AND-DOWN at a target on the')
+    print('    ground.  depth = max(down) - down(open) is kept beside it because a stroke can')
+    print('    score fd while never getting lower than the pose it started from.')
+    print('  %-30s %6s %5s | %7s %7s %7s %7s | %7s %7s %8s'
+          % ('clip', 'secs', 'keys', 'maxfore', 'fore@fd', 'down@fd', 'fd', 'depth', 'maxr', 'elbowspan'))
+    for r in rows[:top]:
+        print('  %-30s %6.3f %5d | %7.2f %7.2f %7.2f %7.2f | %7.2f %7.2f %8.1f' % r)
+    print('  %d clip(s) scanned; every one opens on the same captured pose (delta form)'
+          % len(rows))
+    print('  ⚠️ fd is a POSITION metric, not a verdict: read elbowspan (a flat one is not a')
+    print('     swing) and maxr beside it, then eyeball the winner.')
+    return 0
 
 
 def bake_times(rows, secs, mapping):
@@ -1155,7 +1230,7 @@ def bake_report(bones, clip, form, mapping, reflog=None):
     print('  BAKE_FORM/BAKE_MAP at the top of this file move in the SAME commit - check_mirror()')
     print('  re-bakes with them and diffs every value, so a half-paste reads as drift.')
     tail = bake_tail(form, ts)
-    for n, tag in ((UPPER, 'Up'), (FORE, 'Fo')):
+    for n, tag in ((UPPER, 'Up'), (FORE, 'Fo'), (HAND, 'Hand')):
         tab = bake_table(bones, K, n, form, ts, tail)
         print('')
         print('static const float kRideSwingBake%s[][5] = {   // t, w, x, y, z   (%s)'
@@ -1203,7 +1278,7 @@ def cpp_bake_table(src, tag):
 
 
 def check_mirror(bones=None, cpp=None):
-    """RE-BAKE the clip out of male_skeleton.skeleton and diff EVERY value against the .cpp's two
+    """RE-BAKE the clip out of male_skeleton.skeleton and diff EVERY value against the .cpp's three
     baked tables (plus ArcMs / WinMs, which this file still holds twice).
 
     ⚠️ THIS IS THE ONE DRIFT NOTHING ELSE CAN CATCH.  The compiler never sees this script and this
@@ -1237,7 +1312,7 @@ def check_mirror(bones=None, cpp=None):
             bad.append('%s: this file %d vs .cpp %d' % (nm, mine, int(v)))
 
     theirs = {}
-    for tag in ('Up', 'Fo'):
+    for tag in ('Up', 'Fo', 'Hand'):
         rows, _keys, cb = cpp_bake_table(src, tag)
         theirs[tag] = rows
         bad.extend(cb)
@@ -1267,12 +1342,12 @@ def check_mirror(bones=None, cpp=None):
         rows = bake_path(bones, base, K, form)
         ts, _lab = bake_times(rows, secs, mapping)
         tail = bake_tail(form, ts)
-        return dict((tag, bake_table(bones, K, n, form, ts, tail))
-                    for n, tag in ((UPPER, 'Up'), (FORE, 'Fo')))
+        return dict((tag, bake_table(bones, K, bone, form, ts, tail))
+                    for bone, tag in ((UPPER, 'Up'), (FORE, 'Fo'), (HAND, 'Hand')))
 
     def diff(mine):
         out = []
-        for tag in ('Up', 'Fo'):
+        for tag in ('Up', 'Fo', 'Hand'):
             a, b = mine[tag], theirs[tag]
             if len(a) != len(b):
                 out.append('kRideSwingBake%s has %d rows, the re-bake has %d' % (tag, len(b), len(a)))
@@ -1310,17 +1385,11 @@ def check_mirror(bones=None, cpp=None):
         print('     `python tools\\armarc.py --bake "%s"%s` and paste both tables again.'
               % (BAKE_CLIP, '' if BAKE_MAP == 'native' else ' --map ' + BAKE_MAP))
         return 1
-    hinge = max(max(abs(r[2]), abs(r[4])) for r in theirs['Fo'])
     print('MIRROR OK - %r re-baked from %s and diffed value by value (tol %g):'
           % (BAKE_CLIP, os.path.basename(HUMAN), MIRROR_TOL))
-    print('    kRideSwingBakeUp %d rows, kRideSwingBakeFo %d rows, form=%s tempo=%s,'
-          ' ArcMs=%d WinMs=%d' % (len(theirs['Up']), len(theirs['Fo']), BAKE_FORM, BAKE_MAP,
-                                  ARC_MS, WIN_MS))
-    print('    forearm hinge check: max |x|,|z| over the Fo table = %.6f => %s'
-          % (hinge, 'PURE HINGE, so the grip claim in the .cpp holds' if hinge <= MIRROR_TOL else
-             'NOT a pure hinge - the .cpp comment says the grip survives because x=z=0; it does not'))
-    print('    AXIS/ARC2 in this file are the RETIRED T28/T29 model - the .cpp no longer holds them,')
-    print('    so they are NOT mirrored; they exist only to decode pre-T30 logs.')
+    print('    kRideSwingBakeUp/Fo/Hand %d/%d/%d rows, form=%s tempo=%s; ArcMs=%d WinMs=%d'
+          % (len(theirs['Up']), len(theirs['Fo']), len(theirs['Hand']),
+             BAKE_FORM, BAKE_MAP, ARC_MS, WIN_MS))
     return 0
 
 
@@ -1345,8 +1414,14 @@ def main(argv):
     # mirror is checked FIRST and a mismatch is fatal: a report that silently describes a different
     # stroke is the one failure mode this file cannot survive.  ⚠️ `--mirror` alone is the standalone
     # form; here the parsed skeleton is handed over so the 8 MB walk happens once.
+    # EXCEPT: `--bake <explicit clip>` is the ONE mode whose output is meant to REPLACE the tables the
+    # mirror just failed on (its own FAIL message says "re-run --bake <clip> and paste again") - so a
+    # mismatch must not block it, or the fix is impossible to generate.  The default clip (no
+    # argument) is still behind the mirror: that is the re-report path, and it must stay fatal.
+    explicit_bake = '--bake' in argv and (argv.index('--bake') + 1 < len(argv)
+                                          and not argv[argv.index('--bake') + 1].startswith('--'))
     rc = check_mirror(bones)
-    if rc:
+    if rc and not explicit_bake:
         return rc
     print('skeleton: %s  (%d bones)' % (os.path.basename(path), len(bones)))
     print('bind-pose sanity (lengths are |local position|, i.e. bone lengths):')
@@ -1382,6 +1457,15 @@ def main(argv):
 
     if '--log' in argv:
         return report_log(bones, argv[argv.index('--log') + 1])
+
+    if '--sweep-down' in argv:
+        i = argv.index('--sweep-down')
+        find = argv[i + 1] if (i + 1 < len(argv) and not argv[i + 1].startswith('--')) else None
+        _, base, _ = host_pose(bones, HOST_CLIP)
+        if not base:
+            print('no host clip %r - the window-open pose cannot be modelled offline' % HOST_CLIP)
+            return 2
+        return sweep_down(bones, base, find)
 
     if '--bake' in argv:
         i = argv.index('--bake') + 1
@@ -1475,5 +1559,3 @@ def main(argv):
 
 if __name__ == '__main__':
     sys.exit(main(sys.argv))
-
-

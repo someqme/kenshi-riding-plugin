@@ -395,6 +395,14 @@ class Session(object):
         self.sw_rides = []       # "P43SW ride swing= tech= skip= fail= guardoff="
         self.sw_open  = []       # "P43SW open n= tech='..' init= minS= lim= d= reach="
         self.sw_close = []       # "P43SW close n= guardoff= tech= skip= fail="
+        # P4-6, the swing's HIT RESOLUTION (DLL 333312 B and later, UNGATED with
+        # its own line budget - the P43RD discipline again: it changes game
+        # state).  At most one line per window: "P43ST n= ret= dmg=a/b/c
+        # tech='..' f=" for a real dispatch (ret= is the engine's own
+        # HitMaterialType answer, 0 = HIT_MISSED = the enemy DODGED, which is
+        # the feature), "P43ST n= skip tgt=down|none f=" for a refusal before
+        # the call.  Reconciled window-by-window against the close line's hit=.
+        self.st_lines = []       # dicts of "P43ST ..." lines (_kind: hit/skip)
         self.sw_legacy = 0       # lines that look like the trip-10 window instead
         self.sw_hold_bones = []  # T23 "SWING hold bone '<name>' has= handle="
         self.sw_free_bones = []  # T23 "SWING free bone '<name>' has= handle="
@@ -711,6 +719,15 @@ def parse(path, s):
                     s.sw_close.append(d)
                 else:
                     s.sw_legacy += 1
+                continue
+            # P4-6: the hit resolution line.  Ungated, its own budget, at most
+            # one per window.  Shape tells the two kinds apart - the dispatch
+            # row carries ret=/dmg=, the refusal row carries skip tgt=.
+            if "Riding: P43ST " in line:
+                d = kv(line)
+                d["_ts"] = ts(line)
+                d["_kind"] = "hit" if "ret" in d else "skip"
+                s.st_lines.append(d)
                 continue
             # T23: the two bone tables of the complementary split, printed once per
             # DLL load.  "SWING hold bone '<name>' has=N handle=N" protects the seat
@@ -3726,11 +3743,12 @@ def report_swing(s):
         hk = hostkeep(d, 0)
         tot_hk += int(hk) if hk is not None else 0
         print("    %8s  swing=%-3s tech=%-3s skip=%-3s noclip=%-3s %s=%-5s"
-              " dmin=%-6s limlast=%s"
+              " dmin=%-6s limlast=%s aspd=%-6s gap=%s"
               % (d.get("_ts", "?"), d.get("swing", "-"), d.get("tech", "-"),
                  d.get("skip", "-"), d.get("noclip", "-"), hk_lbl,
                  d.get(hostkeep_key(d) or "hostkeep", "-"),
-                 d.get("dmin", "-"), d.get("limlast", "-")))
+                 d.get("dmin", "-"), d.get("limlast", "-"),
+                 d.get("aspd", "-"), d.get("gap", "-")))
     tot[hk_lbl] = tot_hk
 
 
@@ -5314,6 +5332,87 @@ def report_swing_aim(s):
     print("             wrist rule there.")
 
 
+def report_swing_hit(s):
+    """P4-6 - the swing's hit resolution: did the engine take our one stroke?
+
+    One dispatch per window at kRideSwingHitMs (552 ms, the native 'chop down static' through pose):
+    threat->_NV_hitByMeleeAttack(CUT_DEFAULT, dmg, rider, tech, 0).  The engine
+    owns the whole verdict - ret= is its own HitMaterialType answer, and
+    HIT_MISSED (0) is the DODGE, which is the feature (the user asked for the
+    enemies to be able to dodge).  Blocks, body part, wounds, stumbles, sounds
+    are all inside that call; we read nothing but the return.
+
+    Judging discipline inherited from the suppressor/redraw probes:
+      * ret=0-distribution is NOT a criterion.  A ride of all-misses with the
+        enemy alive and swinging is a WORKING dodge, not a failure; the only
+        self-proving field here is that the LINE EXISTS for a window that had
+        a live target at 1050 ms.
+      * hit= on the close row is per-window (1 hit / 0 dodge / -1 attempted
+        but unresolved / -2-ended-before-the-tick).  A close row with hit=
+        missing entirely predates this build - like every "predates" shape,
+        that is a NOTE, not a CHECK.
+    """
+    print("")
+    print("== P4-6: the swing's hit resolution (P43ST) ==")
+    if not s.st_lines and not any("hit" in d for d in s.sw_close):
+        print("  no P43ST line and no hit= on any close row: this log predates")
+        print("  the P4-6 build (333312 B).  NOT a failure - nothing to judge.")
+        return
+    hits = [d for d in s.st_lines if d["_kind"] == "hit"]
+    skips = [d for d in s.st_lines if d["_kind"] == "skip"]
+    n_hit_ret = sum(1 for d in hits if int(fnum(d, "ret", -1)) > 0)
+    n_dodge = sum(1 for d in hits if int(fnum(d, "ret", -1)) == 0)
+    n_weird = len(hits) - n_hit_ret - n_dodge
+    print("  dispatch rows: %d   (engine called it a hit: %d, dodge/HIT_MISSED: %d,"
+          " unreadable ret: %d)" % (len(hits), n_hit_ret, n_dodge, n_weird))
+    print("  refusals (target down/gone or shell fault): %d" % len(skips))
+    for d in (hits + skips)[:12]:
+        if d["_kind"] == "hit":
+            print("    %8s  n=%-3s ret=%-3s dmg=%-17s tech=%s" % (
+                d.get("_ts", "?"), d.get("n", "-"), d.get("ret", "-"),
+                d.get("dmg", "-"), d.get("tech", "?").strip("'")[:24]))
+        else:
+            print("    %8s  n=%-3s skip tgt=%s" % (
+                d.get("_ts", "?"), d.get("n", "-"), d.get("tgt", "?")))
+    if len(hits) + len(skips) > 12:
+        print("    ... (%d more)" % (len(hits) + len(skips) - 12))
+    # Window-by-window reconciliation: every close row with hit= should be
+    # 1/0 when a P43ST dispatch row exists for the same n, -1/-2 otherwise.
+    closes = [d for d in s.sw_close if "hit" in d]
+    if closes:
+        st_by_n = {}
+        for d in s.st_lines:
+            st_by_n.setdefault(int(fnum(d, "n", -1)), []).append(d)
+        mismatch = 0
+        for d in closes:
+            n = int(fnum(d, "n", -1))
+            hitv = int(fnum(d, "hit", -2))
+            row = st_by_n.get(n)
+            # A target that became down before the resolution tick is a deliberate
+            # refusal: it logs P43ST skip tgt=down and closes with hit=-1.
+            skipped_down = bool(row) and row[-1].get("_kind") == "skip" and row[-1].get("tgt") == "down"
+            if (hitv in (0, 1)) != bool(row) and not (skipped_down and hitv == -1):
+                mismatch += 1
+            elif row and hitv in (0, 1):
+                r = int(fnum(row[-1], "ret", -1))
+                if (hitv == 1) != (r > 0) and r >= 0:
+                    mismatch += 1
+        print("  close rows with hit=: %d   reconciliation vs P43ST: %s" % (
+            len(closes),
+            verdict(mismatch == 0, "%d window(s) disagree" % mismatch
+                    if mismatch else "all agree")))
+    else:
+        print("  NOTE  no close row carries hit= (windows closed before the tick,"
+              " or a log")
+        print("        mixing builds) - the P43ST rows above stand alone.")
+    # Budget: the DLL caps P43ST at kRideSwingHitLines=24; if we see exactly 24
+    # while windows kept happening, the tail of the ride went dark (a NOTE,
+    # not a failure - the dispatch itself still ran).
+    print("  NOTE  ret= 0 IS the dodge - the feature, not a miss of the feature.")
+    print("        Damage numbers, blocks and wounds are the engine's inside that")
+    print("        call; the eyeball half (enemy health dropping) is not in this file.")
+
+
 def report_swing_host(s):
     """T27 - the window KEEPS its host: does holding 'guard 1h' through the stroke work?
 
@@ -5682,7 +5781,7 @@ def is_t28(s):
 
 
 def is_t30(s):
-    """T30 rows carry elbow=; T28/T29 carried deg=/cone= and no elbow=.
+    """T30 rows carry elbow= without deg=; T28/T29 carried deg=/cone= and no elbow=.
 
     Dispatch on the FIELD NAME, never on a trip number or a byte count - the same rule
     is_t27() follows, and the reason is sharper here than anywhere else in this file: T28
@@ -5692,7 +5791,12 @@ def is_t30(s):
     ⚠️ `elb=` is NOT this field.  T25's retired joint-angle line printed abd=/flx=/elb=, and
     kv() keys those separately, so a T25 log cannot be mistaken for a T30 one.
     """
-    return any("elbow" in d for d in s.sw_arm)
+    return any("elbow" in d and "deg" not in d for d in s.sw_arm)
+
+
+def is_t31_hybrid(s):
+    """P4-6f: T29 front/down arm position plus a baked Hand delta for the blade roll."""
+    return is_t28(s) and any("hkept" in d for d in s.sw_arm)
 
 
 def _len_pair(d):
@@ -5759,7 +5863,9 @@ def report_swing_arc(s):
     the hand ends up any more.  The only two dials left are the AXIS and the ANGLE PROFILE.
     """
     print("")
-    print("== T28 - one rigid rotation: the elbow frozen, the grip carried ==")
+    hybrid = is_t31_hybrid(s)
+    print("== T31 - front/down arm arc with baked wrist ==" if hybrid else
+          "== T28 - one rigid rotation: the elbow frozen, the grip carried ==")
     if not s.sw_arm:
         print("  no SWING arm sample at all - nothing to judge (see -- T25/T26 -- above).")
         return
@@ -5855,10 +5961,15 @@ def report_swing_arc(s):
         for n, lo, hi, sp, cnt in grips:
             print("    win%-2d n=%-3d angle(bx,arm)=%5.1f .. %5.1f deg   spread %5.1f"
                   % (n, cnt, lo, hi, sp))
-        print("  " + verdict(gworst[3] <= GRIP,
-                             "the blade keeps its attitude relative to the arm (worst spread"
-                             " %.1f <= %.0f deg) = 正手 stays 正手" % (gworst[3], GRIP)))
-        if gworst[3] > GRIP:
+        if hybrid:
+            print("  INFO  wrist is deliberately animated by bigchopv2 here; its angle relative to"
+                  " the arm is a blade-shape witness, not a flatness criterion.  Judge ownership"
+                  " from hkept= in T30's wrist audit and judge the edge by eye.")
+        else:
+            print("  " + verdict(gworst[3] <= GRIP,
+                                 "the blade keeps its attitude relative to the arm (worst spread"
+                                 " %.1f <= %.0f deg) = 正手 stays 正手" % (gworst[3], GRIP)))
+        if not hybrid and gworst[3] > GRIP:
             print("        win%d wanders %.1f .. %.1f deg.  Read it in this order:"
                   % (gworst[0], gworst[1], gworst[2]))
             print("          a) WITNESS 1 also failed ⇒ one cause, not two: the forearm local"
@@ -6094,6 +6205,24 @@ def report_swing_bake(s):
               " and every")
         print("  criterion here is the negation of one there, so this section stays silent.")
         return
+    hkept_all = [fnum(d, "hkept") for d in s.sw_arm if fnum(d, "hkept") is not None]
+    hkept = [v for v in hkept_all if v >= 0.0]
+    if not hkept_all:
+        print("  NOTE  no hkept= samples: this log predates the three-bone wrist replay, so"
+              " the blade's authored curve is UNJUDGED.")
+    elif not hkept:
+        print("  NOTE  hkept= appears only on first authored samples (=-1.0000); the wrist"
+              " write is UNJUDGED this trip.")
+    else:
+        worst_hkept = min(hkept)
+        print("  wrist write hkept=: worst %.4f over %d settled sample(s)" %
+              (worst_hkept, len(hkept)))
+        print("  " + verdict(worst_hkept >= 0.999,
+                             "the R Hand curve survived the host/mask pass (worst %.4f)" %
+                             worst_hkept))
+        if worst_hkept < 0.999:
+            print("        The upper-arm/forearm path can still pass while the blade remains in"
+                  " guard orientation.  Check the R Hand mask handle and free-bone table first.")
     wins = swing_arm_windows(s)
     print("  %d sample(s) in %d window(s) of samples (throttled one per"
           " kRideSwingArmLogGap=12" % (len(s.sw_arm), len(wins)))
@@ -6589,6 +6718,7 @@ def main(argv):
     report_swing_gate(s)
     report_swing_arm(s)
     report_swing_aim(s)
+    report_swing_hit(s)
     report_swing_host(s)
     report_swing_arc(s)
     report_swing_bake(s)
@@ -6605,11 +6735,5 @@ def main(argv):
 
 if __name__ == "__main__":
     sys.exit(main(sys.argv))
-
-
-
-
-
-
 
 
