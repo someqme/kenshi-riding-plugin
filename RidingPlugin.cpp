@@ -2996,6 +2996,70 @@ static Character* RideNearestThreat(Character* rider, Character* mount, float* d
     return best;
 }
 
+// Normal-play combat promotion for a small eligible mount.  The diagnostics lever below is a
+// deliberately exhaustive reverse-engineering ladder, but it must not be the only code path that
+// gives a mounted rider a combat relationship: with two riders, one rider can otherwise remain a
+// passive carried character until Ctrl+Numpad. happens to run the ladder.  Keep this path narrow and
+// idempotent.  It only installs the same three preconditions already proven by P4-1d (target,
+// attacker-list membership, combat mode); it never runs the ladder, never changes big-mount policy,
+// and never clears combat mode.
+static void RideCombatPromoteImpl(Character* rider, Character* mount)
+{
+    if (!rider || !mount || rider->isDown() || rider->isDead()) return;
+
+    float d = -1.0f;
+    Character* threat = RideNearestThreat(rider, mount, &d);
+    if (!threat || d < 0.0f || d > kAtkTryRange) return;
+
+    CombatClass* rcc = rider->getCombatClass();
+    if (!rcc) return;
+
+    int targetSet = 0;
+    int attackerSet = 0;
+    int combatSet = 0;
+
+    Character* current = rcc->_getAttackTarget().getCharacter();
+    if (current != threat)
+    {
+        rcc->setAttackTarget(threat);
+        rcc->setAttackTargetHandle(threat);
+        targetSet = 1;
+    }
+    if (!rcc->isInAttackerListH(threat))
+    {
+        rider->attackingYou(threat, true, false);
+        attackerSet = 1;
+    }
+
+    // Do not construct `hand` in the DLL.  Copy the engine-owned handle, exactly as the
+    // diagnostic ladder does, then call the non-virtual AI entry only when the rider is not
+    // already in combat mode.
+    hand targetHandle = rcc->_getAttackTarget();
+    if (CcBool(rcc, 0x130) != 1 && targetHandle.getCharacter())
+    {
+        reinterpret_cast<CombatClassAI*>(rcc)->_NV_initCombatMode(targetHandle, 0, false);
+        combatSet = 1;
+    }
+
+    if (targetSet || attackerSet || combatSet)
+    {
+        char b[256];
+        _snprintf_s(b, 256, _TRUNCATE,
+            "Riding: P43AUTO rider=%p mount=%p tgt=%p d=%.2f target=%d attacker=%d combat=%d f=%u",
+            (void*)rider, (void*)mount, (void*)threat, d,
+            targetSet, attackerSet, combatSet, gP3Frames);
+        DebugLog(std::string(b));
+    }
+}
+
+static void RideCombatPromote(Character* rider, Character* mount)
+{
+    __try { RideCombatPromoteImpl(rider, mount); }
+    __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION
+                  ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH)
+    { DebugLog("Riding: P43AUTO access violation - promotion abandoned"); }
+}
+
 // ⚠️ P4-1M measured that isInCombatMode(true, true) DOES NOT DROP when a mounted fight ends: the
 // log holds STANCE 1 for ~8700 frames (≈67 s) after the last blow and never returns to 0, which
 // is exactly the "出战斗后没有回到纯坐姿" the player reported.  So the engine flag cannot be the
@@ -10528,6 +10592,12 @@ static void CombatAndForceDismountPass()
                 bigMount    = IsBigMount(sit->second);
                 riderFights = MountCombatEligible(mount, sit->second);
             }
+
+            // A diagnostics-off session must still promote each eligible rider into the same
+            // combat state that the old P41D ladder proved necessary.  Keep the exhaustive ladder
+            // below diagnostic-only; this small idempotent bridge is the shipping path.
+            if (riderFights)
+                RideCombatPromote(rider, mount);
 
             // Read the combat state BEFORE the suppression below runs, or the probe would
             // only ever see our own endCombatMode().  neck= keeps its original meaning
