@@ -390,14 +390,14 @@ class Session(object):
         # HISTORY §U).  The two are told apart by shape, not by name - the old one
         # printed "P43SW <open|hold|close|after> n= blow play= ... | guard play= ..."
         # with the two clips repeating field names on one line, this one prints
-        # "P43SW open n= tech='..' init= minS= lim= d= reach=" plus a "P43SW ride"
+        # "P43SW open rider=... n= tech='..' init= minS= lim= d= reach=" plus a "P43SW ride"
         # summary the old one never had.  A log that has "P43SW ride" is this one.
         self.sw_rides = []       # "P43SW ride swing= tech= skip= fail= guardoff="
         self.sw_open  = []       # "P43SW open n= tech='..' init= minS= lim= d= reach="
         self.sw_close = []       # "P43SW close n= guardoff= tech= skip= fail="
         # P4-6, the swing's HIT RESOLUTION (DLL 333312 B and later, UNGATED with
         # its own line budget - the P43RD discipline again: it changes game
-        # state).  At most one line per window: "P43ST n= ret= dmg=a/b/c
+        # state).  At most one line per window: "P43ST rider=... n= ret= dmg=a/b/c
         # tech='..' f=" for a real dispatch (ret= is the engine's own
         # HitMaterialType answer, 0 = HIT_MISSED = the enemy DODGED, which is
         # the feature), "P43ST n= skip tgt=down|none f=" for a refusal before
@@ -5377,17 +5377,30 @@ def report_swing_hit(s):
     if len(hits) + len(skips) > 12:
         print("    ... (%d more)" % (len(hits) + len(skips) - 12))
     # Window-by-window reconciliation: every close row with hit= should be
-    # 1/0 when a P43ST dispatch row exists for the same n, -1/-2 otherwise.
+    # 1/0 when a P43ST dispatch row exists for the same rider and n, -1/-2
+    # otherwise.  The rider key was added when the runtime became per-rider;
+    # fall back to n alone for older single-rider logs.
     closes = [d for d in s.sw_close if "hit" in d]
     if closes:
-        st_by_n = {}
+        st_by_window = {}
         for d in s.st_lines:
-            st_by_n.setdefault(int(fnum(d, "n", -1)), []).append(d)
+            n = int(fnum(d, "n", -1))
+            key = (d.get("rider"), n) if d.get("rider") else (None, n)
+            st_by_window.setdefault(key, []).append(d)
         mismatch = 0
         for d in closes:
             n = int(fnum(d, "n", -1))
             hitv = int(fnum(d, "hit", -2))
-            row = st_by_n.get(n)
+            rider = d.get("rider")
+            if rider:
+                row = st_by_window.get((rider, n), [])
+            else:
+                row = st_by_window.get((None, n), [])
+                if not row:
+                    # Old logs have no identity field, so allow the historical
+                    # global-n lookup only when the close itself is also old.
+                    row = [x for (key, wn), values in st_by_window.items()
+                           if wn == n for x in values]
             # A target that became down before the resolution tick is a deliberate
             # refusal: it logs P43ST skip tgt=down and closes with hit=-1.
             skipped_down = bool(row) and row[-1].get("_kind") == "skip" and row[-1].get("tgt") == "down"
@@ -6735,5 +6748,4 @@ def main(argv):
 
 if __name__ == "__main__":
     sys.exit(main(sys.argv))
-
 

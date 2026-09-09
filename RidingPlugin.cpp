@@ -3904,8 +3904,8 @@ static int RideSwingDamageImpl(Character* rider, Character* threat, CombatTechni
         const std::string* an = (const std::string*)((const char*)tech + 0x00);
         char b[256];
         _snprintf_s(b, 256, _TRUNCATE,
-            "Riding: P43ST n=%d ret=%d dmg=%.1f/%.1f/%.1f tech='%s' f=%u",
-            rt->swingCount, (int)ret, dmg.cut, dmg.pierce, dmg.bleedMult,
+            "Riding: P43ST rider=%p n=%d ret=%d dmg=%.1f/%.1f/%.1f tech='%s' f=%u",
+            (void*)rider, rt->swingCount, (int)ret, dmg.cut, dmg.pierce, dmg.bleedMult,
             an->c_str(), gP3Frames);
         DebugLog(std::string(b));
     }
@@ -4274,9 +4274,9 @@ static void RideSwingPass(Character* rider, Character* mount, AnimationClass* rA
             RideSwingProbePin(rAnim, host, pn, sizeof(pn));
             char b[640];
             _snprintf_s(b, 640, _TRUNCATE,
-                "Riding: P43SW close n=%d prog=%.3f ms=%u rst=%d drv=%d armt=%.2f noref=%d hold=%d "
+                "Riding: P43SW close rider=%p n=%d prog=%.3f ms=%u rst=%d drv=%d armt=%.2f noref=%d hold=%d "
                 "fit=%d hostkeep=%d tech=%d skip=%d noclip=%d hit=%d | tech='%s' %s | %s f=%u",
-                rt.swingCount, prog, (unsigned)ms, rt.restarts, rt.driveFrames,
+                (void*)rider, rt.swingCount, prog, (unsigned)ms, rt.restarts, rt.driveFrames,
                 rt.armT, rt.noRef, rt.holdN, rt.fitMs, rt.hostKeepFrames,
                 rt.techCount, rt.skipCount, rt.noClipCount, hitv, rt.techniqueName, pr, pn, gP3Frames);
             DebugLog(std::string(b));
@@ -4328,9 +4328,12 @@ static void RideSwingPass(Character* rider, Character* mount, AnimationClass* rA
             if (rt.hitLines < kRideSwingHitLines)
             {
                 ++rt.hitLines;
-                DebugLog(std::string("Riding: P43ST n=") + IntToStr(rt.swingCount)
-                         + " skip=" + RideHitSkipReasonName(rt.hitSkipReason)
-                         + " f=" + IntToStr((int)gP3Frames));
+                char stline[192];
+                _snprintf_s(stline, 192, _TRUNCATE,
+                            "Riding: P43ST rider=%p n=%d skip=%s f=%u",
+                            (void*)rider, rt.swingCount,
+                            RideHitSkipReasonName(rt.hitSkipReason), gP3Frames);
+                DebugLog(std::string(stline));
             }
         }
     }
@@ -4440,9 +4443,9 @@ static void RideSwingPass(Character* rider, Character* mount, AnimationClass* rA
         RideSwingProbePin(rAnim, host, pn, sizeof(pn));
         char b[640];
         _snprintf_s(b, 640, _TRUNCATE,
-            "Riding: P43SW open n=%d tech='%s' gate='%s' dq=%.2f init=%.2f minS=%.2f lim=%.2f "
+            "Riding: P43SW open rider=%p n=%d tech='%s' gate='%s' dq=%.2f init=%.2f minS=%.2f lim=%.2f "
             "d=%.2f reach=%.2f aspd=%.3f gap=%d | pin='%s' %s | pre %s f=%u",
-            rt.swingCount, pick.name, pick.gate, pick.dq, pick.init, pick.minS, lim, pick.d,
+            (void*)rider, rt.swingCount, pick.name, pick.gate, pick.dq, pick.init, pick.minS, lim, pick.d,
             pick.reach, rt.attackSpeed, rt.gapMs,
             hostNm ? hostNm : "", pr, pn, gP3Frames);
         DebugLog(std::string(b));
@@ -8353,8 +8356,9 @@ void Dismount(Character* rider)
     {
         char sws[352];
         _snprintf_s(sws, 352, _TRUNCATE,
-            "Riding: P43SW ride swing=%d rst=%d drv=%d arm=%d postarm=%d swfree=%d tech=%d skip=%d noclip=%d "
+            "Riding: P43SW ride rider=%p swing=%d rst=%d drv=%d arm=%d postarm=%d swfree=%d tech=%d skip=%d noclip=%d "
             "hostkeep=%d hdveto=%d dmin=%.2f limlast=%.2f aspd=%.3f gap=%d hskipN=%d",
+            (void*)rider,
             rideRt ? rideRt->swingCount : 0,
             rideRt ? rideRt->restarts : 0,
             rideRt ? rideRt->driveFrames : 0,
