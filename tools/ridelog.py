@@ -5401,10 +5401,11 @@ def report_swing_hit(s):
                     # global-n lookup only when the close itself is also old.
                     row = [x for (key, wn), values in st_by_window.items()
                            if wn == n for x in values]
-            # A target that became down before the resolution tick is a deliberate
-            # refusal: it logs P43ST skip tgt=down and closes with hit=-1.
-            skipped_down = bool(row) and row[-1].get("_kind") == "skip" and row[-1].get("tgt") == "down"
-            if (hitv in (0, 1)) != bool(row) and not (skipped_down and hitv == -1):
+            # A skipped resolution is a deliberate refusal: the target may be down,
+            # out of range/sector, moved, or otherwise rejected before the engine call.
+            # All P43ST skip rows close with hit=-1 because no engine verdict exists.
+            skipped = bool(row) and row[-1].get("_kind") == "skip"
+            if (hitv in (0, 1)) != bool(row) and not (skipped and hitv == -1):
                 mismatch += 1
             elif row and hitv in (0, 1):
                 r = int(fnum(row[-1], "ret", -1))
@@ -6748,4 +6749,3 @@ def main(argv):
 
 if __name__ == "__main__":
     sys.exit(main(sys.argv))
-

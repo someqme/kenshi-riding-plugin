@@ -865,8 +865,7 @@ static const int kStanceDrawKeepMs = 3000;
 static Character* gStanceDrawWho = NULL;   // whose edge is pending; pointer compare only
 static DWORD    gStanceDrawKeepUntil = 0;  // successful draw's post-stance sheathe grace
 static bool gStanceDrawPend  = false;      // an edge fired; the draw has not been issued yet
-static bool gStanceDrawPrev  = false;      // last frame's stance, UNGATED (gRideStanceLast is
-                                           // only maintained inside the debugContinuous log)
+static bool gStanceDrawPrev  = false;      // last frame's stance, UNGATED
 static bool gStanceDrawBusy  = false;      // our own drawWeapon is on the stack right now
 static int  gStanceDrawOk    = 0;
 static int  gStanceDrawFail  = 0;
@@ -1076,8 +1075,7 @@ static int gArmDumpCmbEntries = -1;       // layer entry count last sample (-1 =
 // P4-1M therefore replaces the rotation with RideCombatStance() (defined next to
 // MountCombatEligible, which needs SeatInfo and so cannot be reached from here): route A is
 // what a mounted fighter looks like, in normal play, with no debugContinuous gate.
-static bool gRideStanceOn   = false;  // last frame's decision; read by the DBG tag
-static int  gRideStanceLast = -1;     // for the transition log only
+static bool gRideStanceOn   = false;  // last processed rider's decision; read by the DBG tag
 
 // Total entries over every layer's addList+removeList.  A clip entering or leaving the rider's
 // layers moves this number, and that event is the one worth spending combat budget on: a
@@ -1511,6 +1509,7 @@ static bool CharacterLooksLive(Character* c)
 // native carry link survives in the save and TryRestoreOrphanedMount rebuilds
 // the pair from it on the next animation frame.
 static void ResetRideSwingWindow(Character* rider);
+static void ClearRideStanceRuntime(Character* rider);
 static void RideSwingArmRelease(AnimationClass* rAnim);
 static void ClearAllRideMaskRuntime();
 static void ClearAllRidePoseRuntime();
@@ -3086,12 +3085,61 @@ static const int   kRideStanceHoldMs = 1200;
 // frames to drain, which is invisible (no frames were rendered during the stall anyway).
 static const int   kRideStanceStepMaxMs = 250;
 
-// The stance tail is still kept separately because it is a shared wall-clock edge detector;
-// gRideStanceWho keeps one rider's tail from leaking into another's - pointer compare only,
-// never dereferenced, so a stale value is safe.  Leg-pose custody itself is rider-keyed below.
-static int        gRideStanceHold = 0;      // MILLISECONDS of tail left (was: frames)
-static Character* gRideStanceWho  = NULL;
-static DWORD      gRideStanceTick = 0;      // GetTickCount() at the last advance=true call
+// The stance tail is mutable runtime state, so it must be keyed by rider just like the swing
+// transaction below.  Animation updates interleave riders; a single hold/tick pair makes rider B
+// reset or drain rider A's tail and produces the observed same-frame STANCE 1/0 flicker.
+struct RideStanceRuntime
+{
+    Character* rider;
+    int holdMs;
+    DWORD tick;
+    int last;       // diagnostics-only edge latch; -1 means not logged yet
+    bool on;
+};
+
+static boost::unordered_map<Character*, RideStanceRuntime> rideStanceByRider;
+
+static RideStanceRuntime* FindRideStanceRuntime(Character* rider)
+{
+    if (!rider) return NULL;
+    boost::unordered_map<Character*, RideStanceRuntime>::iterator it =
+        rideStanceByRider.find(rider);
+    return (it != rideStanceByRider.end()) ? &it->second : NULL;
+}
+
+static RideStanceRuntime& GetRideStanceRuntime(Character* rider)
+{
+    boost::unordered_map<Character*, RideStanceRuntime>::iterator it =
+        rideStanceByRider.find(rider);
+    if (it == rideStanceByRider.end())
+    {
+        RideStanceRuntime& fresh = rideStanceByRider[rider];
+        memset(&fresh, 0, sizeof(fresh));
+        fresh.rider = rider;
+        fresh.last = -1;
+        return fresh;
+    }
+    RideStanceRuntime& rt = it->second;
+    if (rt.rider != rider)
+    {
+        memset(&rt, 0, sizeof(rt));
+        rt.rider = rider;
+        rt.last = -1;
+    }
+    return rt;
+}
+
+static void ClearRideStanceRuntime(Character* rider)
+{
+    if (!rider) rideStanceByRider.clear();
+    else       rideStanceByRider.erase(rider);
+}
+
+static int RideStanceHoldMs(Character* rider)
+{
+    RideStanceRuntime* rt = FindRideStanceRuntime(rider);
+    return rt ? rt->holdMs : 0;
+}
 
 // The raw, stateless predicate.  True => the rider gives the pose channel back and holds a combat
 // stance instead, with the straddle carried entirely by LegPosePass's manual bones.  ⚠️ NO
@@ -3159,34 +3207,37 @@ static bool RideStanceRaw(Character* rider, Character* mount, const SeatInfo& se
 static bool RideCombatStance(Character* rider, Character* mount, const SeatInfo& seat, bool advance)
 {
     bool raw = RideStanceRaw(rider, mount, seat);
-    bool mine = (rider == gRideStanceWho);
-    if (!advance) return raw || (mine && gRideStanceHold > 0);
-    if (!mine) { gRideStanceWho = rider; gRideStanceHold = 0; gRideStanceTick = 0; }
+    RideStanceRuntime* readRt = FindRideStanceRuntime(rider);
+    if (!advance) return raw || (readRt && readRt->holdMs > 0);
+    if (!rider) return false;
+
+    RideStanceRuntime& rt = GetRideStanceRuntime(rider);
 
     // Wall-clock step.  DWORD subtraction is wrap-safe, so the 49.7-day GetTickCount rollover
     // needs no special case (the one tick that lands exactly on 0 just contributes nothing).
     DWORD now = GetTickCount();
     int   dt  = 0;
-    if (gRideStanceTick != 0)
+    if (rt.tick != 0)
     {
-        DWORD elapsed = now - gRideStanceTick;
+        DWORD elapsed = now - rt.tick;
         if (elapsed > (DWORD)kRideStanceStepMaxMs) elapsed = (DWORD)kRideStanceStepMaxMs;
         dt = (int)elapsed;
     }
-    gRideStanceTick = now;
+    rt.tick = now;
     // ⚠️ A paused game must not drain the tail: same discipline as the capture state machine and
     // ServicePendingMounts (a pause freezes exactly what this budget is measuring).  The tick is
     // still refreshed above, so unpausing resumes with a normal-sized delta instead of the whole
     // pause duration.
     if (ou && ou->isPaused()) dt = 0;
 
-    if (raw) gRideStanceHold = kRideStanceHoldMs;
-    else if (gRideStanceHold > 0)
+    if (raw) rt.holdMs = kRideStanceHoldMs;
+    else if (rt.holdMs > 0)
     {
-        gRideStanceHold -= dt;
-        if (gRideStanceHold < 0) gRideStanceHold = 0;
+        rt.holdMs -= dt;
+        if (rt.holdMs < 0) rt.holdMs = 0;
     }
-    return raw || gRideStanceHold > 0;
+    rt.on = raw || rt.holdMs > 0;
+    return rt.on;
 }
 
 // ---- P4-3-4: the swing itself, played by the ENGINE'S own combat dispatch --------------------
@@ -3594,6 +3645,7 @@ static void ResetRideSwingWindow(Character* rider)
     if (!rider)
     {
         ClearAllRideCombatRuntime();
+        ClearRideStanceRuntime(NULL);
         return;
     }
     ClearRideCombatRuntime(rider);
@@ -4223,7 +4275,7 @@ static void RideSwingPass(Character* rider, Character* mount, AnimationClass* rA
     // body.  Trip 25 caught exactly that - 32 frames of arm=536 swfree=536 against hostkeep=504, and
     // `pinst=none` on the close line - which is trip 17's hostless-skeleton disease for half a second.
     // ⚠️ Safe against flicker BY CONSTRUCTION: this pass reads the stance with advance=false, and that
-    // form is sticky (raw || (mine && gRideStanceHold > 0)), so a one-frame dropout of the raw fight
+    // form is sticky (raw || per-rider holdMs > 0), so a one-frame dropout of the raw fight
     // test cannot cut a window short.  Only the hold running out can, which is the intended meaning.
     bool  open = (rt.openTick != 0)
                && stance
@@ -7898,7 +7950,7 @@ static void LegPosePassImpl(AnimationClass* rAnim, AnimationData* poseData, Char
                 "host='%s' msk=%d holdms=%d",
                 poseRt.poseFrames, poseRt.twistDeg, twistWant, twistOn ? 1 : 0,
                 twistTgt ? 1 : 0, twistDist, sh, haveSh ? 1 : 0,
-                host->animName.c_str(), msk, gRideStanceHold);
+                host->animName.c_str(), msk, RideStanceHoldMs(rider));
             DebugLog(std::string(tw));
         }
 
@@ -8089,11 +8141,8 @@ void Mount(Character* rider, Character* mount)
     gArmDumpLeft   = kArmDumpBase;    // a short baseline before the first forced draw
     gArmDumpCmbBudget  = kArmDumpCmbBudget;  // P4-1h: combat-only dumps, own budget
     gArmDumpCmbEntries = -1;
-    gRideStanceLast    = -1;                 // P4-1M: re-arm the stance transition log
     gRideStanceOn      = false;
-    gRideStanceHold    = 0;                  // P4-1N: no release tail into a new ride
-    gRideStanceWho     = NULL;
-    gRideStanceTick    = 0;                  // and no stale wall-clock baseline either
+    ClearRideStanceRuntime(rider);           // P4-1N: no release tail into a new ride
     gP41kResolved      = false;              // P4-1k: re-resolve + re-log the probe clips
     gShSupReal         = 0;                  // P4-3-2: sheathe suppression counters, per ride
     gShSupNoop         = 0;
@@ -8377,6 +8426,7 @@ void Dismount(Character* rider)
         DebugLog(std::string(sws));
     }
     ClearRideCombatRuntime(rider);
+    ClearRideStanceRuntime(rider);
     ClearRideMaskRuntime(rider);
     ClearRidePoseRuntime(rider);
     DebugLog("Riding: dismounted");
@@ -8440,11 +8490,8 @@ void RestoreRideAfterLoad(Character* rider, Character* mount)
     gArmDumpLeft   = kArmDumpBase;    // a short baseline before the first forced draw
     gArmDumpCmbBudget  = kArmDumpCmbBudget;  // P4-1h: combat-only dumps, own budget
     gArmDumpCmbEntries = -1;
-    gRideStanceLast    = -1;                 // P4-1M: re-arm the stance transition log
     gRideStanceOn      = false;
-    gRideStanceHold    = 0;                  // P4-1N: no release tail into a new ride
-    gRideStanceWho     = NULL;
-    gRideStanceTick    = 0;                  // and no stale wall-clock baseline either
+    ClearRideStanceRuntime(rider);           // P4-1N: no release tail into a new ride
     gP41kResolved      = false;              // P4-1k: re-resolve + re-log the probe clips
     gShSupReal         = 0;                  // P4-3-2: sheathe suppression counters, per ride
     gShSupNoop         = 0;
@@ -9370,11 +9417,10 @@ static void HaltAndForceSitPass()
                         bool stance = RideCombatStance(rider, mount, sit->second, true);
                         gRideStanceOn = stance;   // read by the DBG tag, nothing else
                         // P4-3-3: latch the 0 -> 1 edge for the one-shot re-draw.  UNGATED, and
-                        // kept separate from gRideStanceLast below, which only advances inside the
-                        // debugContinuous block - toggling diagnostics must never change whether
+                        // kept separate from the per-rider diagnostic latch below, which only
+                        // advances inside the debugContinuous block - toggling diagnostics must never change whether
                         // the rider arms itself (same discipline as the stance itself).  Whose
-                        // edge it is travels with the flag: the stance state machine is
-                        // single-rider (gRideStanceWho) but this loop walks every tracked pair.
+                        // edge it is travels with the flag; this loop walks every tracked pair.
                         if (rider != gStanceDrawWho)
                         {
                             gStanceDrawWho  = rider;
@@ -9383,9 +9429,11 @@ static void HaltAndForceSitPass()
                         }
                         if (stance && !gStanceDrawPrev) gStanceDrawPend = true;
                         gStanceDrawPrev = stance;
-                        if (debugContinuous && (stance ? 1 : 0) != gRideStanceLast)
+                        RideStanceRuntime* stanceRt = FindRideStanceRuntime(rider);
+                        if (debugContinuous && stanceRt
+                            && (stance ? 1 : 0) != stanceRt->last)
                         {
-                            gRideStanceLast = stance ? 1 : 0;
+                            stanceRt->last = stance ? 1 : 0;
                             // d= / holdms= are how a stuck stance is diagnosed now: cm=1 with no
                             // threat (d=-1) is the engine flag lingering and OUR term doing its
                             // job; cm=1 with a real d beyond kRideThreatDist is a fight that
@@ -9398,7 +9446,8 @@ static void HaltAndForceSitPass()
                             _snprintf_s(pl, 160, _TRUNCATE,
                                 "Riding: STANCE %d f=%u cm=%d d=%.1f holdms=%d",
                                 stance ? 1 : 0, gP3Frames,
-                                rider->isInCombatMode(true, true) ? 1 : 0, td, gRideStanceHold);
+                                rider->isInCombatMode(true, true) ? 1 : 0, td,
+                                stanceRt->holdMs);
                             DebugLog(std::string(pl));
                         }
                         // Unconditional: both branches want the carried pose gone and
