@@ -1,16 +1,16 @@
 # armarc.py - where does the AUTHORED swing arc actually put the hand?  Offline, no game.
 #
-#   python tools\armarc.py                   # the shipped kRideSwingArc, sampled
+#   python tools\armarc.py                   # the live RideSwingRigidArc path, sampled
 #   python tools\armarc.py --ref 1.41 3.88 3.51   # ... off a different reference pose (out fore down)
 #   python tools\armarc.py --bindref          # ... off the BIND pose instead of the measured one
 #   python tools\armarc.py --bind             # bind-pose sanity numbers only
 #   python tools\armarc.py --abd -70 --flx -30 --elb -50    # one retired-model pose, ad hoc
 #   python tools\armarc.py --log <RE_Kenshi_log>            # what the GAME actually drew, vs this
-#   python tools\armarc.py --mirror           # ONLY diff AXIS/ARC2/ArcMs/WinMs against the .cpp
+#   python tools\armarc.py --mirror           # Diff retained offline models, baked tables and timing
 #
-# ⚠️ EVERY MODE ABOVE RUNS --mirror FIRST and refuses to report on a mismatch.  This file holds the
-# DLL's numbers a second time; the compiler never sees this copy, so a half-finished edit used to be
-# invisible until an in-game trip contradicted the offline report.  That is what the check closes.
+# ⚠️ EVERY MODE ABOVE RUNS --mirror FIRST.  The active vanilla-clip route is a fatal gate;
+# retained authored-arm models are diagnostics only and may warn without blocking shipping.
+# This file holds retired geometry a second time so historical logs remain reproducible.
 #
 # Why this exists: the DLL hand-writes two arm bones (RidingPlugin.cpp, RideSwingArmPose) and every
 # version of that has been a guess about a frame we do not own.  The .skeleton file carries every bone's
@@ -51,8 +51,9 @@ HUMAN = os.path.join(KENSHI, r'data\character\meshes\male_skeleton\male_skeleton
 C_BLEND, C_BONE, C_PARENT = 0x1010, 0x2000, 0x3000
 C_ANIM, C_BASEINFO, C_TRACK, C_KEYFRAME, C_LINK = 0x4000, 0x4010, 0x4100, 0x4110, 0x5000
 
-# The arc under test.  ⚠️ MIRRORS kRideSwingArc in RidingPlugin.cpp - if one changes, change both;
-# there is no build step that could catch a drift here.
+# The retained rigid-arc diagnostic model.  Its values mirror RideSwingRigidArc() in
+# RidingPlugin.cpp so old logs and geometry reports remain reproducible; the shipping stance path
+# uses rotating vanilla whole-body attack clips instead.
 #
 # ⛔ RETIRED MODEL (T25, trip 23).  ARC below is the joint-ANGLE table: abd/flx about the bone's own
 # bind axes.  It was measured right and still drew the wrong thing on screen, because a bind-relative
@@ -87,36 +88,18 @@ ARC_DIR = [
     (1.00, (0.30,  0.15,  0.94), (0.35,  0.80,  0.49)),   # settle back to ready
 ]
 
-# ---- the RETIRED model (T28/T29): ONE rigid rotation of the pose the host is already holding ----
-# ⚠️ MIRRORS NOTHING ANY MORE.  T30 deleted kRideSwingAxis*/kRideSwingArc/kRideSwingArcKeys from the
-# .cpp, so check_mirror() no longer looks for them - it re-bakes the clip instead (see the bake section
-# below).  These numbers stay because they are the ONLY way to decode a pre-T30 log: report_log's
-# witness 2/3 replay them against trips 24..26, and those readings are the baselines T30 is judged
-# against.  Editing them silently rewrites history; nothing in the DLL cares.
-# That model captured the upper arm's DERIVED orientation and the forearm's LOCAL orientation at window
-# open, then wrote derived_upper = S(t) * refUp and local_forearm = refFo verbatim every frame.  A
-# constant forearm local makes the elbow angle constant by construction, so the whole arm-plus-weapon
-# assembly is one rigid body turning about the shoulder ⇒ everything this file needs to know about the
-# hand's path is rel(t) = S(t) * rel(0).  No skeleton file, no bind pose, no per-bone lengths.  T30 broke
-# exactly that: the elbow moves now, so `r=` SPANS instead of staying flat (see report_log).
-# The axis is the normal of the plane the RETIRED table's own upper arm swept between its cock key and
-# its cut-through key - i.e. the cut plane of the shape whose DIRECTION the user accepted (「从右侧劈
-# 出」 was never the complaint; only the flip was).  A POSITIVE angle carries the right hand down and
-# across the mount's neck; a NEGATIVE angle lifts it out and up over the shoulder.
-AXIS = (-0.05, 0.83, -0.55)     # (out, fore, down), normalised below
-# 🆕 T29 slid the window up the SAME circle (axis untouched = one variable).  T28's -100 -> +45 straddled
-# the circle's out-extreme (out 5.2) ⇒ 6.00 vertical vs 7.27 lateral travel = the geometry behind the
-# verdict 「侧面张开大臂」; -130 -> +25 gives 8.11 / 3.74 = vert/lat 2.17, a chop.  And T28's -60 「hang」
-# leaked 40 of its 145 deg early, so the wind-up (22.2 u/s) nearly matched the cut (27.2 u/s); the hold
-# below fixes that without moving the instant the cut lands (1092 ms into the window, same as T28).
+# ---- the live model: ONE rigid rotation of the pose the host already holds ----------------------
+# This mirrors RideSwingRigidArc() in the DLL.  The arm chain is kept rigid: only the upper arm's
+# derived orientation is written, while forearm and hand keep their captured locals and carry the
+# weapon together.  The normal is the rider's lateral/out axis, so the hand travels in the fore/down
+# sagittal plane instead of sweeping sideways across the mount.
+AXIS = (-1.0, 0.0, 0.0)     # (out, fore, down); to_skel() yields the DLL's +X
 ARC2 = [
     #  t      deg      what it is
-    (0.00,    0.0),   # open: identity, i.e. the host's own pose - no handover step
-    (0.40, -130.0),   # cock: high, over the right shoulder (clear of the head box)
-    (0.54, -130.0),   # hold - deg_at is pure linear, so two equal keys are a true hold
-    (0.78,   25.0),   # through: the circle's lowest reachable point is +18..20, so +25 is past it
-    (0.86,   25.0),   # impact beat
-    (1.00,    0.0),   # settle back onto the captured pose
+    (0.00,   0.0),   # open: identity, i.e. the host's own pose - no handover step
+    (0.30, -35.0),   # restrained lift; retired authored-arm diagnostic profile
+    (0.74,  45.0),   # forward/down through without the old 180-degree loop
+    (1.00,   0.0),   # recovery
 ]
 # The pose the guard clip was holding at window open, measured - trip 25's first arm sample, out/fore/
 # down (r = 5.42).  Everything --bindref does instead is a sanity bound, not a prediction: the game will
@@ -124,7 +107,11 @@ ARC2 = [
 REF_MEASURED = (1.41, 3.88, 3.51)
 # ⚠️ MIRRORS kRideSwingArcMs / kRideSwingWinMs.  Only used to turn t into ms for the tempo column - the
 # shape does not depend on them - but a drift here would mislabel the tempo, so keep them in step.
-ARC_MS, WIN_MS = 1400, 1650
+ARC_MS, WIN_MS = 1400, 700
+SHIPPING_ATTACKS = (
+    'chop down static', 'mid blow', 'mid blow light',
+    'mid blow drop', 'back blow high',
+)
 UPPER, FORE, HAND = 'Bip01 R UpperArm', 'Bip01 R Forearm', 'Bip01 R Hand'
 
 
@@ -762,7 +749,7 @@ def report_log(bones, path):
 # the open pose (down 4.90 at t=0.87, i.e. 0.56 lower) while still reaching forward (fore 3.08
 # at the fd peak) and carrying a real elbow (span 96 deg).  Its own tempo is 2.833 s, so stretch
 # runs it at 0.49x vanilla.
-BAKE_CLIP, HOST_CLIP = 'chop down static', 'guard 1h'
+BAKE_CLIP, HOST_CLIP = 'chop left', 'guard 1h'
 # ⚠️ MIRRORED, and this is the pair that says WHICH bake the .cpp is holding.  check_mirror() re-bakes
 # with exactly these and diffs; if you ship a different form or tempo, change them here in the same
 # commit or the checker will (correctly) call the .cpp drifted - and it will name the combination that
@@ -805,6 +792,20 @@ def _skel():
     return _SKEL[0]
 
 
+def converted_tracks(sk, tracks):
+    """Convert one parsed clip's tracks to ARMARC quaternions without rescanning sk.anims."""
+    bh = sk.by_handle()
+    out = {}
+    for h, keys in tracks.items():
+        prev, seq = (1.0, 0.0, 0.0, 0.0), []
+        for (t, q, _x) in keys:
+            w = qalign(prev, (q[3], q[0], q[1], q[2]))
+            seq.append((t, w))
+            prev = w
+        out[bh[h]] = seq
+    return out
+
+
 def clip_tracks(clip):
     """-> (seconds, {boneName: [(t, quat)]}) with quats in ARMARC order (w,x,y,z) and sign-aligned.
 
@@ -815,15 +816,7 @@ def clip_tracks(clip):
     for (name, secs, tracks) in sk.anims:
         if name.lower() != clip.lower():
             continue
-        out = {}
-        for h, keys in tracks.items():
-            prev, seq = (1.0, 0.0, 0.0, 0.0), []
-            for (t, q, _x) in keys:
-                w = qalign(prev, (q[3], q[0], q[1], q[2]))
-                seq.append((t, w))
-                prev = w
-            out[bh[h]] = seq
-        return secs, out
+        return secs, converted_tracks(sk, tracks)
     return None, None
 
 
@@ -988,7 +981,7 @@ def sweep_down(bones, base, find=None, top=25):
         if find and find.lower() not in name.lower():
             continue
         try:
-            csecs, K = clip_tracks(name)
+            csecs, K = secs, converted_tracks(sk, tracks)
             if not K or UPPER not in K or FORE not in K or HAND not in K:
                 continue
             path = bake_path(bones, base, K, 'delta')
@@ -1004,9 +997,9 @@ def sweep_down(bones, base, find=None, top=25):
         bi = fd.index(max(fd))
         rows.append((name, csecs, len(path), max(fs), fs[bi], ds[bi], fd[bi],
                      max(ds) - ds[0], max(rs), max(es) - min(es)))
-    rows.sort(key=lambda r: -r[6])
+    rows.sort(key=lambda r: (-r[7], -r[6]))
     print('')
-    print('SWEEP-DOWN  delta form, host %r  -  fd = max(fore + down)' % HOST_CLIP)
+    print('SWEEP-DOWN  delta form, host %r  -  ranked by depth, then fd' % HOST_CLIP)
     print('    the sample that points the hand most nearly FORWARD-AND-DOWN at a target on the')
     print('    ground.  depth = max(down) - down(open) is kept beside it because a stroke can')
     print('    score fd while never getting lower than the pose it started from.')
@@ -1277,27 +1270,75 @@ def cpp_bake_table(src, tag):
     return rows, keys, bad
 
 
-def check_mirror(bones=None, cpp=None):
-    """RE-BAKE the clip out of male_skeleton.skeleton and diff EVERY value against the .cpp's three
-    baked tables (plus ArcMs / WinMs, which this file still holds twice).
+def cpp_rigid_arc(src):
+    """-> ([(t, deg)], (ax, ay, az), [complaint]) from RideSwingRigidArc()."""
+    bad, rows, axis = [], [], None
+    fn = re.search(r'static\s+Ogre::Quaternion\s+RideSwingRigidArc\s*\([^)]*\)\s*\{(.*?)^\}',
+                   src, re.S | re.M)
+    if fn is None:
+        return rows, axis, ['could not parse RideSwingRigidArc() out of the .cpp']
+    keys = re.search(r'static\s+const\s+float\s+keys\s*\[\s*\]\s*\[\s*2\s*\]\s*=\s*\{'
+                     r'(.*?)^\s*\};', fn.group(1), re.S | re.M)
+    if keys is None:
+        bad.append('could not parse RideSwingRigidArc() keys[][2]')
+    else:
+        for raw in re.findall(r'\{([^{}]*)\}', keys.group(1)):
+            v = [float(x) for x in re.findall(r'-?(?:[0-9]+\.[0-9]*|[0-9]*\.[0-9]+|[0-9]+)', raw)]
+            if len(v) != 2:
+                bad.append('RideSwingRigidArc key %d has %d number(s), expected 2: %r'
+                           % (len(rows), len(v), raw.strip()))
+            else:
+                rows.append(tuple(v))
+    a = re.search(r'const\s+float\s+ax\s*=\s*(-?[0-9.]+)f?\s*,\s*'
+                  r'ay\s*=\s*(-?[0-9.]+)f?\s*,\s*az\s*=\s*(-?[0-9.]+)f?\s*;', fn.group(1))
+    if a is None:
+        bad.append('could not parse RideSwingRigidArc() ax/ay/az')
+    else:
+        axis = tuple(float(a.group(i)) for i in (1, 2, 3))
+    return rows, axis, bad
 
-    ⚠️ THIS IS THE ONE DRIFT NOTHING ELSE CAN CATCH.  The compiler never sees this script and this
-    script never sees the DLL, so a half-finished edit leaves an offline report that describes a
-    stroke the game is not drawing - and every conclusion drawn from it is then wrong about the
-    right thing.  That is why every mode runs this first and refuses to report on a mismatch.
-    🆕 T30 makes it STRICTLY STRONGER than the AXIS/ARC2 mirror it replaces: there is no second
-    hand-copy of the numbers any more.  This side is derived from the ASSET by bake_table(), the
-    same function that printed the .cpp's side, so the only way to fail is for the .cpp to have been
-    hand-edited, generated from another clip/form/tempo, or for the asset itself to have changed.
-    On a mismatch the other five (form, tempo) combinations are tried and any exact match is NAMED,
-    so 'the .cpp is a --map lead bake' arrives as a fact instead of a guess."""
+
+def check_mirror(bones=None, cpp=None):
+    """Validate the active vanilla-clip route; diagnose retired authored-arm drift.
+
+    The shipping gate only checks facts the live route depends on: authored-arm must
+    remain disabled and the five literal attack records must remain selected in order.
+    The rigid arc, old timing and baked tables stay reproducible diagnostics, but drift
+    there cannot fail a build that never calls those writers.
+    """
     if cpp is None:
         cpp = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'RidingPlugin.cpp')
     if not os.path.isfile(cpp):
         print('MIRROR: no RidingPlugin.cpp at %s' % cpp)
         return 2
     src = io.open(cpp, encoding='utf-8', errors='replace').read()
-    bad = []
+    fatal = []
+    retired = []
+    cpp_arc, cpp_axis, arc_bad = cpp_rigid_arc(src)
+    retired.extend(arc_bad)
+    if cpp_axis is not None:
+        for label, mine, theirs in zip(('ax', 'ay', 'az'), AXIS_SKEL, cpp_axis):
+            if abs(mine - theirs) > MIRROR_TOL:
+                retired.append('RideSwingRigidArc %s: this file %.6f vs .cpp %.6f'
+                               % (label, mine, theirs))
+    if cpp_arc:
+        if len(cpp_arc) != len(ARC2):
+            retired.append('RideSwingRigidArc has %d keys, this file has %d'
+                           % (len(cpp_arc), len(ARC2)))
+        else:
+            for i, (mine, theirs) in enumerate(zip(ARC2, cpp_arc)):
+                if max(abs(mine[j] - theirs[j]) for j in range(2)) > MIRROR_TOL:
+                    retired.append('RideSwingRigidArc key %d: this file (%.4f, %.4f) vs .cpp (%.4f, %.4f)'
+                                   % (i, mine[0], mine[1], theirs[0], theirs[1]))
+
+    m = re.search(r'kRideAtkAnim\s*\[\s*kRideAtkAnimCount\s*\]\s*=\s*\{(.*?)\};',
+                  src, re.S)
+    attacks = re.findall(r'"([^"]+)"', m.group(1)) if m else []
+    if tuple(attacks) != SHIPPING_ATTACKS:
+        fatal.append('shipping attack list: expected %r, found %r'
+                     % (SHIPPING_ATTACKS, tuple(attacks)))
+    if not re.search(r'bool\s+swingFree\s*=\s*false\s*;', src):
+        fatal.append('could not prove the authored-arm mask is disabled (swingFree=false)')
 
     def one(name):
         m = re.search(r'kRideSwing%s\s*=\s*(-?[0-9.]+)f?\s*;' % name, src)
@@ -1307,15 +1348,15 @@ def check_mirror(bones=None, cpp=None):
     for nm, mine in (('ArcMs', ARC_MS), ('WinMs', WIN_MS)):
         v = one(nm)
         if v is None:
-            bad.append('could not parse kRideSwing%s' % nm)
+            retired.append('could not parse kRideSwing%s' % nm)
         elif int(v) != mine:
-            bad.append('%s: this file %d vs .cpp %d' % (nm, mine, int(v)))
+            retired.append('%s: this file %d vs .cpp %d' % (nm, mine, int(v)))
 
     theirs = {}
     for tag in ('Up', 'Fo', 'Hand'):
         rows, _keys, cb = cpp_bake_table(src, tag)
         theirs[tag] = rows
-        bad.extend(cb)
+        retired.extend(cb)
 
     if not os.path.isfile(HUMAN):
         print('MIRROR: no skeleton at %s - the tables cannot be re-baked, so nothing below can be'
@@ -1362,34 +1403,34 @@ def check_mirror(bones=None, cpp=None):
 
     mine = rebake(BAKE_FORM, BAKE_MAP)
     rowdiff = diff(mine) if all(theirs.values()) else []
-    bad.extend(rowdiff[:12])
+    retired.extend(rowdiff[:12])
     if len(rowdiff) > 12:
-        bad.append('... and %d more row(s)' % (len(rowdiff) - 12))
+        retired.append('... and %d more row(s)' % (len(rowdiff) - 12))
     if rowdiff:
         for f in ('delta', 'absolute'):
             for mp in ('native', 'lead', 'stretch'):
                 if (f, mp) != (BAKE_FORM, BAKE_MAP) and not diff(rebake(f, mp)):
-                    bad.append('BUT the .cpp matches form=%s tempo=%s EXACTLY => the .cpp is that'
-                               ' bake and BAKE_FORM/BAKE_MAP here are stale, not the tables' % (f, mp))
+                    retired.append('BUT the .cpp matches form=%s tempo=%s EXACTLY => the .cpp is that'
+                                   ' bake and BAKE_FORM/BAKE_MAP here are stale, not the tables' % (f, mp))
 
-    if bad:
-        # ASCII only in this function's own output: it must be printable on a cp936 console even
-        # when nobody has called main()'s reconfigure() - a checker that dies while reporting a
-        # failure is worse than no checker.
-        print('MIRROR FAIL - the offline model and the DLL DISAGREE:')
-        for b in bad:
+    if fatal:
+        print('MIRROR FAIL - the active vanilla-clip route disagrees with this checker:')
+        for b in fatal:
             print('    %s' % b)
-        print('  -> fix before trusting anything below, and before rebuilding: an offline report')
-        print('     that describes a different stroke than the game draws is worse than none.')
-        print('  -> the tables are GENERATED.  Do not hand-patch a row to silence this; re-run')
-        print('     `python tools\\armarc.py --bake "%s"%s` and paste both tables again.'
-              % (BAKE_CLIP, '' if BAKE_MAP == 'native' else ' --map ' + BAKE_MAP))
         return 1
-    print('MIRROR OK - %r re-baked from %s and diffed value by value (tol %g):'
+    print('MIRROR OK - active route: authored arm disabled; vanilla attack order matches (%d clips).'
+          % len(attacks))
+    if retired:
+        print('MIRROR WARN - retired authored-arm diagnostics drifted (shipping gate unaffected):')
+        for b in retired:
+            print('    %s' % b)
+        return 0
+    print('MIRROR RETIRED-DIAGNOSTIC OK - rigid arc plus %r re-baked from %s (tol %g):'
           % (BAKE_CLIP, os.path.basename(HUMAN), MIRROR_TOL))
-    print('    kRideSwingBakeUp/Fo/Hand %d/%d/%d rows, form=%s tempo=%s; ArcMs=%d WinMs=%d'
-          % (len(theirs['Up']), len(theirs['Fo']), len(theirs['Hand']),
-             BAKE_FORM, BAKE_MAP, ARC_MS, WIN_MS))
+    print('    RideSwingRigidArc axis=(%.4f, %.4f, %.4f), %d keys; ArcMs=%d WinMs=%d'
+          % (cpp_axis[0], cpp_axis[1], cpp_axis[2], len(cpp_arc), ARC_MS, WIN_MS))
+    print('    kRideSwingBakeUp/Fo/Hand %d/%d/%d rows, form=%s tempo=%s'
+          % (len(theirs['Up']), len(theirs['Fo']), len(theirs['Hand']), BAKE_FORM, BAKE_MAP))
     return 0
 
 
@@ -1410,14 +1451,9 @@ def main(argv):
         if n not in bones:
             print('missing bone %r - the arm chain is not what T25 assumes' % n)
             return 2
-    # Every other mode reports numbers that are supposed to describe the stroke the DLL draws, so the
-    # mirror is checked FIRST and a mismatch is fatal: a report that silently describes a different
-    # stroke is the one failure mode this file cannot survive.  ⚠️ `--mirror` alone is the standalone
-    # form; here the parsed skeleton is handed over so the 8 MB walk happens once.
-    # EXCEPT: `--bake <explicit clip>` is the ONE mode whose output is meant to REPLACE the tables the
-    # mirror just failed on (its own FAIL message says "re-run --bake <clip> and paste again") - so a
-    # mismatch must not block it, or the fix is impossible to generate.  The default clip (no
-    # argument) is still behind the mirror: that is the re-report path, and it must stay fatal.
+    # Validate the live route first; retired diagnostics may warn but do not block any mode.
+    # `--bake <explicit clip>` remains useful for regenerating old tables even if the active gate
+    # fails, because it is a repair command rather than a report about the shipping path.
     explicit_bake = '--bake' in argv and (argv.index('--bake') + 1 < len(argv)
                                           and not argv[argv.index('--bake') + 1].startswith('--'))
     rc = check_mirror(bones)
@@ -1492,7 +1528,7 @@ def main(argv):
         ref = tuple(float(c) for c in argv[i + 1:i + 4])
         lab = 'given on the command line'
     print('')
-    print('the authored arc (kRideSwingArc, T28 rotation model), 17 samples')
+    print('the retained authored rigid arc (RideSwingRigidArc), 17 samples')
     print('  axis  out=%.2f fore=%.2f down=%.2f   (skeleton %.4f,%.4f,%.4f, unit)'
           % (AXIS + AXIS_SKEL))
     print('  ref   out=%.2f fore=%.2f down=%.2f   r=%.3f   <- %s' % (ref + (vlen(ref), lab)))
@@ -1545,9 +1581,9 @@ def main(argv):
     vert, lat = abs(ht[2] - hc[2]), abs(ht[0] - hc[0])
     print('  cock->through travel: vertical %.2f  lateral %.2f  forward %.2f => vert/lat %.2f'
           % (vert, lat, abs(ht[1] - hc[1]), vert / lat if lat else float('inf')))
-    print('  ⚠️ vert/lat IS the difference between a chop and a sideways spread (T28 shipped 0.83 and the')
-    print('  verdict named it: 「侧面张开大臂带动刀」).  It is set by WHERE on the circle the window sits,')
-    print('  not by the amplitude - the circle itself only moves if the AXIS does.')
+    print('  ⚠️ vert/lat is the offline plane check: a large value means fore/down travel dominates')
+    print('  instead of a sideways spread.  It is set by the rotation axis; this live arc uses the')
+    print('  rider\'s lateral/out normal.')
     print('  the cut lands %.0f ms into the window of %d ms (through reaches its extreme at t=%.2f)'
           % (hi[0] * ARC_MS, WIN_MS, hi[0]))
     print('')

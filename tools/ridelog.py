@@ -33,6 +33,14 @@ KV = re.compile(r"([A-Za-z][A-Za-z0-9_]*)=('[^']*'|\([^)]*\)|[^\s]+)")
 # '...' and hands back only the pre-name, so the pair needs its own pattern.
 RD_SH = re.compile(r"sh='([^']*)'->'([^']*)'")
 
+VANILLA_ATTACKS = (
+    "chop down static",
+    "mid blow",
+    "mid blow light",
+    "mid blow drop",
+    "back blow high",
+)
+
 
 def kv(line):
     return dict(KV.findall(line))
@@ -187,6 +195,22 @@ def is_t27(s):
     """
     for d in s.sw_close:
         if "hostkeep" in d:
+            return True
+    return False
+
+
+def is_vanilla_attack_route(s):
+    """True only for the five-slot rider-local vanilla-host log shape.
+
+    `hostkeep=` alone also exists on the retired guard-host/authored-arm route.  The
+    current route is identified by both the five `atk=` markers and a `pin='<clip>'`
+    field naming one of the fixed attack records.  Never infer it from a DLL size or
+    trip label.
+    """
+    if s.k_attacks is None or len(s.k_attacks) != len(VANILLA_ATTACKS):
+        return False
+    for d in s.sw_open + s.sw_close:
+        if (d.get("pin") or "").strip("'") in VANILLA_ATTACKS:
             return True
     return False
 
@@ -397,10 +421,10 @@ class Session(object):
         self.sw_close = []       # "P43SW close n= guardoff= tech= skip= fail="
         # P4-6, the swing's HIT RESOLUTION (DLL 333312 B and later, UNGATED with
         # its own line budget - the P43RD discipline again: it changes game
-        # state).  At most one line per window: "P43ST rider=... n= ret= dmg=a/b/c
+        # state).  At most one line per window: "P43ST rider=... n= ret= dmg=cut/blunt/pierce/bleed
         # tech='..' f=" for a real dispatch (ret= is the engine's own
         # HitMaterialType answer, 0 = HIT_MISSED = the enemy DODGED, which is
-        # the feature), "P43ST n= skip tgt=down|none f=" for a refusal before
+        # the feature), "P43ST rider=... n=... skip=down|moved|range|height|sector f="
         # the call.  Reconciled window-by-window against the close line's hit=.
         self.st_lines = []       # dicts of "P43ST ..." lines (_kind: hit/skip)
         self.sw_legacy = 0       # lines that look like the trip-10 window instead
@@ -417,7 +441,8 @@ class Session(object):
         # be judged at all.  Two strings, not a kv() dict: both values are "found" or
         # "ABSENT" under repeated key-less positions.
         self.k_guard = None      # "found" / "ABSENT" / None (line never printed)
-        self.k_blow  = None      # ditto for 'mid blow', which T27 only RESOLVES
+        self.k_blow  = None      # ditto for 'mid blow'
+        self.k_attacks = None    # current route's five atk= availability markers
 
         # P4-3 step 2's THIRD probe (DLL 309760 B and later): who takes the hand
         # slot away AFTER attachItem put the weapon there.  Trip 11 closed the
@@ -699,7 +724,7 @@ def parse(path, s):
             if "Riding: P43SW " in line:
                 d = kv(line)
                 d["_ts"] = ts(line)
-                # ⚠️ SHAPE, not keyword: trip 10's deleted window also printed
+                d["_line"] = lines
                 # "P43SW open" and "P43SW close".  Its lines carry two clips'
                 # fields separated by " | guard " and have no tech= / guardoff=;
                 # kv() would silently hand back the guard's numbers for the blow's
@@ -716,17 +741,19 @@ def parse(path, s):
                 elif "P43SW open" in line and "tech" in d:
                     s.sw_open.append(d)
                 elif "P43SW close" in line and ("guardoff" in d or "hostkeep" in d):
+                    d["_line"] = lines
                     s.sw_close.append(d)
                 else:
                     s.sw_legacy += 1
                 continue
             # P4-6: the hit resolution line.  Ungated, its own budget, at most
             # one per window.  Shape tells the two kinds apart - the dispatch
-            # row carries ret=/dmg=, the refusal row carries skip tgt=.
+            # row carries ret=/dmg=, the refusal row carries skip=<reason>.
             if "Riding: P43ST " in line:
                 d = kv(line)
                 d["_ts"] = ts(line)
                 d["_kind"] = "hit" if "ret" in d else "skip"
+                d["_line"] = lines
                 s.st_lines.append(d)
                 continue
             # T23: the two bone tables of the complementary split, printed once per
@@ -772,6 +799,9 @@ def parse(path, s):
                               line)
                 if m:
                     s.k_guard, s.k_blow = m.group(1), m.group(2)
+                am = re.search(r"atk=\[([^]]*)\]", line)
+                if am:
+                    s.k_attacks = re.findall(r"'([^']*)'", am.group(1))
                 continue
 
             if "Riding: P43FT ride" in line:
@@ -4008,16 +4038,15 @@ def report_swing_look(s):
     if not (s.sw_rides or s.sw_close):
         print("  no P4-3-4 P43SW row at all - nothing to judge (see T20 above).")
         return
+    if is_vanilla_attack_route(s):
+        print("  RETIRED for this build: restart/speed are judged on the rider-local vanilla")
+        print("  attack host in -- Current mounted attack host -- below.  Here rst == swing is")
+        print("  required because each transaction makes one serial-latched restart decision.")
+        return
     if is_t27(s):
-        print("  RETIRED for this build (close rows carry hostkeep=): the window no"
-              " longer swaps a")
-        print("  one-shot onto the body, so there is no clip to restart, no speed to"
-              " impose and no")
-        print("  progress to close on.  rst=0 is the EXPECTED value here, not a"
-              " miss - the window's")
-        print("  length is kRideSwingWinMs and the stroke's own completion is armt="
-              " in -- T25/T26 --.")
-        print("  Judge this build in -- T27 -- below.")
+        print("  RETIRED for this guard-host build (close rows carry hostkeep= but no vanilla")
+        print("  attack pin): the window does not swap a one-shot onto the body, so rst=0 is")
+        print("  expected.  Judge its authored stroke in the later T25-T30 sections.")
         return
     has_t21 = any("rst" in d for d in s.sw_rides) or \
               any("pinst" in d for d in s.sw_close)
@@ -4253,6 +4282,12 @@ def report_swing_drive(s):
     if not (has_a or has_b):
         print("  P43SW rows carry neither hdveto= nor drv=: this log predates the")
         print("  veto and the state drive.  NOT a failure.")
+        return
+
+    if is_vanilla_attack_route(s):
+        print("  RETIRED for the current vanilla-attack route.  The rider faces the mount's")
+        print("  forward heading and no technique state is driven; judge the selected attack")
+        print("  host, transaction restart and retired drive fields in the current-route section.")
         return
 
     # ---- A) the heading veto ------------------------------------------------
@@ -5335,7 +5370,7 @@ def report_swing_aim(s):
 def report_swing_hit(s):
     """P4-6 - the swing's hit resolution: did the engine take our one stroke?
 
-    One dispatch per window at kRideSwingHitMs (552 ms, the native 'chop down static' through pose):
+    One dispatch per window at kRideSwingHitMs (450 ms):
     threat->_NV_hitByMeleeAttack(CUT_DEFAULT, dmg, rider, tech, 0).  The engine
     owns the whole verdict - ret= is its own HitMaterialType answer, and
     HIT_MISSED (0) is the DODGE, which is the feature (the user asked for the
@@ -5346,7 +5381,7 @@ def report_swing_hit(s):
       * ret=0-distribution is NOT a criterion.  A ride of all-misses with the
         enemy alive and swinging is a WORKING dodge, not a failure; the only
         self-proving field here is that the LINE EXISTS for a window that had
-        a live target at 1050 ms.
+        a live target at 450 ms.
       * hit= on the close row is per-window (1 hit / 0 dodge / -1 attempted
         but unresolved / -2-ended-before-the-tick).  A close row with hit=
         missing entirely predates this build - like every "predates" shape,
@@ -5372,49 +5407,71 @@ def report_swing_hit(s):
                 d.get("_ts", "?"), d.get("n", "-"), d.get("ret", "-"),
                 d.get("dmg", "-"), d.get("tech", "?").strip("'")[:24]))
         else:
-            print("    %8s  n=%-3s skip tgt=%s" % (
-                d.get("_ts", "?"), d.get("n", "-"), d.get("tgt", "?")))
+            print("    %8s  n=%-3s skip=%s" % (
+                d.get("_ts", "?"), d.get("n", "-"), d.get("skip", "?")))
     if len(hits) + len(skips) > 12:
         print("    ... (%d more)" % (len(hits) + len(skips) - 12))
-    # Window-by-window reconciliation: every close row with hit= should be
-    # 1/0 when a P43ST dispatch row exists for the same rider and n, -1/-2
-    # otherwise.  The rider key was added when the runtime became per-rider;
-    # fall back to n alone for older single-rider logs.
+    # Window-by-window reconciliation.  Identity-bearing logs never fall back to a
+    # global n: two riders each start at n=1.  Riderless fallback exists only for a
+    # wholly old single-rider shape.  Missing P43ST after a rider has spent its 24-row
+    # budget is NOT MEASURED, not an inferred skip.
     closes = [d for d in s.sw_close if "hit" in d]
     if closes:
+        identity_log = any(d.get("rider") for d in closes + s.st_lines)
+        riders = set(d.get("rider") for d in closes + s.st_lines if d.get("rider"))
+        legacy_fallback = not identity_log and len(riders) <= 1
         st_by_window = {}
+        st_count_by_rider = {}
         for d in s.st_lines:
             n = int(fnum(d, "n", -1))
-            key = (d.get("rider"), n) if d.get("rider") else (None, n)
-            st_by_window.setdefault(key, []).append(d)
+            rider = d.get("rider")
+            st_by_window.setdefault((rider, n), []).append(d)
+            st_count_by_rider[rider] = st_count_by_rider.get(rider, 0) + 1
+        opens_by_window = {}
+        for d in s.sw_open:
+            n = int(fnum(d, "n", -1))
+            opens_by_window.setdefault((d.get("rider"), n), []).append(d)
         mismatch = 0
+        measured = 0
+        not_measured = 0
         for d in closes:
             n = int(fnum(d, "n", -1))
             hitv = int(fnum(d, "hit", -2))
             rider = d.get("rider")
-            if rider:
-                row = st_by_window.get((rider, n), [])
-            else:
-                row = st_by_window.get((None, n), [])
-                if not row:
-                    # Old logs have no identity field, so allow the historical
-                    # global-n lookup only when the close itself is also old.
-                    row = [x for (key, wn), values in st_by_window.items()
-                           if wn == n for x in values]
-            # A skipped resolution is a deliberate refusal: the target may be down,
-            # out of range/sector, moved, or otherwise rejected before the engine call.
-            # All P43ST skip rows close with hit=-1 because no engine verdict exists.
-            skipped = bool(row) and row[-1].get("_kind") == "skip"
-            if (hitv in (0, 1)) != bool(row) and not (skipped and hitv == -1):
+            close_line = d.get("_line", 0)
+            opens = [x for x in opens_by_window.get((rider, n), [])
+                     if x.get("_line", 0) < close_line]
+            open_line = opens[-1].get("_line", 0) if opens else 0
+            row = [x for x in st_by_window.get((rider, n), [])
+                   if open_line < x.get("_line", 0) < close_line]
+            if not row and legacy_fallback:
+                row = [x for (key, wn), values in st_by_window.items()
+                       if wn == n for x in values
+                       if open_line < x.get("_line", 0) < close_line]
+            expected = None
+            if row:
+                last = row[-1]
+                if last.get("_kind") == "skip":
+                    expected = -1
+                else:
+                    r = int(fnum(last, "ret", -1))
+                    expected = 1 if r > 0 else (0 if r >= 0 else None)
+            if expected is None:
+                not_measured += 1
+                continue
+            measured += 1
+            if hitv != expected:
                 mismatch += 1
-            elif row and hitv in (0, 1):
-                r = int(fnum(row[-1], "ret", -1))
-                if (hitv == 1) != (r > 0) and r >= 0:
-                    mismatch += 1
+        detail = "%d measured agree; %d NOT MEASURED" % (measured - mismatch,
+                                                          not_measured)
+        if mismatch:
+            detail = "%d measured disagree; %s" % (mismatch, detail)
         print("  close rows with hit=: %d   reconciliation vs P43ST: %s" % (
-            len(closes),
-            verdict(mismatch == 0, "%d window(s) disagree" % mismatch
-                    if mismatch else "all agree")))
+            len(closes), verdict(mismatch == 0, detail)))
+        exhausted = [r for r, count in st_count_by_rider.items() if count >= 24]
+        if exhausted:
+            print("  NOTE  P43ST budget reached for %d rider(s); their unlogged tail is NOT MEASURED."
+                  % len(exhausted))
     else:
         print("  NOTE  no close row carries hit= (windows closed before the tick,"
               " or a log")
@@ -5428,343 +5485,132 @@ def report_swing_hit(s):
 
 
 def report_swing_host(s):
-    """T27 - the window KEEPS its host: does holding 'guard 1h' through the stroke work?
-
-    ⛔ WHY THIS SECTION EXISTS.  Trip 24 (T26's aimed arc) got the eyeball to
-    「有点劈砍的意思了」 and named what was left: 「角色的右手总是想找左手因为原版就是
-    双手劈砍的，所以把动作带崩了」.  The mechanism is one step off that reading - the right
-    HAND's position is already ours (dot= mean 0.9920 over 36 samples) so no clip is
-    pulling that hand - but the conclusion holds.  What the swapped-in 'mid blow' still
-    owned was everything the arc does NOT: the LEFT arm, the right WRIST and the SPINE.
-    It is one of the six `blow` records, all 'whole,action,norm,reloc,restrict' =
-    two-handed committed strike (doc.md :245), so its left-arm track kept reaching across
-    for a grip our arc had already carried away.
-
-    ✅ T27 therefore stops swapping the host at all: 'guard 1h' (UPPER, LOOP,
-    weaponTypeFlags bit 0x04 = ONE-HANDED, no whole/reloc - doc.md :248) stays pinned
-    straight through the window and the authored arc cuts on top of it.  Three things
-    come free - no root motion inside the window, a wrist that keeps a one-handed
-    attitude for the whole stroke, and a window length that is our own arc's rather than
-    a restatement of 'mid blow's.
-
-    WHAT THAT RETIRES, and this section states it so nothing reads a design decision as
-    a regression: rst= (nothing to restart), sp= (a loop's speed is meaningless), prog=
-    as a close test (a LOOP's progress cycles), and §U's ClipPin-door dodge (the door is
-    `target + others <= 1.02f` and after this change only ONE clip ever asks for 1.0).
-
-    WHAT IT PUTS AT RISK, which is what the checks below are: the guard has to survive
-    being held for 1650 ms with our writes on two of its bones (pinst=/pw=/psw=/oen=),
-    the window has to close on OUR clock (ms= ~ kRideSwingWinMs), and the retired
-    assertion sites have to stay retired (rst=/drv=/hold=/fit= all 0).
-    """
+    """Current route: guard between windows, rider-local vanilla attack inside."""
     print("")
-    print("== T27 - the window keeps its host ('guard 1h' straight through) ==")
+    print("== Current mounted attack host (guard between windows, vanilla attack inside) ==")
     if not (s.sw_rides or s.sw_close):
         print("  no P43SW row at all - nothing to judge (see T20 above).")
         return
-    if not is_t27(s):
-        print("  close rows carry guardoff=, not hostkeep=: this log is from a build whose")
-        print("  window still SWAPPED 'mid blow' onto the body.  NOT a failure - T20/T21"
-              " above")
-        print("  are its verdicts.  ⚠️ Passing those is not passing this: they judge the swap")
-        print("  this rung deletes.")
+    if not is_vanilla_attack_route(s):
+        if is_t27(s):
+            print("  close rows use hostkeep= but no five-slot vanilla attack pin was logged:")
+            print("  this is the retired guard-host/authored-arm family.  Judge T25-T30 instead.")
+        else:
+            print("  this log predates the five-slot rider-local vanilla-host route.")
         return
 
-    # ---- 1) the host guarantee, at its strongest ---------------------------
-    # The guard is resolved once per DLL load on the stance's first frame.  On T20..T26
-    # this line was background; here it is the precondition for the whole rung, because
-    # the clip it names is the body's host for every frame of every window.
+    # ---- 1) all rider-local records exist ------------------------------------
     if s.k_guard is None:
-        print("  CHECK no `P41K resolve` line in this log at all.  It is UNGATED and prints"
-              " on the")
-        print("        stance's first frame, so its absence means the stance never armed"
-              " - read")
-        print("        -- T18 -- and stop here; nothing below is judgeable.")
+        print("  CHECK no `P41K resolve` line: clip availability is NOT MEASURED.")
     else:
         print("  " + verdict(s.k_guard == "found",
-                             "'guard 1h' resolved in the rider's own table (guard=%s)"
-                             % s.k_guard))
-        if s.k_guard != "found":
-            print("        gP41kGuard is NULL, so RideSwingPass's `if (!host)` gate refuses"
-                  " EVERY window")
-            print("        (noclip= in T20 counts them) and the stance has no host either."
-                  "  This is not")
-            print("        a swing bug - FindAnimData could not find the clip in this rider's"
-                  " table.")
-        if s.k_blow is not None:
-            print("  NOTE  blow='mid blow' %s.  T27 only RESOLVES it - nothing requests it any"
-                  % s.k_blow)
-            print("        more.  The line is kept as standing evidence that the rider's table"
-                  " really")
-            print("        does hold a swing record, which is what makes the retreat in §17.18"
-                  " possible.")
+                             "'guard 1h' resolved for the between-window stance"))
+        missing = [i for i, v in enumerate(s.k_attacks or ()) if v != "ok"]
+        print("  " + verdict(not missing,
+                             "all five rider-local vanilla attack records resolved"
+                             if not missing else "missing slots: %s" %
+                             ", ".join(str(i + 1) for i in missing)))
 
-    # ---- 2) did the host survive being held through the stroke -------------
-    # ⚠️ THE FIELDS ARE THE SAME ONES T21 READ AND THEY DESCRIBE A DIFFERENT CLIP.
-    # RideSwingProbePin is handed `host`, which was gP41kBlow up to T26 and is gP41kGuard
-    # now, so pinst=/pw=/psw=/oen= on a T27 close row are the GUARD's.  pw is the
-    # SingleAnimation weight, oen the Ogre state's enabled flag: both at the close edge,
-    # i.e. after the whole window has run with our two bones written every frame.
-    closes = [d for d in s.sw_close if "pinst" in d]
-    if closes:
-        st = [(d.get("_ts", "?"), (d.get("pinst") or "?")) for d in closes]
-        dead = [t for t, v in st if v != "live"]
-        print("  " + verdict(not dead,
-                             "the guard's entry was still live at every close (%d/%d)"
-                             % (len(closes) - len(dead), len(closes))))
-        if dead:
-            print("        pinst=none/AV at %s.  none = the guard is no longer in the"
-                  " playing list, which" % ", ".join(dead[:6]))
-            print("        is trip 17's hostless skeleton with a new cause (T27 never"
-                  " withholds it, so")
-            print("        something else dropped it); AV = the layer walk hit a dangling"
-                  " list.")
-        pws = [v for v in (fnum(d, "pw") for d in closes) if v is not None]
-        if pws:
-            print("  " + verdict(min(pws) >= 0.95,
-                                 "the guard kept its render weight through the window"
-                                 " (worst pw=%.3f of %d)" % (min(pws), len(pws))))
-            if min(pws) < 0.95:
-                print("        The guard is pinned to 1.0 at BOTH sites every frame, so a"
-                      " sagging pw means")
-                print("        something is draining it while the window is open."
-                      "  ClipPin's door")
-                print("        (`target + others <= 1.02f`) is the first suspect, and on T27"
-                      " it should be")
-                print("        the LEAST likely it has ever been: only one clip asks for 1.0"
-                      " now.  Read the")
-                print("        P41K weight rows for that timestamp before touching the door"
-                      " (⛔ TASK.md")
-                print("        :326-334 says the door is not to be rewritten).")
-        sw = [d.get("psw") for d in closes]
-        oe = [d.get("oen") for d in closes]
-        badsw = [x for x in sw if x is not None and x != "1"]
-        badoe = [x for x in oe if x is not None and x != "1"]
-        if any(x is not None for x in sw) or any(x is not None for x in oe):
-            print("  " + verdict(not badsw and not badoe,
-                                 "stillWanted and the Ogre state stayed on (psw!=1: %d,"
-                                 " oen!=1: %d)" % (len(badsw), len(badoe))))
-            if badsw or badoe:
-                print("        psw=0 means our per-frame request stopped reaching the entry;"
-                      " oen=0 means the")
-                print("        entry is there but its Ogre state is disabled, so the pose"
-                      " is not being")
-                print("        applied at all.  Either one makes every 'kept=1.0000' above"
-                      " a write onto a")
-                print("        body nobody is drawing.")
-        # The pair that answers "does holding the host cost the stance anything": pw on the
-        # OPEN row is sampled at the open decision, pw on the close row after 1650 ms of
-        # window.  ⚠️ pre pinst=live is the EXPECTED shape here and it was NOT on T21 -
-        # there the probe looked at a one-shot whose entry did not exist yet (pinst=none
-        # 14/14).  Here it looks at a clip that has been playing since the stance began.
-        opens = [d for d in s.sw_open if "pinst" in d]
-        if opens:
-            pre_dead = [d.get("_ts", "?") for d in opens
-                        if (d.get("pinst") or "?") != "live"]
-            print("  " + verdict(not pre_dead,
-                                 "the guard was ALREADY playing at every open decision"
-                                 " (%d/%d live)"
-                                 % (len(opens) - len(pre_dead), len(opens))))
-            if pre_dead:
-                print("        pre pinst=none at %s: the stance's own host was not in the"
-                      " playing list when" % ", ".join(pre_dead[:6]))
-                print("        the window opened.  On T21 that reading was ROUTINE (the"
-                      " one-shot's entry was")
-                print("        built a frame later); on T27 it is news, because the guard"
-                      " is supposed to have")
-                print("        been pinned since the stance's first frame.")
-            po = [v for v in (fnum(d, "pw") for d in opens) if v is not None]
-            if po and pws:
-                print("  guard weight: open worst %.3f -> close worst %.3f  (held for the"
-                      " whole window)" % (min(po), min(pws)))
+    # ---- 2) each rider independently cycles the five fixed slots -------------
+    opens = [d for d in s.sw_open
+             if (d.get("pin") or "").strip("'") in VANILLA_ATTACKS]
+    by_rider = {}
+    for d in opens:
+        by_rider.setdefault(d.get("rider") or "<legacy>", []).append(d)
+    order_bad = []
+    for rider, rows in by_rider.items():
+        names = [(d.get("pin") or "").strip("'") for d in rows]
+        for i, name in enumerate(names):
+            expected = VANILLA_ATTACKS[i % len(VANILLA_ATTACKS)]
+            if name != expected:
+                order_bad.append((rider, i + 1, expected, name))
+                break
+    print("  " + verdict(bool(opens) and not order_bad,
+                         "%d open row(s), %d rider(s): independent five-slot order"
+                         % (len(opens), len(by_rider))))
+    if not opens:
+        print("        no budgeted open row names a vanilla attack: NOT MEASURED.")
+    for rider, n, expected, got in order_bad[:8]:
+        print("        rider=%s open#%d expected '%s', got '%s'" %
+              (rider, n, expected, got))
 
-    # ---- 3) the window closed on OUR clock ---------------------------------
-    # kRideSwingArcMs 1400 < kRideSwingWinMs 1650 < kRideSwingLenMs 3000 (cap) <
-    # kRideSwingMinGapMs 3200.  ms= below 1650 is structurally impossible (the close edge
-    # only fires once `now - openTick >= kRideSwingWinMs`), and ms= at the 3000 cap means
-    # the CAP closed the window - which after T27 can only happen if an open tick outlived
-    # a per-ride reset, not because a clip ran long.
-    WIN, CAP = 1650, 3000
-    mss = [(d.get("_ts", "?"), v) for d in s.sw_close
-           for v in (fnum(d, "ms"),) if v is not None]
+    # ---- 3) close must retain the exact host latched at open -----------------
+    open_by_window = {}
+    for d in opens:
+        key = (d.get("rider") or "<legacy>", int(fnum(d, "n", -1)))
+        open_by_window.setdefault(key, []).append(d)
+    close_rows = [d for d in s.sw_close if "pinst" in d]
+    pin_bad, pin_measured = [], 0
+    for d in close_rows:
+        key = (d.get("rider") or "<legacy>", int(fnum(d, "n", -1)))
+        prior = [x for x in open_by_window.get(key, [])
+                 if x.get("_line", 0) < d.get("_line", 0)]
+        if not prior or "pin" not in d:
+            continue
+        pin_measured += 1
+        opened = (prior[-1].get("pin") or "").strip("'")
+        closed = (d.get("pin") or "").strip("'")
+        if opened != closed:
+            pin_bad.append((key[0], key[1], opened, closed))
+    print("  " + verdict(not pin_bad,
+                         "open/close retained the same attack host (%d measured)"
+                         % pin_measured))
+    if not pin_measured:
+        print("        close pin= is absent or the line budget omitted its open: NOT MEASURED.")
+    for rider, n, opened, closed in pin_bad[:8]:
+        print("        rider=%s n=%d open='%s' close='%s'" %
+              (rider, n, opened, closed))
+
+    dead = [d for d in close_rows if (d.get("pinst") or "?") != "live"]
+    print("  " + verdict(not dead,
+                         "selected attack entry live at every measured close (%d/%d)"
+                         % (len(close_rows) - len(dead), len(close_rows))))
+    pws = [v for v in (fnum(d, "pw") for d in close_rows) if v is not None]
+    if pws:
+        print("  " + verdict(min(pws) >= 0.95,
+                             "attack render weight held (worst pw=%.3f)" % min(pws)))
+    bad_state = [d for d in close_rows
+                 if d.get("psw") not in (None, "1") or d.get("oen") not in (None, "1")]
+    print("  " + verdict(not bad_state,
+                         "stillWanted/Ogre enabled stayed on at every measured close"))
+
+    # ---- 4) current timing and serial restart --------------------------------
+    WIN, CAP = 700, 780
+    mss = [v for v in (fnum(d, "ms") for d in s.sw_close) if v is not None]
     if mss:
-        vals = [v for _, v in mss]
-        early = [(t, v) for t, v in mss if v < WIN - 1]
-        capped = [(t, v) for t, v in mss if v >= CAP - 60]
-        print("  window lengths: %s ms  (expected ~%d = kRideSwingWinMs; cap %d)"
-              % ("/".join("%d" % v for v in vals[:12]), WIN, CAP))
+        early = [v for v in mss if v < WIN - 1]
+        capped = [v for v in mss if v >= CAP - 60]
+        print("  window lengths: %s ms (target %d; hard cap %d)" %
+              ("/".join("%d" % v for v in mss[:12]), WIN, CAP))
         print("  " + verdict(not early and not capped,
-                             "every window closed on the arc's own clock (%d window(s))"
-                             % len(vals)))
-        if early:
-            print("        ms < %d at %s.  The close edge cannot fire before that by"
-                  " construction, so" % (WIN, ", ".join(t for t, _ in early[:6])))
-            print("        either kRideSwingWinMs was changed without changing this section,"
-                  " or the open")
-            print("        tick was rewritten mid-window (gRideSwingOpenTick is cleared by"
-                  " the per-ride")
-            print("        reset and by the rider-mismatch branch - both should also clear"
-                  " gRideSwingWasOpen).")
-        if capped:
-            print("        ms at the %d ms CAP at %s: kRideSwingLenMs closed the window,"
-                  " not kRideSwingWinMs." % (CAP, ", ".join(t for t, _ in capped[:6])))
-            print("        On T27 the cap is a pure safety net, so a hit means the window's"
-                  " own bound was")
-            print("        not applied - read the `open` computation, not the tuning.")
-        print("  NOTE  the ARC's completion is armt= in -- T25/T26 --, not ms=."
-              "  kRideSwingArcMs")
-        print("        (1400) finishes ~250 ms before the window does, and holds its last"
-              " key for the")
-        print("        remainder - that tail IS the settle pose, and it is why the two"
-              " numbers differ.")
-
-    # ---- 4) the retired assertion sites must STAY retired ------------------
-    # Four counters, four deleted call sites.  This is the check that catches the swap or
-    # the drive being reintroduced by a later edit - each one is a design decision of this
-    # rung, so a nonzero value is a code change, never a tuning artefact.
-    zero_bad = []
+                             "all measured windows closed on the 700 ms clock"))
+    bad_rst = []
     for d in s.sw_rides:
-        for k in ("rst", "drv"):
+        sw, rs = fnum(d, "swing"), fnum(d, "rst")
+        if sw is not None and rs is not None and int(sw) != int(rs):
+            bad_rst.append((d.get("_ts", "?"), int(sw), int(rs)))
+    print("  " + verdict(not bad_rst,
+                         "one serial-latched restart decision per transaction (rst == swing)"))
+    for t, sw, rs in bad_rst[:8]:
+        print("        %8s swing=%d rst=%d" % (t, sw, rs))
+
+    # ---- 5) retired writers stay retired -------------------------------------
+    retired_bad = []
+    for d in s.sw_rides:
+        for k in ("drv", "arm", "swfree"):
             v = fnum(d, k)
             if v is not None and v != 0:
-                zero_bad.append((d.get("_ts", "?"), k, v))
+                retired_bad.append((d.get("_ts", "?"), k, v))
     for d in s.sw_close:
         for k in ("hold", "fit"):
             v = fnum(d, k)
             if v is not None and v != 0:
-                zero_bad.append((d.get("_ts", "?"), k, v))
-    print("  " + verdict(not zero_bad,
-                         "the four retired sites are all silent (rst/drv/hold/fit = 0)"))
-    if zero_bad:
-        for t, k, v in zero_bad[:8]:
-            print("        %8s  %s=%g - that call site was REMOVED in this rung." % (t, k, v))
-        print("        rst= is RideSwingRestart (no one-shot to restart), drv=/hold=/fit="
-              " are T22's")
-        print("        drive of the technique's own Ogre state, its blend mask and T24's"
-              " phase fit.")
-        print("        ⚠️ Do not re-attach the drive to 'fix' a stiff swing: its mask frees"
-              " only eight")
-        print("        bones and would fight the authored arm.  The answer to 「太僵」 is the"
-              " spine")
-        print("        (P4-1M's twist is already ours, RidingPlugin.cpp:6295).")
-
-    # ---- 5) the three per-frame counters have to agree ---------------------
-    # hostkeep= is counted in HaltAndForceSitPass (render side), arm= and swfree= in
-    # LegPosePass, all three on every frame a window is in flight.  Trip 24 measured
-    # 636/635/635 - a one-frame offset from the open frame, before the leg pass runs.
-    # A real gap means one of the two passes is not running while the other thinks a
-    # window is open, which is a pass-order or rider-identity fault, not tuning.
-    rows = [d for d in s.sw_rides if (fnum(d, "swing", 0) or 0) > 0]
-    if rows:
-        bad_agree = []
-        for d in rows:
-            hk = hostkeep(d)
-            ar = fnum(d, "arm")
-            fr = fnum(d, "swfree")
-            if hk is None or ar is None:
-                continue
-            tol = max(8.0, 0.02 * hk)
-            if abs(hk - ar) > tol or (fr is not None and abs(hk - fr) > tol):
-                bad_agree.append((d.get("_ts", "?"), hk, ar, fr))
-        print("  " + verdict(not bad_agree,
-                             "hostkeep / arm / swfree agree on every ride that swung"
-                             " (%d ride(s))" % len(rows)))
-        if bad_agree:
-            for t, hk, ar, fr in bad_agree[:6]:
-                print("        %8s  hostkeep=%g arm=%g swfree=%s"
-                      % (t, hk, ar, "-" if fr is None else "%g" % fr))
-            print("        All three count frames INSIDE a live window, from two passes"
-                  " that both run")
-            print("        once per frame, so they can only diverge if one pass is not"
-                  " reached (an early")
-            print("        return above it) or the two disagree about WHICH rider is"
-                  " swinging")
-            print("        (gRideSwingWho).  arm << hostkeep in particular means the"
-                  " window held the host")
-            print("        for frames that authored nothing - which renders the freed bones"
-                  " at BIND (§17.9).")
-
-    # ---- 6) the aim, which is a LAG term and now has a bigger rate to lag behind ----
-    # want= cancels the parent through `conj(parentDerived)`, and that read is one frame
-    # stale (const _getDerivedOrientation, §21.5) ⇒ the deficit in dot= scales with how fast
-    # the whole arm is turning: the host's contribution (R Clavicle, 'guard 1h', a LOOP at
-    # 1.0) plus OUR OWN arc rate.  Trips 24→25→26 differenced the 9.6 deg residual by moving
-    # one thing at a time: host 0.6 deg, model 1.7 deg, remainder 7.3 = the stale read.
-    # 🆕 T29 RAISES THE ARC'S PEAK RATE ON PURPOSE, 341 → 461 deg/s (a real hold at the top
-    # buys a faster descent).  A lag term must loosen with that, by construction:
-    #   scaled expectation = 7.3 * 461/341 = 9.9 deg, and that is an UPPER bound because
-    #   part of the 7.3 is the host, which did not change ⇒ anything at or under 9.9 is the
-    #   same defect at a higher speed, NOT a regression.
-    # ⛔ AND NOT A REASON TO TOUCH THE ARC.  This number is the price of the tempo the trip
-    # is buying; retuning the table to flatter it would undo the change under test.  The only
-    # honest fix is a fresh parent read (§21.5), which is a different rung entirely.
-    # Baseline = trip 26 (BE962686, diagnostics OFF, same host, same model, the shape being
-    # replaced), SETTLED samples only: worst 0.9918 (7.3 deg), mean 0.9984, 98 samples.
-    if swing_aimed(s):
-        settled, first24, _unread = swing_dot_split(s)
-        vals = [v for _, v in settled]
-        if vals:
-            BASE_W, BASE_DEG = 0.9918, 7.3
-            BAR_DEG = 11.0          # 9.9 scaled + 1.1 slack; see the derivation above
-            worst = min(vals)
-            wdeg = math.degrees(math.acos(max(-1.0, min(1.0, worst))))
-            print("  aim vs a 1.35x faster arc: settled worst %.4f (%.1f deg), mean %.4f,"
-                  " %d sample(s)" % (worst, wdeg, sum(vals) / len(vals), len(vals)))
-            print("  " + verdict(wdeg <= BAR_DEG,
-                                 "within the rate-scaled bar %.1f deg (trip 26 was %.4f /"
-                                 " %.1f deg at 341 deg/s)" % (BAR_DEG, BASE_W, BASE_DEG)))
-            if wdeg <= BASE_DEG:
-                print("        ⇒ and it did not loosen AT ALL despite +35%% peak rate, which"
-                      " says the")
-                print("          residual is host/parent rather than ours by an even wider"
-                      " margin than")
-                print("          the trip 24→26 differencing showed.  Worth a line in §17.19.")
-            elif wdeg > BAR_DEG:
-                print("        Loosened by MORE than the rate scaling can explain ⇒ something"
-                      " other than")
-                print("          lag.  Check WITNESS 1 (r= flat) and kept= first: if either"
-                      " moved, the")
-                print("          rigid-body model is being fought, and the arc table is"
-                      " downstream of that.")
-                print("        ⛔ Do not answer this by softening the arc - that would retune"
-                      " away the")
-                print("          very tempo this trip is testing.")
-
-    # ---- 7) what only the eyeball can answer this trip ---------------------
-    print("  NOTE  the shape is STILL not in this file, and 🆕 T29 changed the ARC ITSELF (the")
-    print("        window slid up the same circle: -100/+45 → -130/+25, plus a hold at each")
-    print("        end).  Trip 26 already accepted the direction (「侧面张开大臂带动刀，简单美")
-    print("        观」) - what this trip asks is whether it now reads as a CHOP.  Outcomes:")
-    print("          1. it reads as a downward cut ⇒ P4-3-4 is DONE.  Close T29; what is left")
-    print("             is the release decision (does this build replace v1.6 in release\\).")
-    print("          2. STILL 「侧面」 ⇒ the endpoints are already vert/lat 2.17, so the")
-    print("             remaining sideways component is the circle's own mid-stroke bulge (out")
-    print("             reaches 5.21 between the two keys, +2.34 past either end) and NO arc")
-    print("             table can remove it.  That is the AXIS dial, and the measured fallback")
-    print("             is a sagittal axis (log ≈ out 1 / fore 0 / down 0), which holds out")
-    print("             constant at 1.41 for the whole stroke.  ⚠️ Both mirrors together.")
-    print("          3. 「太僵」 / the body does not join in ⇒ author the SPINE.  P4-1M's"
-          " twist")
-    print("             is already ours (RidingPlugin.cpp:6295) and 'Bip01 Spine' would"
-          " re-enter")
-    print("             BOTH tables together.  ⛔ NOT by bringing a ground record back:"
-          " that is the")
-    print("             wall trips 20/22/24 hit three different ways.")
-    print("          4. the raise is now too big / the blade clips the head ⇒ offline says it")
-    print("             does not (cock out 2.87 down -4.41 vs head base out -1.83 down -2.22),")
-    print("             so trust the eyeball over that and pull the cock key back toward -115.")
-    print("          5. the arm is right and the BLADE is wrong ⇒ bx=/bz= in -- T26 --"
-          " section 4,")
-    print("             and the wrist rule there ('Bip01 R Hand' into BOTH tables or"
-          " neither).")
-    print("  NOTE  the regressions that must hold alongside, each judged in its own section:")
-    print("        the four v1.6 behaviours (P43RD/P43SUP), the straddle (takeovers ==")
-    print("        restored + released, minDot=1.0000, residue=0, dropped=0), no standing")
-    print("        upright on the mount, no sudden turn to its rear (hdveto=), and zero AV.")
-    print("        ⚠️ AND THE ONE EYEBALL CHECK THAT OUTRANKS THE SHAPE: look at the right"
-          " arm")
-    print("        AFTER DISMOUNTING (-- T25/T26 -- section 6 is its log-side proof only).")
-
+                retired_bad.append((d.get("_ts", "?"), k, v))
+    print("  " + verdict(not retired_bad,
+                         "retired technique/authored-arm writers stayed zero"))
+    for t, k, v in retired_bad[:8]:
+        print("        %8s %s=%g" % (t, k, v))
+    print("  NOTE  rst= is a decision count, not proof that a restart helper succeeded.")
 
 def swing_arm_windows(s):
     """s.sw_arm split into windows: t only ever increases inside one.
@@ -5795,17 +5641,12 @@ def is_t28(s):
 
 
 def is_t30(s):
-    """T30 rows carry elbow= without deg=; T28/T29 carried deg=/cone= and no elbow=.
+    """T30 rows are identified by elbow=, regardless of legacy deg= coexistence.
 
-    Dispatch on the FIELD NAME, never on a trip number or a byte count - the same rule
-    is_t27() follows, and the reason is sharper here than anywhere else in this file: T28
-    needed the elbow FROZEN and T30 needs it to MOVE, so the two sections' criteria are each
-    other's negation.  Guessing the family from anything but the field is how a working build
-    gets failed by the previous rung's bar.
-    ⚠️ `elb=` is NOT this field.  T25's retired joint-angle line printed abd=/flx=/elb=, and
-    kv() keys those separately, so a T25 log cannot be mistaken for a T30 one.
+    Dispatch on the FIELD NAME, never on a trip number or byte count.  `elb=` is a
+    different T25 joint-angle key and cannot satisfy this test.
     """
-    return any("elbow" in d and "deg" not in d for d in s.sw_arm)
+    return any("elbow" in d for d in s.sw_arm)
 
 
 def is_t31_hybrid(s):
@@ -6727,15 +6568,17 @@ def main(argv):
     report_redraw(s)
     report_swing(s)
     report_swing_look(s)
-    report_swing_drive(s)
-    report_swing_split(s)
-    report_swing_gate(s)
-    report_swing_arm(s)
-    report_swing_aim(s)
+    if not is_vanilla_attack_route(s):
+        report_swing_drive(s)
+        report_swing_split(s)
+        report_swing_gate(s)
+        report_swing_arm(s)
+        report_swing_aim(s)
     report_swing_hit(s)
     report_swing_host(s)
-    report_swing_arc(s)
-    report_swing_bake(s)
+    if not is_vanilla_attack_route(s):
+        report_swing_arc(s)
+        report_swing_bake(s)
     report_attach(s)
     report_detach(s)
     report_p41d(s)
