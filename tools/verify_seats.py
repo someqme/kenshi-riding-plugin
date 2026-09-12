@@ -33,7 +33,7 @@ SRC = os.path.join(ROOT, "RidingPlugin.cpp")
 # Literals the source compares on purpose, outside the table itself.  Each entry buys one
 # extra allowed UTF-8 occurrence.  Keep the source location in the comment.
 EXTRA = {
-    "65260-Newwworld.mod": 1,       # neckFollow race match, RidingPlugin.cpp
+    "65260-Newwworld.mod": 2,       # neckFollow race match + kCombatRaceDeny, RidingPlugin.cpp
 }
 
 # 🆕 P2-4 (2026-09-06): kRideLegStyleRows is a SECOND table keyed on the same raceKeys, so every

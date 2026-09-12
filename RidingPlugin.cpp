@@ -2920,13 +2920,18 @@ static bool IsBigMount(const SeatInfo& seat)
 // of the rider" (mode 2||3); the garru is mode 2 yet comfortably inside the size
 // gate.  Two separate questions - never merge them.
 //
-// Residual risk = "big animal + degenerate torso + small hull" all at once.  The
-// only unmeasured candidate is King/Curled-One (race 65260-Newwworld.mod, mode 2,
-// on the vertical-spine list so its torso must degenerate, rad unknown).  Handling
-// = the mount log prints size=/torso=/rad= plus a RECORD-ONLY h= (anchor bone
-// height above the mount's movement position; goat measured 6.99u) so a misjudged
-// species is visible the first time it is ridden.
+// ⚠️ P4-0 residual risk (big animal + degenerate torso + small hull) is CLOSED for the
+// only unmeasured candidate: user ruling 2026-09-12 puts King/Curled-One (race 65260)
+// into the big tier by race key - see kCombatRaceDeny below.  The size-gate log still
+// prints size=/torso=/rad= plus a RECORD-ONLY h= so any other misjudge stays visible.
 static const float kCombatSizeMax = 15.5f;
+
+// User ruling 2026-09-12 「国王/卷缩者放入大体形，人物不战斗」.  Race-key deny, not name:
+// both localized names share one race, and stringID suffixes must never be guessed.
+// Size alone cannot catch this species (vertical spine degenerates torsoLen; rad unknown).
+static const char* const kCombatRaceDeny[] = {
+    "65260-Newwworld.mod",   // 卷缩者 + 国王 Crimper
+};
 
 static float MountCombatSize(Character* mount, const SeatInfo& seat)
 {
@@ -2964,6 +2969,11 @@ static const char* RidePoseNameForSeat(Character* mount, const SeatInfo& seat);
 static bool MountCombatEligible(Character* mount, const SeatInfo& seat)
 {
     if (RideLegPoseIsCushion(mount, seat)) return false;   // 🆕 P4-5, see the block above
+    if (!seat.raceKey.empty())
+    {
+        for (int i = 0; i < (int)(sizeof(kCombatRaceDeny) / sizeof(kCombatRaceDeny[0])); ++i)
+            if (seat.raceKey == kCombatRaceDeny[i]) return false;   // 2026-09-12, big tier by race
+    }
     float s = MountCombatSize(mount, seat);
     return s > 0.0f && s <= kCombatSizeMax;   // a failed read (0) DENIES
 }
@@ -11239,11 +11249,13 @@ static void RiderCombatLever(Character* rider, Character* mount)
 //     - Any mount that is down (KO'd) or dead force-dismounts its rider.
 //     - Any RIDER that is down (KO'd) or dead force-dismounts too (P4-4, see below).
 //     - Outside the P4-0 SIZE gate (big tier) the rider stays passive: their combat is
-//       suppressed every frame and the mount fights back with its native animal combat,
-//       defending the rider against the rider's attackers.
-//     - Inside the size gate (small tier) BOTH fight (已定决策「骑手与坐骑都出手」): nothing
-//       of ours touches the rider's combat, and the mount is still pointed at the rider's
-//       attackers.
+//       suppressed every frame.  The mount keeps its own engine animal combat (user-
+//       confirmed) - we no longer re-point it at the rider's attackers (2026-09-12
+//       ruling: 「坐骑本来就会攻击，护主这条可以删掉了」; the write was the only
+//       combat-ordering lever left in this pass and never lit in the player package
+//       because rider->getAllAttackers() is empty while carried).
+//     - Inside the size gate (small tier) the rider fights freely (已定决策「骑手与坐骑
+//       都出手」).  Same as above: mount combat is the engine's own, not ours.
 //
 // ⚠️ P4-2 (2026-08-30) split the gate here.  Both branches used to key off IsBigMount()
 // (seat mode 2||3), which is a DIFFERENT question - "where does the seat sit", not "how big is
@@ -11377,23 +11389,12 @@ static void CombatAndForceDismountPass()
                     RiderCombatLever(rider, mount);
             }
 
-            // The mount defends its rider in BOTH tiers (P4-2).  On the big tier this is the
-            // only combat happening; on the small tier it is the mount's half of 「双方都出手」.
-            // Only ever re-issued when the target actually differs, so a fight the player
-            // ordered themselves is not cancelled and re-ordered every frame.
-            lektor<hand> attackers;
-            rider->getAllAttackers(attackers);
-            if (attackers.size())
-            {
-                Character* current = mount->getAttackTarget().getCharacter();
-                for (lektor<hand>::iterator ait = attackers.begin(); ait != attackers.end(); ++ait)
-                {
-                    Character* attacker = ait->getCharacter();
-                    if (!attacker) continue;
-                    if (current != attacker)
-                        mount->attackTarget(attacker);
-                }
-            }
+            // 2026-09-12: P4-2 mount-protect write REMOVED.  It re-issued mount->attackTarget()
+            // against rider->getAllAttackers() every time the target differed - a combat-
+            // ordering lever, not a read - and in the player package that list is always
+            // empty while carried (P4-1b: eTgt=2 on the mount, rTgt=0 on the rider), so it
+            // never fired.  The mount already fights with its own engine AI (user-confirmed);
+            // do not put this write back without a new measured reason.
             ++it;
         }
     }
