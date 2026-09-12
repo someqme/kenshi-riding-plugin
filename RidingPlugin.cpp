@@ -3743,6 +3743,12 @@ struct RideCombatRuntime
     Character* faceTgt;
     int faceFrames;
     int faceDegMax;
+    // 🆕 P4-6al: facing-jump diagnostic state (previous heading + wanted offset, and the budget).
+    Ogre::Vector3 faceFwd;
+    bool  faceFwdHave;
+    float faceWantPrev;
+    bool  faceWantHave;
+    int   faceLog;
     int stumbleNameLines;
 };
 
@@ -5192,6 +5198,13 @@ static const float kRideCombatFaceMaxDeg = 60.0f;
 //      unclamped ms delta would hand back the whole paused duration in one step.
 static const float kRideCombatFaceRateDegPerSec = 240.0f;  // 0 -> 60 deg in 250 ms
 static const float kRideCombatFaceMaxStepDeg    = 15.0f;   // per frame, whatever the clock says
+// 🆕 P4-6al: the hold's radius has hysteresis, and a genuinely nearer enemy still wins.
+static const float kRideCombatFaceHoldDist      = kRideThreatDist * 1.2f;  // 72 u
+static const float kRideCombatFaceSwitchFrac    = 0.5f;    // switch when the candidate is 2x nearer
+// 🆕 P4-6al: the facing-jump diagnostic.  Logs the FIRST few events of a ride (a budget, like
+// every other probe) whenever the heading OR the wanted offset moves more than this in one frame.
+static const float kRideFaceJumpDeg   = 25.0f;
+static const int   kRideFaceJumpLines = 6;
 
 // Orient the rider's scene node after the game's own update.  The carry physics pins
 // the rider horizontally (lying flat, belly up); we override the render-node
@@ -5213,10 +5226,20 @@ static void ApplyRiderOrientation(Character* rider, const SeatInfo& seat, Charac
     // fall back to body-bone forward.
     static const float kHeadingMoveEps = 0.03f;   // per-frame horizontal move to count as "traveling"
     // ⚠️ Same-hemisphere test between the travel delta and the animal's OWN facing (2026-09-02,
-    // trip 19 report).  0.0f is the only value here that is not invented: it means "the delta is
-    // going the opposite way from where the body points".  Tighten it (0.25 ~= 75 deg) only if a
-    // SIDEWAYS shove gets reported next - a pure sidestep reads dot ~= 0 and is NOT vetoed here.
-    static const float kHeadingFaceMinDot = 0.0f;
+    // trip 19 report: "人物在牛背上打架的时候会突然转向牛屁股的方向").  This is the arbiter: the
+    // delta may only refresh the heading while it agrees with where the animal's body points.
+    // 🆕 P4-6al (2026-09-12, user: 「砍着砍着人物会突然向后转然后转回来」): 0.0f was measured as
+    // enough for a REVERSAL, but a pure SIDESTEP reads dot ~= 0 and sailed through, and the doc
+    // for this constant has said all along that 0.25 (~75 deg) is the knob for exactly that
+    // report.  A real walk/turn keeps dot near 1 (an animal walks where it points), so 0.25 costs
+    // nothing on the ordinary frame and rejects everything that is not "the body is going that way".
+    static const float kHeadingFaceMinDot = 0.25f;
+    // 🆕 P4-6al: and a single frame cannot legitimately turn the animal this far.  A delta that
+    // disagrees with the HELD heading by more than this is a shove, a knockback spike or a stale
+    // position (the mount's movement position is not smooth under physics), so hold the last good
+    // heading - the same answer the veto above gives, for the same reason.  At any real frame rate
+    // a genuine turn is a few degrees per frame; a hitch just costs the heading a frame or two.
+    static const float kHeadingMaxStepDeg = 60.0f;
     Ogre::Vector3 fwd(0.0f, 0.0f, 1.0f);
     bool haveFwd = false;
     CharMovement* mv = mount->getMovement();
@@ -5245,10 +5268,25 @@ static void ApplyRiderOrientation(Character* rider, const SeatInfo& seat, Charac
                 // already happens while the mount stands still.  An animal walks where it
                 // points, so on every ordinary frame dot > 0 and nothing changes.
                 Ogre::Vector3 face;
+                bool holdHeading = false;
                 if (!GetMountFacingDirection(mount, face)
                     || d.dotProduct(face) > kHeadingFaceMinDot)
-                    mountHeadingDir[mount] = d;
+                {
+                    // P4-6al: second test - a jump this large in ONE frame is not a turn.
+                    boost::unordered_map<Character*, Ogre::Vector3>::iterator hd2 = mountHeadingDir.find(mount);
+                    if (hd2 != mountHeadingDir.end() && kHeadingMaxStepDeg > 0.0f)
+                    {
+                        float dotHeld = hd2->second.dotProduct(d);
+                        if (dotHeld >  1.0f) dotHeld =  1.0f;
+                        if (dotHeld < -1.0f) dotHeld = -1.0f;
+                        if (Ogre::Math::ACos(dotHeld).valueDegrees() > kHeadingMaxStepDeg)
+                            holdHeading = true;
+                    }
+                    if (!holdHeading) mountHeadingDir[mount] = d;
+                }
                 else
+                    holdHeading = true;
+                if (holdHeading)
                 {
                     RideCombatRuntime* rt = FindRideCombatRuntime(rider);
                     if (rt) ++rt->headVeto;
@@ -5275,28 +5313,41 @@ static void ApplyRiderOrientation(Character* rider, const SeatInfo& seat, Charac
     // target hold, rate limit.  The yaw is applied to the NODE below (world-space, carries the
     // whole skeleton), which is what makes an ordinary "strike forward" clip strike at the enemy.
     // Read with advance=false: HaltAndForceSitPass owns the once-per-frame hold counter.
+    const Ogre::Vector3 fwdHeading = fwd;   // the mount's heading, BEFORE our combat offset
     float wantDeg = 0.0f;      // desired yaw this frame; 0 = face the mount's heading
     {
         RideCombatRuntime* frt = FindRideCombatRuntime(rider);
         if (frt) frt->faceDeg = 0.0f;
+        Character* foe = NULL;
+        float foeD = -1.0f;
         if (RideCombatStance(rider, mount, seat, false))
         {
-            // 2) HOLD: keep last frame's enemy while it is still a live, NEAR threat.
-            Character* foe = frt ? frt->faceTgt : NULL;
+            // 2) HOLD: keep last frame's enemy while it is still a live, NEAR threat.  The radius
+            //    has hysteresis (hold at 1.2x the acquisition gate) so a target hovering on the
+            //    gate cannot make the facing flip on and off frame by frame.
+            foe = frt ? frt->faceTgt : NULL;
             bool foeOk = false;
             if (foe && foe != mount && CharacterLooksLive(foe) && !foe->isDown() && !foe->isDead())
             {
                 Ogre::Vector3 fd = foe->getPosition() - rider->getPosition();
                 fd.y = 0.0f;
-                foeOk = (fd.squaredLength() <= kRideThreatDist * kRideThreatDist);
+                foeD = Ogre::Math::Sqrt(fd.squaredLength());
+                foeOk = (foeD <= kRideCombatFaceHoldDist);
             }
+            // 1) DISTANCE: the search's answer is only allowed to aim us if it is inside the
+            //    stance's own threat radius - its books hold entries hundreds of units away.
+            float candD = -1.0f;
+            Character* cand = RideNearestThreat(rider, mount, &candD);
+            if (cand && (cand == mount || candD < 0.0f || candD > kRideThreatDist)) cand = NULL;
+            // A MUCH nearer enemy is a real switch (the fight moved); anything else keeps the
+            // held one, which is what stops two similar attackers from trading the facing.
+            if (foeOk && cand && cand != foe && candD >= 0.0f && foeD >= 0.0f
+                && candD < foeD * kRideCombatFaceSwitchFrac)
+                foeOk = false;
             if (!foeOk)
             {
-                // 1) DISTANCE: the search's answer is only allowed to aim us if it is inside the
-                //    stance's own threat radius - its books hold entries hundreds of units away.
-                float fd = -1.0f;
-                Character* cand = RideNearestThreat(rider, mount, &fd);
-                foe = (cand && cand != mount && fd >= 0.0f && fd <= kRideThreatDist) ? cand : NULL;
+                foe = cand;
+                foeD = candD;
                 if (frt) frt->faceTgt = foe;
             }
             if (foe)
@@ -5319,6 +5370,43 @@ static void ApplyRiderOrientation(Character* rider, const SeatInfo& seat, Charac
                     if (wantDeg < -kRideCombatFaceMaxDeg) wantDeg = -kRideCombatFaceMaxDeg;
                 }
             }
+        }
+        else if (frt)
+            frt->faceTgt = NULL;   // out of combat: drop the hold, so the next fight re-aims
+
+        // 🆕 P4-6al DIAGNOSTIC: name WHY the facing jumped, budgeted.  「砍着砍着突然向后转然后转
+        // 回来」 has two candidate causes and the log could not tell them apart: the mount's HEADING
+        // flipping (a shove the veto let through - `hdjump=`) versus OUR target offset flipping
+        // (`wantjump=`, e.g. the enemy changed or was lost).  Whichever is non-zero at the event is
+        // the answer; `veto=` counts heading holds, `foe=`/`fd=` identify the target at that moment.
+        if (frt && frt->faceLog < kRideFaceJumpLines)
+        {
+            float hdj = -1.0f;
+            if (frt->faceFwdHave)
+            {
+                Ogre::Vector3 a = frt->faceFwd, b = fwdHeading;
+                a.y = 0.0f; b.y = 0.0f;
+                if (a.length() > 0.001f && b.length() > 0.001f)
+                {
+                    a.normalise(); b.normalise();
+                    float dj = a.dotProduct(b);
+                    if (dj >  1.0f) dj =  1.0f;
+                    if (dj < -1.0f) dj = -1.0f;
+                    hdj = Ogre::Math::ACos(dj).valueDegrees();
+                }
+            }
+            float wj = frt->faceWantHave ? Ogre::Math::Abs(wantDeg - frt->faceWantPrev) : 0.0f;
+            if (hdj > kRideFaceJumpDeg || wj > kRideFaceJumpDeg)
+            {
+                ++frt->faceLog;
+                char fb[288];
+                _snprintf_s(fb, 288, _TRUNCATE,
+                    "Riding: P43FC f=%u hdjump=%.0f wantjump=%.0f want=%.0f app=%.0f foe=%p fd=%.1f veto=%d",
+                    gP3Frames, hdj, wj, wantDeg, frt->faceDegCur, (void*)foe, foeD, frt->headVeto);
+                DebugLog(std::string(fb));
+            }
+            frt->faceFwd = fwdHeading;  frt->faceFwdHave  = true;
+            frt->faceWantPrev = wantDeg; frt->faceWantHave = true;
         }
         // 3) RATE: ramp the APPLIED angle toward the wanted one.  Out of combat wanted is 0, so
         //    the release is a turn too - the rider does not snap back to the mount's heading.
