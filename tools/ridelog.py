@@ -35,10 +35,6 @@ RD_SH = re.compile(r"sh='([^']*)'->'([^']*)'")
 
 VANILLA_ATTACKS = (
     "chop down static",
-    "mid blow",
-    "mid blow light",
-    "mid blow drop",
-    "back blow high",
 )
 
 

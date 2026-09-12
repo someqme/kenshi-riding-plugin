@@ -109,8 +109,7 @@ REF_MEASURED = (1.41, 3.88, 3.51)
 # shape does not depend on them - but a drift here would mislabel the tempo, so keep them in step.
 ARC_MS, WIN_MS = 1400, 700
 SHIPPING_ATTACKS = (
-    'chop down static', 'mid blow', 'mid blow light',
-    'mid blow drop', 'back blow high',
+    'chop down static',
 )
 UPPER, FORE, HAND = 'Bip01 R UpperArm', 'Bip01 R Forearm', 'Bip01 R Hand'
 
