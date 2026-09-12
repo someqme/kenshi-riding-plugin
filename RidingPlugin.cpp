@@ -3601,13 +3601,28 @@ enum RideCombatPhase
 // blade still crosses sideways relative to the body.
 // ⛔ The `blow` family (`back blow low` measures 0 deg, a perfect forward chop) is STILL BANNED:
 // those records carry `stumbles` body-part maps and ARE the vanilla hit reaction (P4-6S).
+// ⚠️ P4-6aj: THE ROOT TRACK IS THE SECOND FILTER, and the user's report points straight at it.
+// We MASK the root (`Bip01` is in the hold table - the rider cannot step), so a clip whose
+// footwork we delete is distorted by exactly that deletion.  Measure the clip's own `Bip01` track
+// (`skelanims.py`): rotation span / translation:
+//     chop down static   15.8 deg /  1.42 u   <- authored IN PLACE, masking costs nothing
+//     chop down          22.4 deg /  6.53 u   <- its closing step is deleted
+//     chop left          31.7 deg /  7.64 u   <- a horizontal slash: lateral stroke BY DESIGN
+//     downward combo     33.4 deg / 13.44 u
+//     heavy downcut      92.7 deg / 17.88 u   <- A SPIN: the body turn is half the attack
+//     bigchopv2          92.6 deg / 25.01 u   <- the same spin, 2.8 s long
+//   Mask a 90 deg spin and the arm's authored sweep - written to accompany that turn - is left
+//   sweeping across a body that never turned: 「往旁边空地上劈，几乎垂直于目标」.  The `static`
+//   suffix is the authoring signal: that is the variant meant to be played standing still.
+// ⚠️ The stroke plane agrees (`chop down static` 14 deg vs `downward combo` 105 / `heavy swing`
+// 115 / `flying big chop 3` 154).  The two metrics DISAGREE about `chop down` (21 deg sweep, but
+// a 6.5 u step deleted), and the user named it as one of the two suspects with no measurement
+// able to clear it - so it is out too.  ⛔ Do not re-add a clip without measuring BOTH numbers.
 static const char* const kRideMixClips[] = {
-    "chop down static",   // 1.300 s  14 deg - 正前方下劈（唯一有 ANIMATION 记录的攻击 clip）
-    "chop down",          // 0.967 s  21 deg - 正前方下劈
-    "heavy downcut",      // 1.633 s  65 deg - 斜劈
-    "chop left"           // 1.067 s  85 deg - 横扫（引擎自己一直在选的那条）
+    "chop down static",   // 1.300 s - root 15.8 deg /  1.42 u - 正前方下劈（唯一原地的攻击 clip）
+    "chop left"           // 1.067 s - root 31.7 deg /  7.64 u - 横扫（引擎自己一直在选的那条）
 };
-static const int kRideMixCount = 4;
+static const int kRideMixCount = 2;
 
 // 🆕 P4-6ag: the hit beat follows the CLIP.  A fixed 600 ms was the validated point on `chop left`
 // (600 / 1067 = 56% of the stroke); with 0.97-2.83 s clips in the mix a fixed beat would land the
