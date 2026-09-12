@@ -5549,16 +5549,26 @@ def report_swing_host(s):
                          "stillWanted/Ogre enabled stayed on at every measured close"))
 
     # ---- 4) current timing and serial restart --------------------------------
-    # P4-6z (2026-09-12): window 1000 ms, hard cap 1100, base gap 1200 (1.2 s / cut).
-    WIN, CAP = 1000, 1100
-    mss = [v for v in (fnum(d, "ms") for d in s.sw_close) if v is not None]
+    # P4-6af-3 (2026-09-12): the window is the CLIP's own length (close line `fit=`) plus the
+    # 250 ms follow-through hold, floored at the old fixed 1000 ms (the frames before Drive has
+    # measured the clip) and capped at 4000 ms.  Judging `ms=` against a fixed 1000 here would
+    # report every long technique as a failure.
+    WIN, HOLD, CAP = 1000, 250, 4000
+    mss = [(d, fnum(d, "ms"), fnum(d, "fit")) for d in s.sw_close]
+    mss = [(d, m, f) for (d, m, f) in mss if m is not None]
     if mss:
-        early = [v for v in mss if v < WIN - 1]
-        capped = [v for v in mss if v >= CAP - 60]
-        print("  window lengths: %s ms (target %d; hard cap %d)" %
-              ("/".join("%d" % v for v in mss[:12]), WIN, CAP))
-        print("  " + verdict(not early and not capped,
-                             "all measured windows closed on the 1000 ms clock"))
+        bad_win = []
+        for (d, m, f) in mss:
+            want = float(WIN) if (f is None or f <= 0) else float(min(CAP, max(WIN, f + HOLD)))
+            if abs(m - want) > 60.0:
+                bad_win.append((d, m, want))
+        print("  window lengths: %s ms (want clip length + %d, floor %d, cap %d)" %
+              ("/".join("%d" % m for (_d, m, _f) in mss[:12]), HOLD, WIN, CAP))
+        print("  " + verdict(not bad_win,
+                             "every window closed on its own clip's length plus the hold"))
+        for (d, m, want) in bad_win[:8]:
+            print("        %8s ms=%s fit=%s, expected %.0f"
+                  % (d.get("_ts", "?"), d.get("ms", "-"), d.get("fit", "-"), want))
     bad_rst = []
     for d in s.sw_rides:
         sw, rs = fnum(d, "swing"), fnum(d, "rst")
@@ -5570,19 +5580,18 @@ def report_swing_host(s):
         print("        %8s swing=%d rst=%d" % (t, sw, rs))
 
     # ---- 5) retired writers stay retired -------------------------------------
+    # ⚠️ P4-6af-3: only the AUTHORED-ARM counters are still retired.  `drv=` (Drive has been the
+    # visible writer since P4-6V), `swfree=` (the free-bone mask since T23) and `fit=` (the clip's
+    # own length since P4-6z) are live fields on this route - listing them here made every modern
+    # log print a false failure.
     retired_bad = []
     for d in s.sw_rides:
-        for k in ("drv", "arm", "swfree"):
-            v = fnum(d, k)
-            if v is not None and v != 0:
-                retired_bad.append((d.get("_ts", "?"), k, v))
-    for d in s.sw_close:
-        for k in ("hold", "fit"):
+        for k in ("arm", "postarm"):
             v = fnum(d, k)
             if v is not None and v != 0:
                 retired_bad.append((d.get("_ts", "?"), k, v))
     print("  " + verdict(not retired_bad,
-                         "retired technique/authored-arm writers stayed zero"))
+                         "authored-arm writers stayed retired (arm=/postarm= zero)"))
     for t, k, v in retired_bad[:8]:
         print("        %8s %s=%g" % (t, k, v))
     print("  NOTE  rst= is a decision count, not proof that a restart helper succeeded.")

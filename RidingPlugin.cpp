@@ -3360,11 +3360,28 @@ static bool RideCombatStance(Character* rider, Character* mount, const SeatInfo&
 // ground technique into 700 ms (~1.5-4x) and the arms thrashed.  Play the clip at 1.0x
 // (Drive uses the clip's own length as the phase timeline); the window clock only
 // decides how long we keep showing it.  Cadence at aspd=1.0 is 1.2 s open-to-open.
-static const int   kRideSwingHitMs   = 600;   // ~60% of the live window
-static const int   kRideSwingWinMs    = 1000; // live window; ~1 s of ground-speed anim
-static const int   kRideSwingLenMs    = 1100; // hard cap (open-tick escape safety)
-static const int   kRideSwingMinGapMs = 1200; // open-to-open at attackSpeed=1.0 (1.2 s / cut)
-// ⚠️ INVARIANT: kRideSwingWinMs < kRideSwingLenMs < kRideSwingMinGapMs.
+static const int   kRideSwingHitMs   = 600;   // mid-arc resolution beat, fixed on the window clock
+static const int   kRideSwingWinMs    = 1000; // window FLOOR / pre-measurement fallback
+static const int   kRideSwingLenMs    = 1100; // ⛔ superseded by kRideSwingLenMaxMs (P4-6af-3);
+                                              // kept named because older remarks quote it
+static const int   kRideSwingMinGapMs = 1200; // open-to-open floor at attackSpeed=1.0
+// 🆕 P4-6af-3 (2026-09-12 user: 「在马上的时候技法动作没做完也可能是刚做完就回收了就回收到握姿了，
+// 导致最后一段播不出来，看起来像刀没完全砍出去。等动作做完再让他保持一点时间」).
+// The window is no longer a fixed 1000 ms: it is THE CLIP'S OWN LENGTH (at ground speed, measured
+// into rt.fitMs by RideSwingDrive) plus a follow-through hold.  A fixed window cut every ground
+// technique (1.07-2.83 s) off mid-arc - `bigchopv2` only ever showed ~35% of its stroke, so the
+// blade never finished travelling - and RideSwingBlend's tail ramp then handed the last 120 ms
+// straight back to the host's grip, which is the 「刚做完就回收」 half of the report.
+//   * kRideSwingHoldMs is the follow-through: the clip is frozen on its LAST frame (Drive clamps
+//     the phase at 1.0) and held at full weight, then the fade-down ramp runs inside the hold -
+//     so the stroke's end pose is visible for (hold - fade) before the grip returns.
+//   * kRideSwingLenMaxMs is the open-tick escape cap, now sized for the longest ground technique
+//     (2.833 s) plus a hold plus margin.  A garbage length reading can never extend a window.
+static const int   kRideSwingHoldMs   = 250;  // follow-through hold after the clip's own end
+static const int   kRideSwingLenMaxMs = 4000; // hard cap on ANY window (escape safety)
+// ⚠️ INVARIANT (P4-6af-3): window = clamp(fit + kRideSwingHoldMs, kRideSwingWinMs, kRideSwingLenMaxMs)
+//    and kRideSwingMinGapMs is a FLOOR on open-to-open, not a ceiling - a long clip legitimately
+//    outlives the gap, and the window itself is what keeps the next attempt from opening.
 // (ArcMs only feeds the retired authored arm path; do not use it to close the window.)
 static const float kRideSwingSpeed    = 2.5f;  // ⛔ RETIRED BY T27 (nothing one-shot is pinned any
                                                // more; kept because RideSwingRestart still compiles
@@ -3779,12 +3796,30 @@ static void ResetRideSwingWindow(Character* rider)
     ClearRideCombatRuntime(rider);
 }
 
+// 🆕 P4-6af-3: how long THIS window runs.  The clip's own length at ground speed (1.0x) plus the
+// follow-through hold, clamped between the old fixed floor and the escape cap.
+// ⚠️ fitMs is measured by RideSwingDrive on its first drive frame, so the frames between the open
+// and that measurement answer the floor - which is why kRideSwingWinMs is still a REAL value and
+// not just documentation.  A clip whose length reads absurd is refused, never trusted.
+// ⚠️ ONE definition, four consumers: the open predicate (RideSwingPass), RideSwingInFlight (the
+// hostkeep= self-proof), RideSwingDrive's cross-fade and LegPosePass's swingYield.  They must never
+// disagree - a window that closes on one clock and fades on another is a visible snap.
+static int RideSwingWindowMs(const RideCombatRuntime& rt)
+{
+    int ms = kRideSwingWinMs;
+    if (rt.fitMs > 0 && rt.fitMs <= kRideSwingLenMaxMs - kRideSwingHoldMs)
+        ms = rt.fitMs + kRideSwingHoldMs;
+    if (ms < kRideSwingWinMs)   ms = kRideSwingWinMs;
+    if (ms > kRideSwingLenMaxMs) ms = kRideSwingLenMaxMs;
+    return ms;
+}
+
 // Pure read: never creates runtime state from a guard/assertion site.
 static bool RideSwingInFlight(Character* rider)
 {
     RideCombatRuntime* rt = FindRideCombatRuntime(rider);
     if (!rt || rt->openTick == 0) return false;
-    return (GetTickCount() - rt->openTick) < (DWORD)kRideSwingWinMs;
+    return (GetTickCount() - rt->openTick) < (DWORD)RideSwingWindowMs(*rt);
 }
 
 // Read Kenshi's finished attack-speed multiplier once per open attempt.  The getter is an
@@ -4176,12 +4211,16 @@ static void RideSwingProbeState(AnimationClass* rAnim, const char* clip, char* o
 // elapsed-ms input from the same openTick, so the two can never disagree by more than a
 // frame.  Abnormal closes (stance dropped mid-window) skip the tail ramp - the window is
 // already closing and Undrive/ArmRelease own that edge.
-static float RideSwingBlend(DWORD elapsedMs)
+// P4-6af-3: winMs is the LIVE window length (RideSwingWindowMs) - it is the clip's own length plus
+// the follow-through hold, so the tail ramp lands at the END of the hold and the stroke's last
+// frame is shown at full weight first.  Passing the old fixed constant here would fade the
+// technique out while the clip was still travelling, which is exactly the reported defect.
+static float RideSwingBlend(DWORD elapsedMs, int winMs)
 {
     if (kRideSwingFadeMs <= 0) return 1.0f;
     float e   = (float)elapsedMs;
     float f   = (float)kRideSwingFadeMs;
-    float rem = (float)kRideSwingWinMs - e;
+    float rem = (float)winMs - e;
     if (rem > f) rem = f;
     float w = (e < rem ? e : rem) / f;
     if (w < 0.0f) w = 0.0f;
@@ -4372,7 +4411,7 @@ static bool RideSwingDrive(AnimationClass* rAnim, const char* clip, DWORD elapse
         }
         st->setEnabled(true);
         // P4-6l: ramped, not hard 1.0 - see RideSwingBlend.
-        st->setWeight(kRideSwingTechW * RideSwingBlend(elapsedMs));
+        st->setWeight(kRideSwingTechW * RideSwingBlend(elapsedMs, RideSwingWindowMs(*rt)));
         // P4-6af-2: the technique owns the whole upper body for the window - spine, arms, hands
         // AND the weapon props.  Only HOLD bones (root+legs) are zeroed here, so a ground clip
         // can never step the skeleton or fight the straddle / sit-height writes in LegPosePass.
@@ -4587,8 +4626,9 @@ static void RideSwingPass(Character* rider, Character* mount, AnimationClass* rA
         if (rt.lastAttemptTick != 0) rt.lastAttemptTick += pausedMs;
         rt.pauseTick = 0;
     }
-    // Window duration belongs to the selected vanilla attack route.  prog= is informational;
-    // the transaction clock, not a clip's varying authored length, owns hit and close timing.
+    // Window duration follows the selected technique (P4-6af-3): the clip's own length at ground
+    // speed plus the follow-through hold.  `prog=` is informational; the HIT beat is still the
+    // transaction clock's fixed kRideSwingHitMs, and the close is the window computed below.
     float prog = (rAnim && host) ? rAnim->getAnimationProgress(host) : -1.0f;
     // 🆕 T28 - `stance` belongs in the OPEN predicate, not only in the open DECISION.  The call site has
     // always said "the pass has to be able to CLOSE a window it opened, and stance=false is what closes
@@ -4600,10 +4640,13 @@ static void RideSwingPass(Character* rider, Character* mount, AnimationClass* rA
     // ⚠️ Safe against flicker BY CONSTRUCTION: this pass reads the stance with advance=false, and that
     // form is sticky (raw || per-rider holdMs > 0), so a one-frame dropout of the raw fight
     // test cannot cut a window short.  Only the hold running out can, which is the intended meaning.
+    // 🆕 P4-6af-3: the window is the CLIP's own length plus the follow-through hold
+    // (RideSwingWindowMs), so the close edge lands after the stroke has finished playing - not
+    // 1000 ms into a 2.83 s ground technique.  `prog=` above stays informational.
+    const int winMs = RideSwingWindowMs(rt);
     bool  open = (rt.openTick != 0)
                && stance
-               && ((now - rt.openTick) < (DWORD)kRideSwingWinMs)
-               && ((now - rt.openTick) < (DWORD)kRideSwingLenMs);
+               && ((now - rt.openTick) < (DWORD)winMs);
 
     // ---- close edge ---------------------------------------------------------------------------
     if (rt.wasOpen && !open)
@@ -7604,7 +7647,8 @@ static void LegPosePassImpl(AnimationClass* rAnim, AnimationData* poseData, Char
         // P4-6ab: same freeze as Drive.  A raw GetTickCount delta would walk the cross-fade
         // (and thus the guard free-mask) to 0 during a long pause while the technique state
         // was frozen mid-arc - two writers disagreeing on a paused screen.
-        swingYield = RideSwingBlend(RideSwingFrozenElapsed(*techRt, GetTickCount()));
+        swingYield = RideSwingBlend(RideSwingFrozenElapsed(*techRt, GetTickCount()),
+                                    RideSwingWindowMs(*techRt));
     }
     int msk = LegMaskApply(rAnim, nb, thighOurs, calfOurs, twistOn, swingYield, pelvisOurs);
     if (swingFree && msk > 0) ++swingRt.freeFrames;
