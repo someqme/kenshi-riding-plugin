@@ -3733,9 +3733,14 @@ struct RideCombatRuntime
     int mixCursor;
     int mixIdx;
     int mixCount[kRideMixCount];
-    // 🆕 P4-6ah: combat facing (node yaw toward the enemy).  faceDeg is this frame's applied
-    // angle, faceFrames/faceDegMax are the per-ride self-proof: frames turned, largest angle.
+    // 🆕 P4-6ah/P4-6ak: combat facing (node yaw toward the enemy).  faceDeg is this frame's
+    // applied angle, faceDegCur the rate-limited value it ramps through, faceTgt the HELD enemy
+    // (kept while it stays a live near threat - see kRideCombatFaceRateDegPerSec), faceTick the
+    // wall clock that ramp is measured against, faceFrames/faceDegMax the per-ride self-proof.
     float faceDeg;
+    float faceDegCur;
+    DWORD faceTick;
+    Character* faceTgt;
     int faceFrames;
     int faceDegMax;
     int stumbleNameLines;
@@ -5169,6 +5174,24 @@ static void RideStanceRedraw(Character* rider)
 // the animal.  60 deg keeps the legs near the flanks while covering every ordinary fight; raise it
 // only if the user reports the aim still falling short.
 static const float kRideCombatFaceMaxDeg = 60.0f;
+// 🆕 P4-6ak (2026-09-12, user: 「那个姿势没了。但是人物在马上有时会突然胡乱转向」).
+// The yaw above was applied DIRECTLY every frame, from a fresh `RideNearestThreat` answer.  That
+// function is a PRIORITY search whose tiers are the engine's own books - rider target, rider
+// ATTACKERS, mount target, mount ATTACKERS - and those lists churn: a declared target can sit
+// 200 u away, an attacker list can hold stale entries, and the "nearest live entry" inside a tier
+// changes the instant any of them moves.  Any of those flips re-aimed the rider in one frame,
+// which is the reported 「突然胡乱转向」.  Three brakes, all of them inside this one block:
+//   1) DISTANCE - only a threat inside kRideThreatDist (60 u, the stance's own gate) may aim us.
+//      Without it, a book entry hundreds of units away turned the rider.
+//   2) HOLD - once a frame's enemy is chosen, KEEP it while it stays a live threat inside that
+//      radius; only then ask the search again.  This is what stops two attackers from trading the
+//      facing every frame (each of them is "nearest" as soon as the other twitches).
+//   3) RATE - the applied angle ramps toward the wanted one at kRideCombatFaceRateDegPerSec with a
+//      per-frame ceiling, so even a genuine target switch is a turn instead of a snap.  The
+//      ceiling also covers the pause case: a paused game keeps GetTickCount running, and an
+//      unclamped ms delta would hand back the whole paused duration in one step.
+static const float kRideCombatFaceRateDegPerSec = 240.0f;  // 0 -> 60 deg in 250 ms
+static const float kRideCombatFaceMaxStepDeg    = 15.0f;   // per frame, whatever the clock says
 
 // Orient the rider's scene node after the game's own update.  The carry physics pins
 // the rider horizontally (lying flat, belly up); we override the render-node
@@ -5244,21 +5267,39 @@ static void ApplyRiderOrientation(Character* rider, const SeatInfo& seat, Charac
     else
         fwd.normalise();
 
-    // 🆕 P4-6ah: COMBAT FACING.  Out of combat the rider faces the mount's direction of travel;
-    // IN A FIGHT he faces the ENEMY (the user's ask: 「战斗时就用原版的索敌，招式都往敌人身上打」).
-    // The enemy comes from RideNearestThreat - the same four-tier search the stance and the twist
-    // aim by, i.e. the engine's own books (rider target -> rider attackers -> mount target ->
-    // mount attackers), so this is the vanilla answer and not a second opinion.
-    // The yaw is applied to the NODE below (world-space, carries the whole skeleton), which is
-    // what makes an ordinary "strike forward" clip strike at the enemy.  Read with advance=false:
-    // HaltAndForceSitPass owns the once-per-frame hold counter.
+    // 🆕 P4-6ah/P4-6ak: COMBAT FACING.  Out of combat the rider faces the mount's direction of
+    // travel; IN A FIGHT he faces the ENEMY (the user's ask: 「战斗时就用原版的索敌」).  The enemy
+    // comes from RideNearestThreat - the same four-tier search the stance aims by, i.e. the
+    // engine's own books (rider target -> rider attackers -> mount target -> mount attackers).
+    // P4-6ak adds the three brakes described at kRideCombatFaceRateDegPerSec: distance gate,
+    // target hold, rate limit.  The yaw is applied to the NODE below (world-space, carries the
+    // whole skeleton), which is what makes an ordinary "strike forward" clip strike at the enemy.
+    // Read with advance=false: HaltAndForceSitPass owns the once-per-frame hold counter.
+    float wantDeg = 0.0f;      // desired yaw this frame; 0 = face the mount's heading
     {
         RideCombatRuntime* frt = FindRideCombatRuntime(rider);
         if (frt) frt->faceDeg = 0.0f;
         if (RideCombatStance(rider, mount, seat, false))
         {
-            Character* foe = RideNearestThreat(rider, mount, NULL);
-            if (foe && foe != mount)
+            // 2) HOLD: keep last frame's enemy while it is still a live, NEAR threat.
+            Character* foe = frt ? frt->faceTgt : NULL;
+            bool foeOk = false;
+            if (foe && foe != mount && CharacterLooksLive(foe) && !foe->isDown() && !foe->isDead())
+            {
+                Ogre::Vector3 fd = foe->getPosition() - rider->getPosition();
+                fd.y = 0.0f;
+                foeOk = (fd.squaredLength() <= kRideThreatDist * kRideThreatDist);
+            }
+            if (!foeOk)
+            {
+                // 1) DISTANCE: the search's answer is only allowed to aim us if it is inside the
+                //    stance's own threat radius - its books hold entries hundreds of units away.
+                float fd = -1.0f;
+                Character* cand = RideNearestThreat(rider, mount, &fd);
+                foe = (cand && cand != mount && fd >= 0.0f && fd <= kRideThreatDist) ? cand : NULL;
+                if (frt) frt->faceTgt = foe;
+            }
+            if (foe)
             {
                 Ogre::Vector3 toFoe = foe->getPosition() - rider->getPosition();
                 toFoe.y = 0.0f;
@@ -5272,26 +5313,49 @@ static void ApplyRiderOrientation(Character* rider, const SeatInfo& seat, Charac
                     // +X = left, +Y = up, +Z = forward (P2-1b), so a rotation about +Y by the
                     // signed angle atan2(up . fwd x toFoe, fwd . toFoe) lands exactly on toFoe.
                     const Ogre::Vector3 up(0.0f, 1.0f, 0.0f);
-                    float cr  = up.dotProduct(fwd.crossProduct(toFoe));
-                    float deg = Ogre::Math::ATan2(cr, dt).valueDegrees();
-                    if (deg >  kRideCombatFaceMaxDeg) deg =  kRideCombatFaceMaxDeg;
-                    if (deg < -kRideCombatFaceMaxDeg) deg = -kRideCombatFaceMaxDeg;
-                    Ogre::Quaternion turn(Ogre::Degree(deg), up);
-                    Ogre::Vector3 turned = turn * fwd;
-                    turned.y = 0.0f;
-                    if (turned.length() > 0.001f)
-                    {
-                        turned.normalise();
-                        fwd = turned;
-                        if (frt)
-                        {
-                            frt->faceDeg = deg;
-                            ++frt->faceFrames;
-                            if (frt->faceDegMax < (int)(deg < 0.0f ? -deg : deg))
-                                frt->faceDegMax = (int)(deg < 0.0f ? -deg : deg);
-                        }
-                    }
+                    float cr = up.dotProduct(fwd.crossProduct(toFoe));
+                    wantDeg = Ogre::Math::ATan2(cr, dt).valueDegrees();
+                    if (wantDeg >  kRideCombatFaceMaxDeg) wantDeg =  kRideCombatFaceMaxDeg;
+                    if (wantDeg < -kRideCombatFaceMaxDeg) wantDeg = -kRideCombatFaceMaxDeg;
                 }
+            }
+        }
+        // 3) RATE: ramp the APPLIED angle toward the wanted one.  Out of combat wanted is 0, so
+        //    the release is a turn too - the rider does not snap back to the mount's heading.
+        if (frt)
+        {
+            DWORD now = GetTickCount();
+            if (frt->faceTick == 0) frt->faceTick = now;
+            DWORD dtms = now - frt->faceTick;
+            frt->faceTick = now;
+            float step = kRideCombatFaceRateDegPerSec * (float)dtms / 1000.0f;
+            if (step < 0.0f) step = 0.0f;
+            if (step > kRideCombatFaceMaxStepDeg) step = kRideCombatFaceMaxStepDeg;
+            float diff = wantDeg - frt->faceDegCur;
+            if (diff >  step) diff =  step;
+            if (diff < -step) diff = -step;
+            frt->faceDegCur += diff;
+            if (frt->faceDegCur >  kRideCombatFaceMaxDeg) frt->faceDegCur =  kRideCombatFaceMaxDeg;
+            if (frt->faceDegCur < -kRideCombatFaceMaxDeg) frt->faceDegCur = -kRideCombatFaceMaxDeg;
+            float mag = (frt->faceDegCur < 0.0f) ? -frt->faceDegCur : frt->faceDegCur;
+            if (mag > 0.01f)
+            {
+                frt->faceDeg = frt->faceDegCur;
+                ++frt->faceFrames;
+                if (frt->faceDegMax < (int)mag) frt->faceDegMax = (int)mag;
+            }
+        }
+        float deg = frt ? frt->faceDegCur : 0.0f;
+        if (deg > 0.001f || deg < -0.001f)
+        {
+            const Ogre::Vector3 up(0.0f, 1.0f, 0.0f);
+            Ogre::Quaternion turn(Ogre::Degree(deg), up);
+            Ogre::Vector3 turned = turn * fwd;
+            turned.y = 0.0f;
+            if (turned.length() > 0.001f)
+            {
+                turned.normalise();
+                fwd = turned;
             }
         }
     }
