@@ -4760,8 +4760,7 @@ def report_swing_gate(s):
         print("        producer keeps NAMING a technique every window, which is what gate=/dq=/lim="
               " read.")
     elif fits:
-        print("  fit= per window (ms the arc was fitted into; kRideSwingTechMs=1700"
-              " is a ceiling now):")
+        print("  fit= per window (ms = clip's own length at ground speed 1.0x since P4-6z):")
         rows = []
         for d in fits[:12]:
             fv = fnum(d, "fit")
@@ -4769,55 +4768,34 @@ def report_swing_gate(s):
             rows.append("%s:%s%s" % (d.get("_ts", "?"), d.get("fit", "-"),
                                      "" if lv is None else "/len=%.3f" % lv))
         print("     " + " ".join(rows))
-        over = [d for d in fits if (fnum(d, "fit") or 0.0) > 1700.5]
-        print("  " + verdict(not over,
-                             "no window fitted the arc into more than"
-                             " kRideSwingTechMs (%d checked)" % len(fits)))
-        if over:
-            print("        %d row(s) over the ceiling - the clamp is inverted."
-                  % len(over))
         # And when the clip is SHORTER than the window, fit must be its own length:
-        # that is the whole point (1.067 s stretched to 1700 ms = 0.63x slow motion,
-        # which reads as a defect and is what T24 must never introduce).
+        # that is the whole point (1.067 s stretched to a short window = thrash,
+        # which reads as a defect - P4-6z's diagnosis).
         checked, bad_fit, natural = 0, [], 0
         for d in fits:
             fv, lv = fnum(d, "fit"), fnum(d, "len")
             if fv is None or lv is None or lv <= 0.001:
                 continue
             checked += 1
-            want = min(1700.0, lv * 1000.0)
+            want = lv * 1000.0           # ground speed: fit == clip length
             if abs(fv - want) > 2.0:
                 bad_fit.append((d, want))
-            elif lv * 1000.0 < 1700.0:
-                natural += 1      # only a row that AGREES may be counted as
-                                  # "played at its own rate"
+            else:
+                natural += 1
         if checked:
             print("  " + verdict(not bad_fit,
-                                 "fit= is min(1700, clip length) on every window"
-                                 " (%d checked)" % checked))
+                                 "fit= equals the clip's own length (ground speed 1.0x)"
+                                 " on every window (%d checked)" % checked))
             if bad_fit:
                 d0, w0 = bad_fit[0]
                 print("        e.g. %s: len=%s fit=%s, expected %.0f."
                       % (d0.get("_ts", "?"), d0.get("len", "-"),
                          d0.get("fit", "-"), w0))
             if natural:
-                print("  NOTE  %d/%d window(s) played the clip at its OWN rate"
-                      " (fit<1700) - the record" % (natural, checked))
-                print("        the new question selects is shorter than the window,"
-                      " which is exactly the")
-                print("        case the no-stretch clamp exists for.  It then holds"
-                      " its last pose for the")
-                print("        remainder (setLoop(false)) - a follow-through, not a"
-                      " freeze bug.")
-            else:
-                print("  NOTE  no window played at its own rate ⇒ every record"
-                      " selected this trip is")
-                print("        still LONGER than the window (fit=kRideSwingTechMs"
-                      " throughout), so the")
-                print("        no-stretch clamp was inert - or the fit= check above"
-                      " already failed.")
+                print("  NOTE  %d/%d window(s) played the clip at its OWN rate."
+                      % (natural, checked))
         else:
-            print("  NOTE  no close row carried both fit= and len=, so the clamp is"
+            print("  NOTE  no close row carried both fit= and len=, so ground speed is"
                   " unmeasured this trip.")
 
     # ---- 5) what this file cannot say --------------------------------------
@@ -5571,7 +5549,8 @@ def report_swing_host(s):
                          "stillWanted/Ogre enabled stayed on at every measured close"))
 
     # ---- 4) current timing and serial restart --------------------------------
-    WIN, CAP = 700, 780
+    # P4-6z (2026-09-12): window 1000 ms, hard cap 1100, base gap 1200 (1.2 s / cut).
+    WIN, CAP = 1000, 1100
     mss = [v for v in (fnum(d, "ms") for d in s.sw_close) if v is not None]
     if mss:
         early = [v for v in mss if v < WIN - 1]
@@ -5579,7 +5558,7 @@ def report_swing_host(s):
         print("  window lengths: %s ms (target %d; hard cap %d)" %
               ("/".join("%d" % v for v in mss[:12]), WIN, CAP))
         print("  " + verdict(not early and not capped,
-                             "all measured windows closed on the 700 ms clock"))
+                             "all measured windows closed on the 1000 ms clock"))
     bad_rst = []
     for d in s.sw_rides:
         sw, rs = fnum(d, "swing"), fnum(d, "rst")
