@@ -3703,6 +3703,11 @@ struct RideCombatRuntime
     int mixCursor;
     int mixIdx;
     int mixCount[kRideMixCount];
+    // 🆕 P4-6ah: combat facing (node yaw toward the enemy).  faceDeg is this frame's applied
+    // angle, faceFrames/faceDegMax are the per-ride self-proof: frames turned, largest angle.
+    float faceDeg;
+    int faceFrames;
+    int faceDegMax;
     int stumbleNameLines;
 };
 
@@ -5105,11 +5110,28 @@ static void RideStanceRedraw(Character* rider)
     }
 }
 
+// 🆕 P4-6ah (2026-09-12, user: 「打着打着人物就头朝后面去了…能不能让人物战斗时就用原版的索敌，
+// 招式都往敌人身上打」).  COMBAT FACING comes back - but at the NODE, not the spine.
+// Why not the spine: the technique's own torso tracks are live (the free list hands them the spine)
+// and they carry the stroke's whip; masking them to twist the spine was tried in P4-1M and reads
+// stiff.  Why the node works: the rider's node is world-space and the whole skeleton hangs off it,
+// so ONE yaw turns the body - and every clip, authored to strike "forward", then strikes toward
+// the enemy.  Measured torso yaw per mix clip (skelanims.py, relative to the BODY): `chop left`
+// -2..+2 deg, `chop down*` -9..+16, `heavy downcut` -29..0, `bigchopv2` -29..+18,
+// `downward combo` -42..0 - i.e. the clip's aim is a rotation of the body, so a body that faces
+// the mount's travel heading instead of the enemy puts the whole stroke on the wrong side.
+// ⚠️ The cap is real and deliberately modest: this yaw rotates the STRADDLE too (the legs hang off
+// the same node while the mount is a different node), so a large angle sits the rider sideways on
+// the animal.  60 deg keeps the legs near the flanks while covering every ordinary fight; raise it
+// only if the user reports the aim still falling short.
+static const float kRideCombatFaceMaxDeg = 60.0f;
+
 // Orient the rider's scene node after the game's own update.  The carry physics pins
 // the rider horizontally (lying flat, belly up); we override the render-node
 // orientation so the seated pose is drawn upright.  Facing is ALWAYS the mount's
 // direction of travel - never a head/body bone, never a manual tune (dropped
 // 2026-08-23); the node is world-space so no bone-local conversion is needed.
+// ⚠️ P4-6ah adds ONE exception: while the combat stance is up, facing is the ENEMY (see below).
 static void ApplyRiderOrientation(Character* rider, const SeatInfo& seat, Character* mount)
 {
     if (!rider || !mount) return;
@@ -5177,6 +5199,58 @@ static void ApplyRiderOrientation(Character* rider, const SeatInfo& seat, Charac
         fwd = Ogre::Vector3(0.0f, 0.0f, 1.0f);
     else
         fwd.normalise();
+
+    // 🆕 P4-6ah: COMBAT FACING.  Out of combat the rider faces the mount's direction of travel;
+    // IN A FIGHT he faces the ENEMY (the user's ask: 「战斗时就用原版的索敌，招式都往敌人身上打」).
+    // The enemy comes from RideNearestThreat - the same four-tier search the stance and the twist
+    // aim by, i.e. the engine's own books (rider target -> rider attackers -> mount target ->
+    // mount attackers), so this is the vanilla answer and not a second opinion.
+    // The yaw is applied to the NODE below (world-space, carries the whole skeleton), which is
+    // what makes an ordinary "strike forward" clip strike at the enemy.  Read with advance=false:
+    // HaltAndForceSitPass owns the once-per-frame hold counter.
+    {
+        RideCombatRuntime* frt = FindRideCombatRuntime(rider);
+        if (frt) frt->faceDeg = 0.0f;
+        if (RideCombatStance(rider, mount, seat, false))
+        {
+            Character* foe = RideNearestThreat(rider, mount, NULL);
+            if (foe && foe != mount)
+            {
+                Ogre::Vector3 toFoe = foe->getPosition() - rider->getPosition();
+                toFoe.y = 0.0f;
+                if (toFoe.length() > 0.05f)
+                {
+                    toFoe.normalise();
+                    float dt = fwd.dotProduct(toFoe);
+                    if (dt >  1.0f) dt =  1.0f;
+                    if (dt < -1.0f) dt = -1.0f;
+                    // +deg turns fwd toward the rider's LEFT, because the skeleton frame is
+                    // +X = left, +Y = up, +Z = forward (P2-1b), so a rotation about +Y by the
+                    // signed angle atan2(up . fwd x toFoe, fwd . toFoe) lands exactly on toFoe.
+                    const Ogre::Vector3 up(0.0f, 1.0f, 0.0f);
+                    float cr  = up.dotProduct(fwd.crossProduct(toFoe));
+                    float deg = Ogre::Math::ATan2(cr, dt).valueDegrees();
+                    if (deg >  kRideCombatFaceMaxDeg) deg =  kRideCombatFaceMaxDeg;
+                    if (deg < -kRideCombatFaceMaxDeg) deg = -kRideCombatFaceMaxDeg;
+                    Ogre::Quaternion turn(Ogre::Degree(deg), up);
+                    Ogre::Vector3 turned = turn * fwd;
+                    turned.y = 0.0f;
+                    if (turned.length() > 0.001f)
+                    {
+                        turned.normalise();
+                        fwd = turned;
+                        if (frt)
+                        {
+                            frt->faceDeg = deg;
+                            ++frt->faceFrames;
+                            if (frt->faceDegMax < (int)(deg < 0.0f ? -deg : deg))
+                                frt->faceDegMax = (int)(deg < 0.0f ? -deg : deg);
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     // Build a world orientation that makes the rider face the mount's forward.
     // FromAxes maps local +Z to its third argument (worldFace).  In-game testing
@@ -6404,6 +6478,9 @@ static Ogre::Quaternion RideCushionQ(int i)
 // RideTwistTargetDeg always returns 0 (its early return is the real switch).  Constants stay
 // for the log/reader; do not re-open by only raising the max.
 static const float kRideTwistMaxDeg   = 0.0f;   // retired (was 90 after the face-enemy ask)
+// 🆕 P4-6ah: the face-enemy ask comes back at the NODE.  The constant lives with the function
+// that applies it (kRideCombatFaceMaxDeg, defined just above ApplyRiderOrientation); the spine
+// route stays retired.
 // kRideTwistNoTgtDeg (was 30 until 2026-09-05) deleted: unused after the early-return switch.
 // That constant was the only source of gratuitous twist when no target was identifiable.
 static const float kRideTwistMinDeg   = 1.0f;   // below this we hand the spine back entirely
@@ -8569,7 +8646,7 @@ void Dismount(Character* rider)
         char sws[512];
         _snprintf_s(sws, 512, _TRUNCATE,
             "Riding: P43SW ride rider=%p swing=%d rst=%d drv=%d arm=%d postarm=%d swfree=%d tech=%d skip=%d noclip=%d "
-            "hostkeep=%d hdveto=%d dmin=%.2f limlast=%.2f aspd=%.3f gap=%d hskipN=%d mix=[%s]",
+            "hostkeep=%d hdveto=%d dmin=%.2f limlast=%.2f aspd=%.3f gap=%d hskipN=%d face=%d/%d mix=[%s]",
             (void*)rider,
             rideRt ? rideRt->swingCount : 0,
             rideRt ? rideRt->restarts : 0,
@@ -8587,6 +8664,8 @@ void Dismount(Character* rider)
             rideRt ? rideRt->attackSpeed : 1.0f,
             rideRt ? rideRt->gapMs : kRideSwingMinGapMs,
             rideRt ? rideRt->hitSkips : 0,
+            rideRt ? rideRt->faceFrames : 0,
+            rideRt ? rideRt->faceDegMax : 0,
             mixv);
         DebugLog(std::string(sws));
     }

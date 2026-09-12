@@ -5640,6 +5640,29 @@ def report_swing_host(s):
     else:
         print("  NOTE  no P43SW ride row carried mix= - this log predates P4-6ag.")
 
+    # ---- 4d) combat facing (P4-6ah) ------------------------------------------
+    # face=F/D on the ride line: F frames the rider's NODE was yawed toward the enemy,
+    # D the largest angle applied (kRideCombatFaceMaxDeg caps it at 60).  face=0 with
+    # swing>0 means the stance never armed (or no threat resolved), because the yaw is
+    # applied exactly when RideCombatStance is up.
+    frows = [(d.get("_ts", "?"), d.get("face"), fnum(d, "swing"))
+             for d in s.sw_rides if d.get("face")]
+    if frows:
+        for (t, v, sw) in frows:
+            p = str(v).split("/")
+            n = p[0] if p else "?"
+            mx = p[1] if len(p) > 1 else "?"
+            print("  face @%s: %s frame(s) turned toward the enemy, max %s deg"
+                  " (swing=%s)" % (t, n, mx, "?" if sw is None else int(sw)))
+        bad_face = [(t, v) for (t, v, sw) in frows
+                    if sw is not None and int(sw) > 0 and str(v).split("/")[0] in ("0", "")]
+        print("  " + verdict(not bad_face,
+                             "every ride that swung also turned to face its enemy"))
+        for (t, v) in bad_face[:8]:
+            print("        %8s face=%s with swing>0" % (t, v))
+    else:
+        print("  NOTE  no P43SW ride row carried face= - this log predates P4-6ah.")
+
     # ---- 5) retired writers stay retired -------------------------------------
     # ⚠️ P4-6af-3: only the AUTHORED-ARM counters are still retired.  `drv=` (Drive has been the
     # visible writer since P4-6V), `swfree=` (the free-bone mask since T23) and `fit=` (the clip's
