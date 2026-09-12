@@ -3740,6 +3740,7 @@ struct RideCombatRuntime
     float faceDeg;
     float faceDegCur;
     DWORD faceTick;
+    DWORD headTick;   // 🆕 P4-6am: wall clock the heading's turn rate is measured against
     Character* faceTgt;
     int faceFrames;
     int faceDegMax;
@@ -5224,24 +5225,42 @@ static void ApplyRiderOrientation(Character* rider, const SeatInfo& seat, Charac
     // while moving that IS "the way it is going", and it ignores head/back bones
     // swivelling mid-run.  Nearly stationary -> HOLD last heading; never moved yet ->
     // fall back to body-bone forward.
+    // 🆕 P4-6am: the heading is a CONTINUOUS quantity.  Until now it was HOLD-or-REPLACE: a travel
+    // delta that failed the veto left the last heading untouched, and the first delta that passed
+    // replaced it outright.  The P43FC probe measured what that costs (2026-09-12 session,
+    // logs\RE_Kenshi_log_20260912_p46al.txt): hdveto=21544 on ONE ride - the veto fired on roughly
+    // a third of all frames - and every release came back as a 30-60 deg jump (hdjump=60 x6).
+    // That is BOTH user reports in one mechanism: after a fight the heading stays STUCK on a stale
+    // direction (「退出战斗后朝向有时不跟随动物前进方向」) and when it finally moves it JUMPS
+    // (「突然向后转」).
+    // ⇒ the heading is now ROTATED toward the best available answer, never assigned, and the
+    //   answer itself is never allowed to be a lie.  Sources, in order of preference:
+    //   (a) the travel delta, while the animal's own facing agrees it is going that way (an animal
+    //       walks where it points, so this is the ordinary frame);
+    //   (b) the animal's own facing - getFacingDirection() is the engine's non-virtual answer and,
+    //       unlike the delta, a shove or knockback cannot make it lie.  This is what keeps the
+    //       heading LIVE instead of frozen while the delta keeps failing (a);
+    //   (c) nothing new -> keep rotating toward the last answer.
     static const float kHeadingMoveEps = 0.03f;   // per-frame horizontal move to count as "traveling"
-    // ⚠️ Same-hemisphere test between the travel delta and the animal's OWN facing (2026-09-02,
-    // trip 19 report: "人物在牛背上打架的时候会突然转向牛屁股的方向").  This is the arbiter: the
-    // delta may only refresh the heading while it agrees with where the animal's body points.
-    // 🆕 P4-6al (2026-09-12, user: 「砍着砍着人物会突然向后转然后转回来」): 0.0f was measured as
-    // enough for a REVERSAL, but a pure SIDESTEP reads dot ~= 0 and sailed through, and the doc
-    // for this constant has said all along that 0.25 (~75 deg) is the knob for exactly that
-    // report.  A real walk/turn keeps dot near 1 (an animal walks where it points), so 0.25 costs
-    // nothing on the ordinary frame and rejects everything that is not "the body is going that way".
+    // The delta may only be used while it agrees with where the animal's BODY points.  0.25 ~= 75
+    // deg: a real walk/turn keeps dot near 1, a sidestep/shove reads dot ~= 0 or less.
     static const float kHeadingFaceMinDot = 0.25f;
-    // 🆕 P4-6al: and a single frame cannot legitimately turn the animal this far.  A delta that
-    // disagrees with the HELD heading by more than this is a shove, a knockback spike or a stale
-    // position (the mount's movement position is not smooth under physics), so hold the last good
-    // heading - the same answer the veto above gives, for the same reason.  At any real frame rate
-    // a genuine turn is a few degrees per frame; a hitch just costs the heading a frame or two.
-    static const float kHeadingMaxStepDeg = 60.0f;
+    // The held heading's turn rate, wall-clock based, plus a per-frame ceiling (which also covers a
+    // paused game: GetTickCount keeps running while the game does not).
+    static const float kHeadingRateDegPerSec = 360.0f;   // 0 -> 90 deg in 250 ms
+    static const float kHeadingMaxStepDeg    = 20.0f;    // per frame, whatever the clock says
+
     Ogre::Vector3 fwd(0.0f, 0.0f, 1.0f);
     bool haveFwd = false;
+    Ogre::Vector3 faceDir(0.0f, 0.0f, 1.0f);
+    bool haveFace = GetMountFacingDirection(mount, faceDir);
+    if (haveFace)
+    {
+        faceDir.y = 0.0f;
+        if (faceDir.length() > 0.001f) faceDir.normalise(); else haveFace = false;
+    }
+    Ogre::Vector3 wantDir(0.0f, 0.0f, 1.0f);
+    bool haveWant = false;
     CharMovement* mv = mount->getMovement();
     if (mv)
     {
@@ -5251,51 +5270,75 @@ static void ApplyRiderOrientation(Character* rider, const SeatInfo& seat, Charac
         {
             Ogre::Vector3 d = cur - lp->second;
             d.y = 0.0f;
-            if (d.length() > kHeadingMoveEps)   // moving: refresh the travel heading
+            if (d.length() > kHeadingMoveEps)
             {
                 d.normalise();
-                // ⚠️ Veto a heading that fights the animal's own facing.  Trip 19 report:
-                // "人物在牛背上打架的时候会突然转向牛屁股的方向".  In a fight the mount backs
-                // off, gets knocked back and sidesteps WITHOUT turning its body, so the position
-                // delta reverses while the body does not - and the rider, whose facing IS that
-                // delta, swings round to look at the mount's rear.  kHeadingMoveEps is 0.03 per
-                // frame (~1.8 u/s at 60 fps), so even a shove is enough to refresh it, and the
-                // nlerp below only makes the spin smooth instead of instant.
-                // getFacingDirection() is the engine's own answer to "where is this animal
-                // pointing" (:2499, non-virtual, cannot degenerate), so it is used as an ARBITER,
-                // never as a new facing source: refresh only while the two agree on the
-                // hemisphere, otherwise HOLD the last good heading - which is exactly what
-                // already happens while the mount stands still.  An animal walks where it
-                // points, so on every ordinary frame dot > 0 and nothing changes.
-                Ogre::Vector3 face;
-                bool holdHeading = false;
-                if (!GetMountFacingDirection(mount, face)
-                    || d.dotProduct(face) > kHeadingFaceMinDot)
+                if (!haveFace || d.dotProduct(faceDir) > kHeadingFaceMinDot)
                 {
-                    // P4-6al: second test - a jump this large in ONE frame is not a turn.
-                    boost::unordered_map<Character*, Ogre::Vector3>::iterator hd2 = mountHeadingDir.find(mount);
-                    if (hd2 != mountHeadingDir.end() && kHeadingMaxStepDeg > 0.0f)
-                    {
-                        float dotHeld = hd2->second.dotProduct(d);
-                        if (dotHeld >  1.0f) dotHeld =  1.0f;
-                        if (dotHeld < -1.0f) dotHeld = -1.0f;
-                        if (Ogre::Math::ACos(dotHeld).valueDegrees() > kHeadingMaxStepDeg)
-                            holdHeading = true;
-                    }
-                    if (!holdHeading) mountHeadingDir[mount] = d;
+                    wantDir = d;            // (a) the animal is travelling the way it points
+                    haveWant = true;
                 }
                 else
-                    holdHeading = true;
-                if (holdHeading)
                 {
                     RideCombatRuntime* rt = FindRideCombatRuntime(rider);
-                    if (rt) ++rt->headVeto;
+                    if (rt) ++rt->headVeto;   // the delta is a shove, not a direction
                 }
             }
         }
         mountHeadingPos[mount] = cur;
-        boost::unordered_map<Character*, Ogre::Vector3>::iterator hd = mountHeadingDir.find(mount);
-        if (hd != mountHeadingDir.end()) { fwd = hd->second; haveFwd = true; }
+    }
+    if (!haveWant && haveFace) { wantDir = faceDir; haveWant = true; }   // (b) the body's own answer
+
+    boost::unordered_map<Character*, Ogre::Vector3>::iterator hd = mountHeadingDir.find(mount);
+    if (hd == mountHeadingDir.end())
+    {
+        if (haveWant) { mountHeadingDir[mount] = wantDir; }
+    }
+    else if (haveWant)
+    {
+        RideCombatRuntime* rt = FindRideCombatRuntime(rider);
+        DWORD now = GetTickCount();
+        DWORD dtms = 0;
+        if (rt)
+        {
+            if (rt->headTick != 0) dtms = now - rt->headTick;
+            rt->headTick = now;
+        }
+        float step = kHeadingRateDegPerSec * (float)dtms / 1000.0f;
+        if (step < 0.0f) step = 0.0f;
+        if (step > kHeadingMaxStepDeg) step = kHeadingMaxStepDeg;
+        Ogre::Vector3 held = hd->second;
+        held.y = 0.0f;
+        if (held.length() > 0.001f)
+        {
+            held.normalise();
+            float dotH = held.dotProduct(wantDir);
+            if (dotH >  1.0f) dotH =  1.0f;
+            if (dotH < -1.0f) dotH = -1.0f;
+            float ang = Ogre::Math::ACos(dotH).valueDegrees();
+            if (ang > 0.05f)
+            {
+                if (ang <= step || step <= 0.0f)
+                    held = wantDir;
+                else
+                {
+                    // Yaw about the world up - everything here is horizontal, and it makes the
+                    // antiparallel case (a true 180) a turn rather than an undefined axis.
+                    const Ogre::Vector3 up(0.0f, 1.0f, 0.0f);
+                    float sgn = (up.dotProduct(held.crossProduct(wantDir)) >= 0.0f) ? 1.0f : -1.0f;
+                    Ogre::Quaternion q(Ogre::Degree(step * sgn), up);
+                    Ogre::Vector3 turned = q * held;
+                    turned.y = 0.0f;
+                    if (turned.length() > 0.001f) { turned.normalise(); held = turned; }
+                    else held = wantDir;
+                }
+                mountHeadingDir[mount] = held;
+            }
+        }
+    }
+    {
+        boost::unordered_map<Character*, Ogre::Vector3>::iterator hd2 = mountHeadingDir.find(mount);
+        if (hd2 != mountHeadingDir.end()) { fwd = hd2->second; haveFwd = true; }
     }
     if (!haveFwd)
         fwd = GetMountForward(seat, mount);   // never traveled yet: body-bone forward
