@@ -7408,6 +7408,30 @@ static Character* gOwnerAuditRider  = NULL;
 static int        gOwnerAuditFrames = 0;
 static int        gOwnerAuditLines  = 0;
 static DWORD      gOwnerAuditNext   = 0;
+// 🆕 P4-6ao: the audit above proves WHAT WE OWN is clean.  The user's 「全身在抖、下马后一直存在」
+// therefore has to be something else moving the rider, and the two candidates are separable by
+// measuring WHICH THING oscillates, per frame:
+//   * the render NODE - that is placement.  Only two things write it: our SyncRiderNode (ride
+//     only) and the engine's carry/ragdoll drag, which the ride fights every frame with
+//     `_NV_ragdollModeUT(false, CARRY_MODE)` and which an engine restorer is known to re-apply
+//     (HISTORY: the "mystery ~10 u node writer").  After a dismount nobody fights it any more.
+//   * the ROOT BONE (`Bip01`) - that is the animation layer, i.e. two clips fighting over the
+//     skeleton rather than over the node.
+// So: per-frame |delta| of both, accumulated per 600 ms window, plus the carry/ragdoll flags.
+static Ogre::Vector3 gOwnerAuditPrevNode(0.0f, 0.0f, 0.0f);
+static Ogre::Vector3 gOwnerAuditPrevRoot(0.0f, 0.0f, 0.0f);
+static bool  gOwnerAuditHave    = false;
+static int   gOwnerAuditN       = 0;
+static float gOwnerAuditNodeSum = 0.0f, gOwnerAuditNodeMax = 0.0f;
+static float gOwnerAuditRootSum = 0.0f, gOwnerAuditRootMax = 0.0f;
+
+static void ResetOwnerAuditMotion()
+{
+    gOwnerAuditHave    = false;
+    gOwnerAuditN       = 0;
+    gOwnerAuditNodeSum = gOwnerAuditNodeMax = 0.0f;
+    gOwnerAuditRootSum = gOwnerAuditRootMax = 0.0f;
+}
 
 static void StartOwnerAuditWatch(Character* rider)
 {
@@ -7416,6 +7440,7 @@ static void StartOwnerAuditWatch(Character* rider)
     gOwnerAuditFrames = 420;   // ~3-7 s of frames
     gOwnerAuditLines  = 6;
     gOwnerAuditNext   = 0;
+    ResetOwnerAuditMotion();
     RideOwnerAudit(rider, "dismount", 1);
 }
 
@@ -7425,12 +7450,57 @@ static void ServiceOwnerAuditWatch()
     if (!gOwnerAuditRider || gOwnerAuditFrames <= 0) return;
     --gOwnerAuditFrames;
     if (!CharacterLooksLive(gOwnerAuditRider)) { gOwnerAuditRider = NULL; return; }
+
+    // --- per-frame motion sampling (P4-6ao) ------------------------------------------------
+    Character* r = gOwnerAuditRider;
+    AnimationClass* rAnim = r->getAnimationClass();
+    Ogre::Vector3 nodePos = r->getPosition();
+    Ogre::Vector3 rootPos = nodePos;
+    bool haveBones = false;
+    if (rAnim && rAnim->node)
+    {
+        nodePos = rAnim->node->getPosition();
+        if (rAnim->skeleton && rAnim->getHasBone(std::string("Bip01")))
+        {
+            Ogre::OldBone* rb = rAnim->_getBone(std::string("Bip01"));
+            if (rb) { rootPos = rb->_getDerivedPosition(); haveBones = true; }
+        }
+    }
+    if (gOwnerAuditHave)
+    {
+        float dn = (nodePos - gOwnerAuditPrevNode).length();
+        float dr = haveBones ? (rootPos - gOwnerAuditPrevRoot).length() : 0.0f;
+        gOwnerAuditNodeSum += dn; if (dn > gOwnerAuditNodeMax) gOwnerAuditNodeMax = dn;
+        gOwnerAuditRootSum += dr; if (dr > gOwnerAuditRootMax) gOwnerAuditRootMax = dr;
+        ++gOwnerAuditN;
+    }
+    gOwnerAuditPrevNode = nodePos;
+    gOwnerAuditPrevRoot = rootPos;
+    gOwnerAuditHave = true;
+
     DWORD now = GetTickCount();
     if (gOwnerAuditLines > 0 && (gOwnerAuditNext == 0 || now >= gOwnerAuditNext))
     {
         gOwnerAuditNext = now + 600;
         --gOwnerAuditLines;
-        RideOwnerAudit(gOwnerAuditRider, "watch", 1);
+        RideOwnerAudit(r, "watch", 1);
+        if (gOwnerAuditN > 0)
+        {
+            int rag = 0, carried = 0, carrying = 0;
+            try { rag = rAnim ? (rAnim->isRagdoll() ? 1 : 0) : 0; } catch (...) { rag = -1; }
+            try { carried  = r->_isBeingCarried ? 1 : 0; } catch (...) { carried = -1; }
+            try { carrying = r->isCarryingSomething ? 1 : 0; } catch (...) { carrying = -1; }
+            char mb[288];
+            _snprintf_s(mb, 288, _TRUNCATE,
+                "Riding: RIDE30m watch rider=%p n=%d nodeMean=%.4f nodeMax=%.4f rootMean=%.4f rootMax=%.4f "
+                "rag=%d carried=%d carrying=%d",
+                (void*)r, gOwnerAuditN,
+                gOwnerAuditNodeSum / (float)gOwnerAuditN, gOwnerAuditNodeMax,
+                gOwnerAuditRootSum / (float)gOwnerAuditN, gOwnerAuditRootMax,
+                rag, carried, carrying);
+            DebugLog(std::string(mb));
+        }
+        ResetOwnerAuditMotion();
     }
     if (gOwnerAuditFrames <= 0 || gOwnerAuditLines <= 0) gOwnerAuditRider = NULL;
 }
