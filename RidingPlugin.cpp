@@ -7290,6 +7290,151 @@ static int LegMaskResidueCount(AnimationClass* rAnim)
     return residue;
 }
 
+// ---- 🆕 P4-6an: WHAT IS STILL DRIVING THE RIDER AFTER DISMOUNT ------------------------------
+// The user's report is 「持续抖／只有腿抖／一站立就抖，跑起来看不出／空手立直姿势也抖」 - a leg-only,
+// idle-only signature.  Two things sit OUTSIDE the reach of the dismount handback audit above:
+//   * `LegMaskResidueCount` checks the 7 leg-pose bones and the 15 free bones.  The HOLD table -
+//     `Bip01` (root) and both FEET - is masked to 0.0 on the technique state and is in NEITHER
+//     list, so a stale entry there is invisible to it;
+//   * nothing at all audits what is still PLAYING.  A residue at partial weight does not overwrite
+//     the idle, it BLENDS with it - and the leg tracks are where a leftover ride pose differs most
+//     from a standing idle, which is exactly the reported shape (invisible while running, because
+//     the run owns the legs).
+// And it runs ONCE, on the dismount frame, while the report says the shake is visible later, while
+// standing.  So: scan every live entry (name + weight), every blend-mask entry on every bone we
+// ever touch (union of the four tables, deduped), and every manually controlled bone - once at
+// dismount and a few times over the following seconds.
+static void RideOwnerAudit(Character* rider, const char* why, int verbose)
+{
+    if (!rider || !CharacterLooksLive(rider)) return;
+    AnimationClass* rAnim = rider->getAnimationClass();
+    if (!rAnim || !rAnim->layer.valid()) return;
+    unsigned int nl = rAnim->layer.size();
+    if (nl == 0 || nl > 32) return;
+
+    // The union of every bone this plugin ever writes a mask entry for.
+    const char* names[64];
+    int nn = 0;
+    for (int i = 0; i < kLegPoseBoneCount && nn < 64; ++i)      names[nn++] = kLegPoseBones[i];
+    for (int i = 0; i < kRideSwingHoldCount && nn < 64; ++i)    names[nn++] = kRideSwingHoldBones[i];
+    for (int i = 0; i < kRideSwingFreeCount && nn < 64; ++i)    names[nn++] = kRideSwingFreeBones[i];
+    for (int i = 0; i < kRideWristCount && nn < 64; ++i)        names[nn++] = kRideWristBones[i];
+    // dedupe (thighs/calves/hands appear in two tables) so the counts mean "bones", not "entries"
+    for (int i = 0; i < nn; ++i)
+        for (int j = i + 1; j < nn; )
+        {
+            if (std::string(names[i]) == std::string(names[j]))
+            { for (int k = j; k + 1 < nn; ++k) names[k] = names[k + 1]; --nn; }
+            else ++j;
+        }
+
+    unsigned short handles[64];
+    bool has[64];
+    for (int i = 0; i < nn; ++i)
+    {
+        has[i] = rAnim->getHasBone(std::string(names[i]));
+        handles[i] = 0;
+        if (has[i]) { Ogre::OldBone* b = rAnim->_getBone(std::string(names[i])); if (b) handles[i] = b->getHandle(); else has[i] = false; }
+    }
+
+    char liveList[220];
+    liveList[0] = 0;
+    int lo = 0, liveN = 0, masked = 0;
+    char mFirst[96];  mFirst[0] = 0;
+    for (unsigned int li = 0; li < nl; ++li)
+    {
+        AnimationClassBase::AnimationLayer* lay = rAnim->layer[li];
+        if (!lay || !lay->addList.valid()) continue;
+        unsigned int n = lay->addList.size();
+        if (n > 64) continue;
+        for (unsigned int ai = 0; ai < n; ++ai)
+        {
+            AnimationClassBase::SingleAnimation* sa = lay->addList[ai];
+            if (!sa) continue;
+            if (sa->weight > 0.02f)
+            {
+                ++liveN;
+                if (lo < (int)sizeof(liveList) - 24)
+                {
+                    int w = _snprintf_s(liveList + lo, sizeof(liveList) - (size_t)lo, _TRUNCATE,
+                                        "%s'%s':%.2f", (lo ? " " : ""), sa->animName.c_str(), sa->weight);
+                    if (w < 0) break;
+                    lo += w;
+                }
+                if (!sa->mainState || !sa->mainState->hasBlendMask()) continue;
+                for (int i = 0; i < nn; ++i)
+                {
+                    if (!has[i]) continue;
+                    unsigned short bmn = rAnim->skeleton ? rAnim->skeleton->getNumBones() : 0;
+                    if (handles[i] >= bmn) continue;
+                    if (sa->mainState->getBlendMaskEntry((size_t)handles[i]) < 0.999f)
+                    {
+                        ++masked;
+                        if (!mFirst[0])
+                            _snprintf_s(mFirst, 96, _TRUNCATE, "%s@%s", names[i], sa->animName.c_str());
+                    }
+                }
+            }
+        }
+    }
+
+    char manFirst[64];
+    manFirst[0] = 0;
+    int manual = 0;
+    unsigned short nb = rAnim->skeleton ? rAnim->skeleton->getNumBones() : 0;
+    for (int i = 0; i < nn; ++i)
+    {
+        if (!has[i] || handles[i] >= nb) continue;
+        Ogre::OldBone* b = rAnim->_getBone(std::string(names[i]));
+        if (!b) continue;
+        if (b->isManuallyControlled())
+        {
+            ++manual;
+            if (!manFirst[0]) _snprintf_s(manFirst, 64, _TRUNCATE, "%s", names[i]);
+        }
+    }
+
+    if (!verbose && masked == 0 && manual == 0) return;   // quiet when nothing is wrong
+    char b[420];
+    _snprintf_s(b, 420, _TRUNCATE,
+        "Riding: RIDE30 %s rider=%p live=%d masked=%d/%d manual=%d first='%s' firstman='%s' [%s] f=%u",
+        why, (void*)rider, liveN, masked, nn, manual, mFirst, manFirst, liveList, gP3Frames);
+    DebugLog(std::string(b));
+}
+
+// Watch window for the audit above: the shake is reported while STANDING (i.e. not necessarily on
+// the dismount frame), so keep looking for a few seconds after the ride ends.
+static Character* gOwnerAuditRider  = NULL;
+static int        gOwnerAuditFrames = 0;
+static int        gOwnerAuditLines  = 0;
+static DWORD      gOwnerAuditNext   = 0;
+
+static void StartOwnerAuditWatch(Character* rider)
+{
+    if (!rider) return;
+    gOwnerAuditRider  = rider;
+    gOwnerAuditFrames = 420;   // ~3-7 s of frames
+    gOwnerAuditLines  = 6;
+    gOwnerAuditNext   = 0;
+    RideOwnerAudit(rider, "dismount", 1);
+}
+
+// Called once per frame from HaltAndForceSitPass (the pass that always runs).
+static void ServiceOwnerAuditWatch()
+{
+    if (!gOwnerAuditRider || gOwnerAuditFrames <= 0) return;
+    --gOwnerAuditFrames;
+    if (!CharacterLooksLive(gOwnerAuditRider)) { gOwnerAuditRider = NULL; return; }
+    DWORD now = GetTickCount();
+    if (gOwnerAuditLines > 0 && (gOwnerAuditNext == 0 || now >= gOwnerAuditNext))
+    {
+        gOwnerAuditNext = now + 600;
+        --gOwnerAuditLines;
+        RideOwnerAudit(gOwnerAuditRider, "watch", 1);
+    }
+    if (gOwnerAuditFrames <= 0 || gOwnerAuditLines <= 0) gOwnerAuditRider = NULL;
+}
+
 // ---- P4-3-4g/4h: AUTHOR the swing instead of borrowing one ---------------------------------
 // ⚠️ THE RULING THAT PUT THIS HERE (trip 22, 2026-09-03).  Three rungs tried to play one of the
 // engine's own attack records on a rider: pin a record-backed stand-in ('mid blow', T20/T21), drive
@@ -8914,6 +9059,9 @@ void Dismount(Character* rider)
     ClearRideMaskRuntime(rider);
     ClearRidePoseRuntime(rider);
     DebugLog("Riding: dismounted");
+    // 🆕 P4-6an: every runtime above is gone, so nothing of ours should touch this rider any more -
+    // which is exactly the claim the shake would falsify.  Audit now and watch for a few seconds.
+    StartOwnerAuditWatch(rider);
 }
 
 // ---- rebuild riding state after a save/load ----------------------------------
@@ -9833,6 +9981,9 @@ static void MainLoopImpl(GameWorld* thisptr, float time)
 //    update overrides it.
 static void HaltAndForceSitPass()
 {
+    // 🆕 P4-6an: the post-dismount owner audit.  Untracked-riders-only bookkeeping, so it runs
+    // before the ride loop and is a no-op once its watch window closes.
+    ServiceOwnerAuditWatch();
     if (!riderToMount.empty())
     {
         boost::unordered_map<Character*, Character*>::iterator it = riderToMount.begin();
