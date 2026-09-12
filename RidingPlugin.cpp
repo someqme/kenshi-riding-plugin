@@ -3460,22 +3460,41 @@ static const int   kRideSwingHoldCount = 7;
 // again: the sit pose owns the body out of combat, the combat idle stance owns the upper body
 // while the stance is armed (both resolved through RideCombatHost).  Lower body is unchanged -
 // LegPosePass keeps writing straddle / cushion / sit-height pelvis through the whole ride.
-// The technique Ogre state still takes the upper body for the length of a window.
+// The technique Ogre state still takes the upper body for the length of a window - EXCEPT the
+// right-hand chain that carries the weapon (see kRideSwingWieldBones below).
 // Free list = what the BASE HOST yields during a window (must cover every bone the
-// technique writes, or two writers share a bone).  It is the same 13 bones for both bases:
-// the sit pose and 'guard 1h' write the same upper-body set, and masking by blend entry is
-// per-clip (LegMaskApply walks every weighted clip), so one table serves either host.
+// technique writes, or two writers share a bone).  Same 11 bones for both bases: the sit pose
+// and 'guard 1h' write the same upper-body set, and masking by blend entry is per-clip
+// (LegMaskApply walks every weighted clip), so one table serves either host.
+// ⛔ The two HANDS are NOT here (P4-6C, restored by P4-6af-1).  Letting the technique drive the
+// wrist is what the user reported as 「战斗时让武器竖直」: `bigchopv2`'s own Hand track spans
+// 70 deg and `chop down static` 48.5 deg, and they are authored for a GROUND arm whose elbow
+// starts somewhere else entirely.  With the hands off this list the base host keeps its grip for
+// the whole stroke and the blade follows the arm we let the technique drive.
 static const char* kRideSwingFreeBones[] = {
     "Bip01 Spine", "Bip01 Spine1", "Bip01 Spine2",
     "Bip01 Neck", "Bip01 Head",
     "Bip01 L Clavicle", "Bip01 R Clavicle",
     "Bip01 L UpperArm", "Bip01 R UpperArm",
-    "Bip01 L Forearm", "Bip01 R Forearm",
-    "Bip01 L Hand", "Bip01 R Hand"
+    "Bip01 L Forearm", "Bip01 R Forearm"
 };
-static const int   kRideSwingFreeCount = 13;
-// Legacy names kept so the runtime POD and release paths still compile.  P4-6ad: neither
-// list is applied on the technique state any more (hands/upper body belong to it whole).
+static const int   kRideSwingFreeCount = 11;
+// 🆕 P4-6af-1 (2026-09-12 user: guard 全程基座「会改变战斗时的手部，在战斗时让武器竖直」).
+// The weapon hangs off `Bip01 Prop2`, a CHILD of `Bip01 R Hand` (RE_NOTES §19), and every clip
+// animates BOTH of them: `bigchopv2` spans Prop2 108.1 deg / Hand 70.0 deg, `chop down static`
+// 64.3 / 48.5, `downward combo` 51.5 / 103.4.  So zeroing only the two Hand bones on the
+// technique would still let a ground clip spin the blade inside the host's grip.  These four
+// bones are the whole wield chain, and the TECHNIQUE state gets 0.0 on them for the window -
+// the host keeps them at 1.0, exactly the P4-6C/D split (「手腕留给 host；技法只 mask 双手」)
+// that measured as 「刀不竖直了」.
+static const char* kRideSwingWieldBones[] = {
+    "Bip01 L Hand", "Bip01 R Hand",
+    "Bip01 Prop1",  "Bip01 Prop2"
+};
+static const int   kRideSwingWieldCount = 4;
+// Legacy names kept so the runtime POD and release paths still compile.  P4-6af-1: the hands
+// are ALSO zeroed on the technique state (kRideSwingWieldBones covers them), and this list stays
+// as the hand-custody handle table the hand writer used to key off.
 static const char* kRideWristBones[] = {
     "Bip01 L Hand", "Bip01 R Hand"
 };
@@ -3567,6 +3586,10 @@ struct RideCombatRuntime
     unsigned short holdHandle[kRideSwingHoldCount];
     bool freeHas[kRideSwingFreeCount];
     unsigned short freeHandle[kRideSwingFreeCount];
+    // P4-6af-1: the wield chain (hands + weapon props) zeroed on the TECHNIQUE so the base host
+    // keeps the weapon attitude for the whole stroke.  Resolved with the other swing tables.
+    bool wieldHas[kRideSwingWieldCount];
+    unsigned short wieldHandle[kRideSwingWieldCount];
     // P4-6aa: left arm / neck / head zeroed on the technique, kept by guard (not free).
     bool keepHas[kRideTechKeepGuardCount];
     unsigned short keepHandle[kRideTechKeepGuardCount];
@@ -4355,11 +4378,11 @@ static bool RideSwingDrive(AnimationClass* rAnim, const char* clip, DWORD elapse
         st->setEnabled(true);
         // P4-6l: ramped, not hard 1.0 - see RideSwingBlend.
         st->setWeight(kRideSwingTechW * RideSwingBlend(elapsedMs));
-        // P4-6af: the stance base is 'guard 1h' again, but the technique still owns the FULL
-        // upper body for the window (spine/arms/hands) - that is what the free-bone mask on the
-        // base host hands over.  Only HOLD bones (root+legs) are zeroed here so a ground clip
-        // cannot fight the straddle / sit-height writes in LegPosePass.  No wrist / keep-guard
-        // split: the hands ride the technique's own Hand tracks (P4-6Y).
+        // P4-6af: the stance base is 'guard 1h' again, but the technique still owns the
+        // spine/arms for the window (that is what the free-bone mask on the base host hands
+        // over).  Only HOLD bones (root+legs) are zeroed for the seat, plus - P4-6af-1 - the
+        // whole WIELD chain (both hands and both weapon props), so the ground clip can neither
+        // step the skeleton nor spin the blade inside the host's grip.
         unsigned short nb = rAnim->skeleton ? rAnim->skeleton->getNumBones() : 0;
         if (nb)
         {
@@ -4372,6 +4395,11 @@ static bool RideSwingDrive(AnimationClass* rAnim, const char* clip, DWORD elapse
             {
                 if (!rt->holdHas[i] || rt->holdHandle[i] >= nb) continue;
                 st->setBlendMaskEntry((size_t)rt->holdHandle[i], 0.0f);
+            }
+            for (int i = 0; i < kRideSwingWieldCount; ++i)
+            {
+                if (!rt->wieldHas[i] || rt->wieldHandle[i] >= nb) continue;
+                st->setBlendMaskEntry((size_t)rt->wieldHandle[i], 0.0f);
             }
         }
         return true;
@@ -4405,7 +4433,13 @@ static void RideSwingUndrive(AnimationClass* rAnim, const char* clip)
                 for (int i = 0; i < kRideSwingHoldCount; ++i)
                     if (rt->holdHas[i] && (nb == 0 || rt->holdHandle[i] < nb))
                         st->setBlendMaskEntry((size_t)rt->holdHandle[i], 1.0f);
-                // P4-6ad: no keep/wrist restore - those entries are never written now.
+                // P4-6af-1: and the wield chain, for the same reason the hold bones are listed
+                // here - this state can outlive our ownership (a mask we did not create), and a
+                // 0.0 left on the hands/props is a weapon that keeps its own attitude on a
+                // character that is walking again.
+                for (int i = 0; i < kRideSwingWieldCount; ++i)
+                    if (rt->wieldHas[i] && (nb == 0 || rt->wieldHandle[i] < nb))
+                        st->setBlendMaskEntry((size_t)rt->wieldHandle[i], 1.0f);
             }
         }
         rt->maskMine = false;
@@ -7323,6 +7357,16 @@ static void LegPosePassImpl(AnimationClass* rAnim, AnimationData* poseData, Char
             {
                 Ogre::OldBone* b = rAnim->_getBone(std::string(kRideSwingFreeBones[i]));
                 if (b) swingRt.freeHandle[i] = b->getHandle(); else swingRt.freeHas[i] = false;
+            }
+        }
+        for (int i = 0; i < kRideSwingWieldCount; ++i)
+        {
+            swingRt.wieldHandle[i] = 0;
+            swingRt.wieldHas[i] = rAnim->getHasBone(std::string(kRideSwingWieldBones[i]));
+            if (swingRt.wieldHas[i])
+            {
+                Ogre::OldBone* b = rAnim->_getBone(std::string(kRideSwingWieldBones[i]));
+                if (b) swingRt.wieldHandle[i] = b->getHandle(); else swingRt.wieldHas[i] = false;
             }
         }
         for (int i = 0; i < kRideTechKeepGuardCount; ++i)
