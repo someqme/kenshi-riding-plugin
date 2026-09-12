@@ -3584,15 +3584,30 @@ enum RideCombatPhase
 // the visible stroke, we do not invent damage.  Only the clip name changes.
 // ⚠️ A curated name whose Ogre state is missing is SKIPPED (the cursor moves on); if none of them
 // resolves, the engine's own answer is used unchanged - a missing clip must never cost a swing.
+// ⚠️ P4-6ai: A CLIP IS ONLY AS AIMED AS ITS OWN STROKE PLANE.  The user caught a down-chop that
+// lands 「往旁边空地上劈，几乎垂直于目标90度」, and the clip is the reason, not the facing: measure
+// where the R Hand travels from its highest to its lowest key, in the BODY frame
+// (`skelanims.py`, angle of that horizontal direction from the body's +Z):
+//     chop down static   14 deg   <- forward down-chop
+//     chop down          21 deg   <- forward down-chop
+//     heavy downcut      65 deg   <- diagonal
+//     bigchopv2          65 deg   <- same stroke as heavy downcut, 2.8 s long
+//     chop left          85 deg   <- a HORIZONTAL slash (that is what a horizontal cut is)
+//     desperate attack   68 deg   <- diagonal
+//     downward combo    105 deg   <- a "downward" clip that actually sweeps SIDEWAYS  <- the defect
+//     heavy swing       115 deg   /  flying big chop 3  154 deg   <- worse still
+// ⇒ `downward combo` and `bigchopv2` are out: one is the reported defect, the other is a longer
+// copy of `heavy downcut`'s diagonal.  Body facing (P4-6ah) cannot fix a lateral stroke - the
+// blade still crosses sideways relative to the body.
+// ⛔ The `blow` family (`back blow low` measures 0 deg, a perfect forward chop) is STILL BANNED:
+// those records carry `stumbles` body-part maps and ARE the vanilla hit reaction (P4-6S).
 static const char* const kRideMixClips[] = {
-    "chop left",          // 1.067 s - 右手→左的平砍（引擎自己一直在选的那条）
-    "chop down static",   // 1.300 s - 唯一有 ANIMATION 记录的攻击 clip（P4-6S：下劈观感不错）
-    "chop down",          // 0.967 s - 下砍
-    "downward combo",     // 1.733 s - 双段下劈
-    "heavy downcut",      // 1.633 s - 重下劈
-    "bigchopv2"           // 2.833 s - 引擎 GATE 给的那条重劈（整条播完才有意义）
+    "chop down static",   // 1.300 s  14 deg - 正前方下劈（唯一有 ANIMATION 记录的攻击 clip）
+    "chop down",          // 0.967 s  21 deg - 正前方下劈
+    "heavy downcut",      // 1.633 s  65 deg - 斜劈
+    "chop left"           // 1.067 s  85 deg - 横扫（引擎自己一直在选的那条）
 };
-static const int kRideMixCount = 6;
+static const int kRideMixCount = 4;
 
 // 🆕 P4-6ag: the hit beat follows the CLIP.  A fixed 600 ms was the validated point on `chop left`
 // (600 / 1067 = 56% of the stroke); with 0.97-2.83 s clips in the mix a fixed beat would land the
@@ -4155,16 +4170,30 @@ static int RideSwingDamageImpl(Character* rider, Character* threat, CombatTechni
     // Ungated and budgeted, the P43RD discipline: this CHANGES game state, and state-changing
     // events are never debugContinuous-gated.  The line is the whole verdict on the dispatch -
     // ret= is the engine's own dodge/block answer, dmg= is what it was asked to apply.
+    // 🆕 P4-6ai: the 2026-09-12 session logged `ret=2` (engine: landed) with
+    // `dmg=0.0/0.0/0.0/0.0` on ALL 22 resolutions, while the rider was demonstrably armed
+    // (`P43RD wih=0->1`, `P43SUP real=10` suppressing ten sheathes).  Trip 33/35 on the same code
+    // path read 8.3-20.9.  `reach=`/`d=` are added to separate the two surviving explanations -
+    // "the rider is not actually holding a weapon any more" (reach<=0) vs "the engine computes no
+    // damage for this attacker/target pair" (reach>0 and dmg still 0) - without another trip.
+    float hitReach = -1.0f;
+    float hitDist  = -1.0f;
+    {
+        CombatClass* hcc = rider->getCombatClass();
+        if (hcc) hitReach = hcc->weaponReach();
+        Ogre::Vector3 hd = threat->getPosition() - rider->getPosition();
+        hitDist = Ogre::Math::Sqrt(hd.x * hd.x + hd.z * hd.z);
+    }
     if (rt && rt->hitLines < kRideSwingHitLines)
     {
         ++rt->hitLines;
         const std::string* an = (const std::string*)((const char*)tech + 0x00);
-        char b[256];
-        _snprintf_s(b, 256, _TRUNCATE,
-            "Riding: P43ST rider=%p n=%d ret=%d dmg=%.1f/%.1f/%.1f/%.1f tech='%s' f=%u",
+        char b[320];
+        _snprintf_s(b, 320, _TRUNCATE,
+            "Riding: P43ST rider=%p n=%d ret=%d dmg=%.1f/%.1f/%.1f/%.1f reach=%.2f d=%.2f tech='%s' f=%u",
             (void*)rider, rt->swingCount, (int)ret,
             dmg.cut, dmg.blunt, dmg.pierce, dmg.bleedMult,
-            an->c_str(), gP3Frames);
+            hitReach, hitDist, an->c_str(), gP3Frames);
         DebugLog(std::string(b));
     }
     return (ret == HIT_MISSED) ? 0 : 1;
