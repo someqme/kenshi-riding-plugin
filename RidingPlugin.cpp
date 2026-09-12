@@ -864,7 +864,7 @@ static const int kStanceDrawLines = 8;   // per-ride P43RD line budget
 // briefly leaves the stance radius.  The last field test showed the engine transition
 // wpn=0->1 and then wpn=1->0 about 1.8 s later, which is fast enough to look like no draw
 // at all.  This is a read-side grace in the sheathe suppressor, not a redraw servo.
-static const int kStanceDrawKeepMs = 3000;
+static const int kStanceDrawKeepMs = 1000;
 
 // This state is per rider.  A global edge latch lets one mounted rider overwrite another
 // rider's draw edge, which was reproduced when two riders exchanged mounts.
@@ -5029,6 +5029,37 @@ static void RideSwingPass(Character* rider, Character* mount, AnimationClass* rA
 // (cosmetic at worst: P4-4 force-dismounts on rider down).
 static const int kShSupLines = 10;   // per-ride line budget; NOT debugContinuous-gated
 
+// 🆕 P4-6aq: LEAVING COMBAT.  Clear the engine's combat mark the moment the stance ends, not only
+// at dismount.  The user asked for exactly this after the P4-6ap fix was confirmed («脱离战斗就可以
+// 清掉了，符合原版逻辑»), and the reasoning is the same one that made the dismount case necessary:
+// while carried, `isInCombatMode` never drops on its own (P4-1M: its exit conditions read the
+// rider's own movement, which the carry destroyed), so without this a rider stays flagged from one
+// fight to the next.  Same pair of calls the P4-5 branch makes every frame for riders who can never
+// fight, and the same calls Dismount now makes on the way out.
+// ⚠️ Called ONLY on the stance's falling edge and at dismount - never while the stance is up: the
+// stance's second condition (RideFightIsOn) READS this flag, and P4-1M's user ruling stands
+// (clearing combat mode mid-fight takes the weapon out of the rider's hand).
+// The weapon half needs no code of its own: the sheathe suppressor is gated on `stance`, so once
+// the stance is down the engine's own sheatheWeapon passes through and puts the blade away, which
+// is what «脱离战斗也不再需要拿武器了» asks for.  Only the short post-draw grace
+// (kStanceDrawKeepMs, whose job is to stop a just-drawn weapon being re-sheathed on the very next
+// update) delays it.
+static void ClearRiderCombatMark(Character* rider, const char* why)
+{
+    if (!rider) return;
+    int cm = 0, tgt = 0, cleared = 0;
+    try { cm = rider->isInCombatMode(true, true) ? 1 : 0; } catch (...) { cm = -1; }
+    try { tgt = rider->getAttackTarget().getCharacter() ? 1 : 0; } catch (...) { tgt = -1; }
+    if (cm != 0 || tgt != 0)
+    {
+        try { rider->endCombatMode(); cleared = 1; } catch (...) { cleared = -1; }
+    }
+    char b[192];
+    _snprintf_s(b, 192, _TRUNCATE,
+        "Riding: combat mark %s cm=%d tgt=%d cleared=%d f=%u", why, cm, tgt, cleared, gP3Frames);
+    DebugLog(std::string(b));
+}
+
 // The map/stance half.  Separate from the SEH shell below because it holds iterators (objects
 // with destructors), which C2712 forbids in a function containing __try.
 static bool RideSheatheSuppressedImpl(Character* rider)
@@ -9032,17 +9063,10 @@ void Dismount(Character* rider)
     // combat flag (RideFightIsOn), and clearing combat mode mid-fight is a state the user vetoed in
     // P4-1M (「清了就把刀从骑手手里拿走」).  Only the exit is safe.
     {
-        int cm = 0, tgt = 0, cleared = 0;
-        try { cm = rider->isInCombatMode(true, true) ? 1 : 0; } catch (...) { cm = -1; }
-        try { tgt = rider->getAttackTarget().getCharacter() ? 1 : 0; } catch (...) { tgt = -1; }
-        if (cm != 0 || tgt != 0)
-        {
-            try { rider->endCombatMode(); cleared = 1; } catch (...) { cleared = -1; }
-        }
-        char cb[192];
-        _snprintf_s(cb, 192, _TRUNCATE,
-            "Riding: dismount combat state cm=%d tgt=%d cleared=%d f=%u", cm, tgt, cleared, gP3Frames);
-        DebugLog(std::string(cb));
+        // 🆕 P4-6aq: same leave-combat cleanup as the stance's falling edge (P4-6ap's code, now
+        // shared): after the rider is a normal standing character again, nothing should still say
+        // he is in a fight - that flag is what made a rider who had fought shake on foot.
+        ClearRiderCombatMark(rider, "dismount");
     }
 
     boost::unordered_map<Character*, Character*>::iterator it = riderToMount.find(rider);
@@ -10124,8 +10148,17 @@ static void HaltAndForceSitPass()
                         // combat mode, AND a live threat within kRideThreatDist, with NO
                         // debugContinuous gate.  Route C is gone.  `advance=true`: this is the
                         // once-per-frame caller that ticks the release tail.
+                        // 🆕 P4-6aq: remember last frame's stance BEFORE the advance=true call
+                        // overwrites it, so the 1 -> 0 edge is visible here (this is the only
+                        // once-per-frame caller, so this is the only place the edge can be caught).
+                        RideStanceRuntime* stanceRtPrev = FindRideStanceRuntime(rider);
+                        bool stanceWasOn = stanceRtPrev ? stanceRtPrev->on : false;
                         bool stance = RideCombatStance(rider, mount, sit->second, true);
                         gRideStanceOn = stance;   // read by the DBG tag, nothing else
+                        // 🆕 P4-6aq: leaving combat -> clear the engine's combat mark (and let the
+                        // engine sheathe the weapon; see ClearRiderCombatMark).
+                        if (stanceWasOn && !stance)
+                            ClearRiderCombatMark(rider, "stance-end");
                         // P4-3-3: latch the 0 -> 1 edge for the one-shot re-draw.  UNGATED, and
                         // kept separate from the per-rider diagnostic latch below, which only
                         // advances inside the debugContinuous block - toggling diagnostics must never change whether
