@@ -9016,6 +9016,35 @@ void Dismount(Character* rider)
     // redundant after getDropped(ragdollHim=false), kept as the safety net.
     rider->ragdollMode(false, RagdollPart::CARRY_MODE);
 
+    // 🆕 P4-6ap (2026-09-12).  CLEAR THE ENGINE'S COMBAT MARK ON THE WAY OUT.
+    // The user's diagnosis, from the outside and without the log: 「人物虽然打完架但是那个战斗中的
+    // 印记没有清理所以会抖，没打过架的人物下马就不会抖动」.  That fits the P4-1M finding exactly -
+    // WHILE CARRIED, `isInCombatMode` never drops, because every exit condition it has reads state
+    // that the carry destroyed (the rider's own movement), so a rider who fought carries the flag
+    // out of the saddle.  On foot that flag is not cosmetic: the engine keeps selecting a COMBAT
+    // idle/stance for him, which blends against the ordinary idle - the reported whole-body shake
+    // that only riders who fought get.
+    // The P4-5 branch already does precisely this every frame for riders who can never fight
+    // (big mounts / cushions); this is the same pair of calls, once, for a fighting rider, AFTER
+    // the rider is a normal standing character again (getDropped above) and AFTER our own weapon
+    // ownership has been handed back, so nothing of ours re-asserts the state afterwards.
+    // ⚠️ Do NOT clear it during the ride: the stance's second condition reads the rider's own
+    // combat flag (RideFightIsOn), and clearing combat mode mid-fight is a state the user vetoed in
+    // P4-1M (「清了就把刀从骑手手里拿走」).  Only the exit is safe.
+    {
+        int cm = 0, tgt = 0, cleared = 0;
+        try { cm = rider->isInCombatMode(true, true) ? 1 : 0; } catch (...) { cm = -1; }
+        try { tgt = rider->getAttackTarget().getCharacter() ? 1 : 0; } catch (...) { tgt = -1; }
+        if (cm != 0 || tgt != 0)
+        {
+            try { rider->endCombatMode(); cleared = 1; } catch (...) { cleared = -1; }
+        }
+        char cb[192];
+        _snprintf_s(cb, 192, _TRUNCATE,
+            "Riding: dismount combat state cm=%d tgt=%d cleared=%d f=%u", cm, tgt, cleared, gP3Frames);
+        DebugLog(std::string(cb));
+    }
+
     boost::unordered_map<Character*, Character*>::iterator it = riderToMount.find(rider);
     if (it != riderToMount.end())
     {
