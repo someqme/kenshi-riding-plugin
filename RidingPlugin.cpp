@@ -3571,6 +3571,35 @@ enum RideCombatPhase
 // Per-rider transaction and authored-arm state.  A single global window was safe only
 // while exactly one rider could fight.  Animation updates interleave riders, so every
 // mutable subject, timing latch and captured arm pose lives under its rider key.
+// 🆕 P4-6ag: THE MIX.  The engine's own answer at in-reach distance is deterministic for a given
+// character: trip 42 (2026-09-12, log `RE_Kenshi_log_20260912_p46af3.txt`) logged 17/17 windows
+// with `dq = min(d, reach)` answering `chop left-3` - one technique, every time - and the GATE
+// answer above reach is `bigchopv2` (init=25/minS=20), a charging chop whose footwork T23 masks
+// away.  So variety cannot come from asking the engine more cleverly; it has to come from us.
+// Every name below is a REAL clip in male_skeleton.skeleton (measured with
+// `python tools\skelanims.py --find ...`), never guessed - the project has been burned twice by
+// guessed names.  Lengths are the asset's own, and because the window is clip-length driven
+// (P4-6af-3) each of them plays whole.
+// ⚠️ The engine's `CombatTechniqueData*` is still what the HIT uses (`rt.technique`): we choose
+// the visible stroke, we do not invent damage.  Only the clip name changes.
+// ⚠️ A curated name whose Ogre state is missing is SKIPPED (the cursor moves on); if none of them
+// resolves, the engine's own answer is used unchanged - a missing clip must never cost a swing.
+static const char* const kRideMixClips[] = {
+    "chop left",          // 1.067 s - 右手→左的平砍（引擎自己一直在选的那条）
+    "chop down static",   // 1.300 s - 唯一有 ANIMATION 记录的攻击 clip（P4-6S：下劈观感不错）
+    "chop down",          // 0.967 s - 下砍
+    "downward combo",     // 1.733 s - 双段下劈
+    "heavy downcut",      // 1.633 s - 重下劈
+    "bigchopv2"           // 2.833 s - 引擎 GATE 给的那条重劈（整条播完才有意义）
+};
+static const int kRideMixCount = 6;
+
+// 🆕 P4-6ag: the hit beat follows the CLIP.  A fixed 600 ms was the validated point on `chop left`
+// (600 / 1067 = 56% of the stroke); with 0.97-2.83 s clips in the mix a fixed beat would land the
+// damage while a long clip is still winding up.  Same fraction of every clip, floored by the old
+// constant, so `chop left` keeps exactly the beat trip 42 measured.
+static const float kRideSwingHitFrac = 0.5625f;   // 600 / 1067, the validated point
+
 struct RideCombatRuntime
 {
     Character* rider;
@@ -3662,17 +3691,25 @@ struct RideCombatRuntime
     float targetOpenLimit;
     float targetOpenDistance;
     int hitSkipReason;
+    // 🆕 P4-6ag: the beat this window actually used (kRideSwingHitMs, or fit * kRideSwingHitFrac
+    // when the clip is longer).  Logged so the hit timing can be judged per window.
+    int hitMs;
     // P4-6S phantom-hit probe.  foreignHits counts stance frames where addList held an
     // entry that is NOT the latched host; foreignLines budgets the name rows.
     int foreignHits;
     int foreignLines;
+    // 🆕 P4-6ag: the clip mix.  mixCursor is the next slot to try, mixIdx the slot this window
+    // actually plays (-1 = engine's own answer), mixCount is the per-ride frequency table.
+    int mixCursor;
+    int mixIdx;
+    int mixCount[kRideMixCount];
     int stumbleNameLines;
 };
 
 // The transaction owner runs before the animation lookup implementations later in this file.
 static void ResolveRideCombatClips(RideCombatRuntime& rt, AnimationClass* rAnim);
 static AnimationData* RideCombatHost(RideCombatRuntime& rt, const char** nameOut);
-static bool SelectRideCombatAttack(RideCombatRuntime& rt);
+static bool SelectRideCombatAttack(RideCombatRuntime& rt, AnimationClass* rAnim);
 // Defined with the animation hooks; RideSwingPass's close edge reasserts guard through it.
 static void ClipPin(AnimationClass* rAnim, AnimationData* ad, float target, bool renderSide);
 
@@ -4690,9 +4727,9 @@ static void RideSwingPass(Character* rider, Character* mount, AnimationClass* rA
             char b[640];
             _snprintf_s(b, 640, _TRUNCATE,
                 "Riding: P43SW close rider=%p n=%d prog=%.3f ms=%u rst=%d drv=%d armt=%.2f noref=%d hold=%d "
-                "fit=%d hostkeep=%d tech=%d skip=%d noclip=%d hit=%d | pin='%s' %s | tech='%s' %s f=%u",
+                "fit=%d hitms=%d mix=%d hostkeep=%d tech=%d skip=%d noclip=%d hit=%d | pin='%s' %s | tech='%s' %s f=%u",
                 (void*)rider, rt.swingCount, prog, (unsigned)ms, rt.restarts, rt.driveFrames,
-                rt.armT, rt.noRef, rt.holdN, rt.fitMs, rt.hostKeepFrames,
+                rt.armT, rt.noRef, rt.holdN, rt.fitMs, rt.hitMs, rt.mixIdx, rt.hostKeepFrames,
                 rt.techCount, rt.skipCount, rt.noClipCount, hitv, hostNm ? hostNm : "",
                 pn, rt.techniqueName, pr, gP3Frames);
             DebugLog(std::string(b));
@@ -4740,9 +4777,20 @@ static void RideSwingPass(Character* rider, Character* mount, AnimationClass* rA
     // runs twice per frame through the two update hooks; this clock ticks exactly once), and
     // gRideSwingHitDone is latched BEFORE the call so a faulting call cannot turn into a per-frame
     // retry - one window, one resolution, same budget discipline as the open attempt itself.
+    // 🆕 P4-6ag: the beat scales with the clip (see kRideSwingHitFrac).  fitMs is measured by
+    // Drive a frame or two after the open and is stable for the rest of the window, so reading it
+    // here is the same number the close line prints as fit=.  Unknown length (no Ogre state) =>
+    // the old fixed constant, i.e. exactly the beat trip 42 validated.
+    int hitMs = kRideSwingHitMs;
+    if (rt.fitMs > 0)
+    {
+        int scaled = (int)((float)rt.fitMs * kRideSwingHitFrac + 0.5f);
+        if (scaled > hitMs) hitMs = scaled;
+    }
+    rt.hitMs = hitMs;   // logged on the close line so the beat is auditable per window
     if (open && !rt.hitResolved
         && RideCombatSessionOwns(rt, rider, mount, rt.target, rt.technique)
-        && (now - rt.openTick) >= (DWORD)kRideSwingHitMs)
+        && (now - rt.openTick) >= (DWORD)hitMs)
     {
         rt.hitResolved = true;
         rt.phase = RIDE_COMBAT_HIT_RESOLVED;
@@ -4825,16 +4873,19 @@ static void RideSwingPass(Character* rider, Character* mount, AnimationClass* rA
     }
 
     // Lock this window's host before openTick becomes visible to either animation pass.
-    // P4-6ad: host is intentionally NULL (no guard).  Technique name alone is enough.
     ResolveRideCombatClips(rt, rAnim);
-    if (!SelectRideCombatAttack(rt)) { ++rt.noClipCount; return; }
+    // 🆕 P4-6ag: pick this window's slot in the clip mix (per rider, one slot per window).  The
+    // engine's technique stays the HIT's subject; only the visible clip name changes.
+    if (!SelectRideCombatAttack(rt, rAnim)) { ++rt.noClipCount; return; }
+    const char* clipName = (rt.mixIdx >= 0 && rt.mixIdx < kRideMixCount)
+                         ? kRideMixClips[rt.mixIdx] : pick.name;
     host = RideCombatHost(rt, &hostNm);
     (void)host;   // may be NULL - the technique Ogre state is the visual
     AnimationData* attackHost = host;
     (void)attackHost;
 
     // Technique clip name BEFORE openTick so LegPosePass can Drive on the first window frame.
-    _snprintf_s(rt.techniqueName, sizeof(rt.techniqueName), _TRUNCATE, "%s", pick.name);
+    _snprintf_s(rt.techniqueName, sizeof(rt.techniqueName), _TRUNCATE, "%s", clipName ? clipName : "");
     if (!rt.techniqueName[0]) { ++rt.noClipCount; rt.atkIdx = -1; return; }
 
     rt.openTick = now;
@@ -4878,9 +4929,11 @@ static void RideSwingPass(Character* rider, Character* mount, AnimationClass* rA
         RideSwingProbePin(rAnim, host, pn, sizeof(pn));
         char b[640];
         _snprintf_s(b, 640, _TRUNCATE,
-            "Riding: P43SW open rider=%p n=%d tech='%s' gate='%s' dq=%.2f init=%.2f minS=%.2f lim=%.2f "
-            "d=%.2f reach=%.2f aspd=%.3f gap=%d | pin='%s' %s | pre %s f=%u",
-            (void*)rider, rt.swingCount, pick.name, pick.gate, pick.dq, pick.init, pick.minS, lim, pick.d,
+            "Riding: P43SW open rider=%p n=%d tech='%s' gate='%s' mix=%d clip='%s' dq=%.2f init=%.2f "
+            "minS=%.2f lim=%.2f d=%.2f reach=%.2f aspd=%.3f gap=%d | pin='%s' %s | pre %s f=%u",
+            (void*)rider, rt.swingCount, pick.name, pick.gate, rt.mixIdx,
+            rt.mixIdx >= 0 ? kRideMixClips[rt.mixIdx] : "(engine)",
+            pick.dq, pick.init, pick.minS, lim, pick.d,
             pick.reach, rt.attackSpeed, rt.gapMs,
             hostNm ? hostNm : "", pr, pn, gP3Frames);
         DebugLog(std::string(b));
@@ -6016,6 +6069,32 @@ static void LogAnimRow(const char* tag, const char* key, AnimationData* ad)
 // forward-declared earlier (BuildSeatInfo needs FindAnimData; the combat-runtime block declares
 // the other three).  Do not re-declare them here.
 
+// 🆕 P4-6ag: resolve once per ride AND print the standing evidence line, from whichever site gets
+// there first.  Since P4-6af the animUpdate pre-pass resolves for a stance rider, and that runs
+// BEFORE HaltAndForceSitPass inside a frame - so the old "resolve inside HaltAndForceSitPass and
+// log there" shape silently stopped printing `P41K resolve`.  `ridelog.py` identifies the current
+// route by the five `atk=` markers ON THAT LINE (`is_vanilla_attack_route`), so losing it made
+// every current log read as a pre-route one and skipped the whole judge.  One log line per ride,
+// budget-free (it fires once by construction: attackClipsResolved is latched here).
+static void ResolveRideCombatClipsLogged(RideCombatRuntime& rt, AnimationClass* rAnim, Character* rider)
+{
+    if (rt.attackClipsResolved) return;
+    ResolveRideCombatClips(rt, rAnim);
+    char rl[320];
+    _snprintf_s(rl, 320, _TRUNCATE,
+        "Riding: P41K resolve rider=%p guard='%s' %s blow='%s' %s "
+        "atk=['%s','%s','%s','%s','%s']",
+        (void*)rider,
+        kP41kGuardAnim, rt.guardClip ? "found" : "ABSENT",
+        kP41kBlowAnim,  rt.blowClip  ? "found" : "ABSENT",
+        rt.attackClips[0] ? "ok" : "-",
+        rt.attackClips[1] ? "ok" : "-",
+        rt.attackClips[2] ? "ok" : "-",
+        rt.attackClips[3] ? "ok" : "-",
+        rt.attackClips[4] ? "ok" : "-");
+    DebugLog(std::string(rl));
+}
+
 // ---- P4-3-2 swing window: REMOVED 2026-09-02, question answered ------------------------------
 // A debugContinuous-gated experiment used to open a 1000 ms window every 3 s while the stance was
 // up, swap the pinned clip from 'guard 1h' to 'mid blow', and log P43SW open/hold/close/after
@@ -6094,12 +6173,28 @@ static AnimationData* RideCombatHost(RideCombatRuntime& rt, const char** nameOut
     return rt.guardClip;
 }
 
-static bool SelectRideCombatAttack(RideCombatRuntime& rt)
+// 🆕 P4-6ag: see the mix table above (it lives next to the other clip tables, before the runtime
+// POD that counts into it).  This advances the per-rider cursor by one window.
+static bool SelectRideCombatAttack(RideCombatRuntime& rt, AnimationClass* rAnim)
 {
-    // Technique drive needs no ANIMATION-record host; the clip name comes from pick.name.
-    // ⚠️ Deliberately NOT gated on guardClip: a table without 'guard 1h' falls back to the
-    // sit-pose base and the swing must still be able to run.
-    (void)rt;
+    // One slot per window, per rider, deterministic.  `mixIdx` = the slot this window will play
+    // (-1 = none of the curated names has a state, so the caller keeps the engine's answer).
+    rt.mixIdx = -1;
+    for (int i = 0; i < kRideMixCount; ++i)
+    {
+        int idx = (rt.mixCursor + i) % kRideMixCount;
+        const char* nm = kRideMixClips[idx];
+        // The Ogre side is the gate: a state that does not exist would drive nothing at all.
+        // Pure read - §21.1's mapper returns NULL on a miss and inserts nothing.
+        if (rAnim && nm && nm[0] && RideSwingState(rAnim, nm))
+        {
+            rt.mixCursor = (idx + 1) % kRideMixCount;
+            rt.mixIdx    = idx;
+            if (rt.mixCount[idx] < 1000000) ++rt.mixCount[idx];
+            return true;
+        }
+    }
+    // Nothing curated resolved: the engine's own pick is still a legal swing.
     return true;
 }
 
@@ -8455,10 +8550,26 @@ void Dismount(Character* rider)
     // now counts frames that pinned the current attack host, not guard frames. `arm=`/`swfree=` belong
     // to the retired authored-arm route and must remain zero on this route.
     {
-        char sws[352];
-        _snprintf_s(sws, 352, _TRUNCATE,
+        // 🆕 P4-6ag: the mix's own frequency table for this ride ("every clip, how many windows").
+        // The 24-line budget only ever shows the first rows of a ride, so this is the ONLY place
+        // the real distribution is visible - it is what answers 「每种动作出现的频率」.
+        char mixv[160];
+        mixv[0] = 0;
+        {
+            int mo = 0;
+            for (int i = 0; i < kRideMixCount; ++i)
+            {
+                if (mo >= (int)sizeof(mixv) - 8) break;
+                int n = _snprintf_s(mixv + mo, sizeof(mixv) - (size_t)mo, _TRUNCATE, "%s%d",
+                                    (i == 0) ? "" : ",", rideRt ? rideRt->mixCount[i] : 0);
+                if (n < 0) break;
+                mo += n;
+            }
+        }
+        char sws[512];
+        _snprintf_s(sws, 512, _TRUNCATE,
             "Riding: P43SW ride rider=%p swing=%d rst=%d drv=%d arm=%d postarm=%d swfree=%d tech=%d skip=%d noclip=%d "
-            "hostkeep=%d hdveto=%d dmin=%.2f limlast=%.2f aspd=%.3f gap=%d hskipN=%d",
+            "hostkeep=%d hdveto=%d dmin=%.2f limlast=%.2f aspd=%.3f gap=%d hskipN=%d mix=[%s]",
             (void*)rider,
             rideRt ? rideRt->swingCount : 0,
             rideRt ? rideRt->restarts : 0,
@@ -8475,7 +8586,8 @@ void Dismount(Character* rider)
             rideRt ? rideRt->lastLimit : -1.0f,
             rideRt ? rideRt->attackSpeed : 1.0f,
             rideRt ? rideRt->gapMs : kRideSwingMinGapMs,
-            rideRt ? rideRt->hitSkips : 0);
+            rideRt ? rideRt->hitSkips : 0,
+            mixv);
         DebugLog(std::string(sws));
     }
     ClearRideCombatRuntime(rider);
@@ -8950,7 +9062,9 @@ static void AnimUpdateImpl(AnimationClass* thisptr, float frameTIME)
                         AnimationData* hostWant = NULL;
                         if (stance && wrt)
                         {
-                            ResolveRideCombatClips(*wrt, thisptr);
+                            // P4-6ag: resolve + print the P41K evidence line here as well - this
+                            // pass runs first in a frame, so it is usually the one that latches.
+                            ResolveRideCombatClipsLogged(*wrt, thisptr, stWho);
                             hostWant = RideCombatHost(*wrt, NULL);
                         }
                         // stop the animation system from choosing the carried pose.
@@ -9536,23 +9650,9 @@ static void HaltAndForceSitPass()
                         if (stance)
                         {
                             hostState = &GetRideCombatRuntime(rider, mount);
-                            if (!hostState->attackClipsResolved)
-                            {
-                                ResolveRideCombatClips(*hostState, rAnim);
-                                char rl[320];
-                                _snprintf_s(rl, 320, _TRUNCATE,
-                                    "Riding: P41K resolve rider=%p guard='%s' %s blow='%s' %s "
-                                    "atk=['%s','%s','%s','%s','%s']",
-                                    (void*)rider,
-                                    kP41kGuardAnim, hostState->guardClip ? "found" : "ABSENT",
-                                    kP41kBlowAnim,  hostState->blowClip  ? "found" : "ABSENT",
-                                    hostState->attackClips[0] ? "ok" : "-",
-                                    hostState->attackClips[1] ? "ok" : "-",
-                                    hostState->attackClips[2] ? "ok" : "-",
-                                    hostState->attackClips[3] ? "ok" : "-",
-                                    hostState->attackClips[4] ? "ok" : "-");
-                                DebugLog(std::string(rl));
-                            }
+                            // Resolve + print the P41K evidence line (P4-6ag: the helper makes the
+                            // pre-pass and this pass share one site, so whichever runs first logs).
+                            ResolveRideCombatClipsLogged(*hostState, rAnim, rider);
                             want = RideCombatHost(*hostState, &wantNm);
                         }
                         if (want)

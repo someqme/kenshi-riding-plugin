@@ -4242,14 +4242,15 @@ def swing_authored(s):
     """True when the build AUTHORS the swing (T25) instead of playing one of the
     engine's records.
 
-    The ride line's arm= only exists from that build onward, and its arrival retires
-    three fields at once: drv= (T22's drive of the technique's own Ogre state), hold=
-    (T23's mask on that state) and fit= (T24's phase fitting) are all zero BY DESIGN
-    afterwards, because both assertion sites were removed.  Every section that judges
-    one of those three has to check this first or it reports a design decision as a
-    regression.
+    ⚠️ P4-6ag: the test is a NON-ZERO arm/, not the field's presence.  The ride line has
+    printed `arm=` since T25, so a presence test is true for every modern build and sent
+    every log down the "retired by T25, drv=/hold=/fit= are zero by design" branch - which
+    is wrong on the current route, where all three are live and load-bearing.
     """
-    return any("arm" in d for d in s.sw_rides) or bool(s.sw_arm)
+    for d in s.sw_rides:
+        if (fnum(d, "arm", 0) or 0) > 0:
+            return True
+    return bool(s.sw_arm)
 
 
 def report_swing_drive(s):
@@ -5578,6 +5579,66 @@ def report_swing_host(s):
                          "one serial-latched restart decision per transaction (rst == swing)"))
     for t, sw, rs in bad_rst[:8]:
         print("        %8s swing=%d rst=%d" % (t, sw, rs))
+
+    # ---- 4b) the beat follows the clip (P4-6ag) ------------------------------
+    # hitms= = max(kRideSwingHitMs, fit * 0.5625); 0.5625 is the validated point on
+    # `chop left` (600 / 1067), so the mix's longer clips do not land their damage
+    # while the blade is still winding up.
+    bad_hitms = []
+    for (d, _m, f) in [(d, fnum(d, "ms"), fnum(d, "fit")) for d in s.sw_close]:
+        hm = fnum(d, "hitms")
+        if hm is None or f is None or f <= 0:
+            continue
+        want_h = max(600.0, f * 0.5625)
+        if abs(hm - want_h) > 2.0:
+            bad_hitms.append((d.get("_ts", "?"), hm, want_h))
+    if any(fnum(d, "hitms") is not None for d in s.sw_close):
+        print("  " + verdict(not bad_hitms,
+                             "hitms= follows the clip (max(600, fit x 0.5625))"))
+        for (t, hm, want_h) in bad_hitms[:8]:
+            print("        %8s hitms=%g, expected %.0f" % (t, hm, want_h))
+
+    # ---- 4c) the clip mix (P4-6ag) -------------------------------------------
+    # The engine's own in-reach answer is deterministic for a given character (trip 42:
+    # 17/17 windows answered `chop left-3`), so the visible stroke is now OUR rotation.
+    # `mix=[...]` on the per-ride summary is the only UNGATED frequency table - the
+    # open/close rows are budgeted to kRideSwingLines per ride.
+    mix_names = ["chop left", "chop down static", "chop down",
+                 "downward combo", "heavy downcut", "bigchopv2"]
+    mix_rows = [(d.get("_ts", "?"), d.get("mix")) for d in s.sw_rides if d.get("mix")]
+    if mix_rows:
+        for (t, v) in mix_rows[:4]:
+            nums = re.findall(r"-?\d+", v)
+            if len(nums) != len(mix_names):
+                print("  NOTE  mix= carries %d slot(s) but this reader knows %d -"
+                      " the table and the reader disagree." % (len(nums), len(mix_names)))
+                continue
+            tot = sum(int(x) for x in nums)
+            print("  mix @%s: %s  (total %d window(s))"
+                  % (t, "  ".join("%s=%s" % (nm, nums[i])
+                                  for i, nm in enumerate(mix_names)), tot))
+        bad_seq, bad_nm = [], []
+        prev = None
+        for d in s.sw_open:
+            mv = fnum(d, "mix")
+            if mv is None:
+                continue
+            if prev is not None and int(mv) == prev:
+                bad_seq.append((d.get("_ts", "?"), int(mv)))
+            prev = int(mv)
+            nm = d.get("clip")
+            if nm:
+                nm = nm.strip("'")
+                if 0 <= int(mv) < len(mix_names) and nm != mix_names[int(mv)]:
+                    bad_nm.append((d.get("_ts", "?"), int(mv), nm))
+        print("  " + verdict(not bad_seq,
+                             "the mix advances one slot per window (%d open row(s))"
+                             % len(s.sw_open)))
+        print("  " + verdict(not bad_nm, "clip= is the name its mix= slot stands for"))
+        for (t, mv, nm) in bad_nm[:8]:
+            print("        %8s mix=%d clip='%s'" % (t, mv, nm))
+    else:
+        print("  NOTE  no P43SW ride row carried mix= - this log predates P4-6ag.")
 
     # ---- 5) retired writers stay retired -------------------------------------
     # ⚠️ P4-6af-3: only the AUTHORED-ARM counters are still retired.  `drv=` (Drive has been the
