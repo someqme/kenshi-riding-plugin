@@ -25,6 +25,10 @@
 - **[RE_Kenshi](https://github.com/BFrizzleFoShizzle/RE_Kenshi)** 框架 —— 本插件由它加载注入。
 - **Kenshi 1.0.65 x64**（Steam 版，Newland）。其他版本的函数地址（RVA）不匹配，可能无法工作甚至崩溃。
 
+### 不安装 RE_Kenshi 的 standalone 启动方式
+
+`standalone/`（构建产物位于 `D:\KenshiModDev\Build\RidingStandalonePackage\`）包含独立启动器、KenshiLib 0.4.0 和匹配的 RVA 表。Steam 1.0.65 直接支持；Steam 1.0.68 启动时会用官方 Courgette 补丁生成旁置的 1.0.65 兼容副本，原始 `Kenshi_x64.exe` 不会被覆盖。请保持包内 `tools/` 与启动器同目录，并不要与 `RE_Kenshi.dll` 同时使用。
+
 ## 🔧 安装 / Installation
 
 1. 先安装并配置好 RE_Kenshi。

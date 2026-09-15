@@ -1,0 +1,16 @@
+Standalone compatibility status (2026-09-15)
+
+- KenshiLib.dll: RE_Kenshi KenshiLib 0.4.0 ABI, 7409-entry table.
+- Steam 1.0.65: direct support via RE_Kenshi/RVAs/Steam_1.0.65.br.
+- Steam 1.0.68: launcher uses the official RE_Kenshi Courgette downgrade
+  method and starts a private 1.0.65 executable. The installed executable is
+  not modified, so KLib resolves the known 1.0.65 hash and table safely.
+- A direct Steam_1.0.68.br table is intentionally not shipped: the available
+  public RE_Kenshi packages do not provide one, and an incomplete guessed table
+  is unsafe (it can crash before plugin initialization).
+
+User validation completed 2026-09-15 on Steam 1.0.68 with RE_Kenshi removed:
+10 minutes of normal play passed, including mount, movement/turning, clean
+dismount, issuing commands after dismount, and a small/medium-mount fight.
+The package remains separate from release/; replacing the release artifact is
+still a deliberate publishing decision.
